@@ -1,0 +1,34 @@
+from sqlalchemy import inspect
+
+
+def test_initial_schema_contains_required_tables(session):
+    required = {
+        "accounts",
+        "holdings",
+        "trades",
+        "trade_reviews",
+        "discipline_rules",
+        "discipline_events",
+        "market_quotes",
+        "market_daily_bars",
+        "market_source_logs",
+        "x_watch_accounts",
+        "x_watch_queries",
+        "x_posts",
+        "ai_analyses",
+        "backtest_runs",
+        "system_jobs",
+        "technical_snapshots",
+        "company_profiles",
+        "company_financial_periods",
+        "company_announcements",
+        "company_valuation_snapshots",
+        "company_research_evidence",
+        "rule_sets",
+        "rule_versions",
+        "trade_plans",
+        "trade_plan_checks",
+        "position_snapshots",
+        "trade_plan_ai_analyses",
+    }
+    assert required == set(inspect(session.bind).get_table_names())

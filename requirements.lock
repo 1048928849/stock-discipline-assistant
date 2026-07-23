@@ -1,0 +1,21 @@
+# 2026-07-22 在 Python 3.11.9 / Windows 上验证的直接依赖版本。
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+SQLAlchemy==2.0.41
+alembic==1.18.5
+pydantic-settings==2.11.0
+Jinja2==3.1.6
+python-multipart==0.0.32
+PyMySQL==1.1.1
+akshare==1.18.72
+twscrape==0.19.2
+backtesting==0.6.5
+APScheduler==3.11.0
+pandas==2.3.0
+pandas-ta-classic==0.3.59
+vectorbt==0.28.1
+httpx==0.28.1
+pypdf==6.10.2
+pytest==8.4.2
+pytest-cov==6.3.0
+ruff==0.15.22

@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>股票纪律助手</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body data-page="{{ page|default('dashboard') }}">
+  <aside class="sidebar">
+    <div class="brand"><small>STOCK DISCIPLINE</small><b>纪律助手</b></div>
+    <nav>
+      <span class="nav-group">今日</span><a href="/dashboard">今日工作台</a>
+      <span class="nav-group">研究中心</span><a href="/market">市场与主线</a><a href="/company-research">公司与财报</a><a href="/technical">技术研究</a><a href="/x-monitor">产业线索 / X</a>
+      <span class="nav-group">计划与执行</span><a href="/trade-plans">交易计划</a><a href="/holdings">持仓管理</a><a href="/trades">交易记录</a>
+      <span class="nav-group">复盘与验证</span><a href="/reviews">每日 / 每周复盘</a><a href="/backtests">策略回测</a>
+      <span class="nav-group">系统</span><a href="/settings">数据源与设置</a>
+    </nav>
+    <a class="docs" href="/docs">API 文档 ↗</a>
+  </aside>
+  <main class="content">
+    <header class="top"><div><p class="eyebrow">PERSONAL RESEARCH DESK</p><h1>研究与纪律控制台</h1></div><span id="status" class="status">连接中</span></header>
+    <div class="notice">仅供研究与纪律记录，不构成投资建议。系统不预测涨跌、不连接券商、不自动下单。</div>
+
+    <section class="panel" data-view="dashboard">
+      <h2>今日工作台</h2><p>只汇总可追溯数据；证据不足时明确显示“数据不足，无法判断”。</p>
+      <div id="dashboard-market" class="cards"></div><h3>今天最应该处理的事项</h3><div id="dashboard-priorities" class="action-list"></div>
+      <div class="workspace-grid"><section><h3>持仓风险</h3><div id="dashboard-holdings" class="risk-grid"></div></section><section><h3>接近计划条件</h3><div id="dashboard-plans" class="risk-grid"></div></section></div>
+      <h3>纪律与数据问题</h3><div id="dashboard-discipline" class="cards"></div><div id="dashboard-data-issues" class="risk-grid"></div>
+      <details class="developer-details"><summary>技术详情：账户与数据源状态</summary><div id="account-cards" class="cards"><article>尚未创建账户</article></div><div id="source-status" class="cards"></div></details>
+    </section>
+
+    <section class="panel" data-view="holdings">
+      <h2>账户与持仓</h2>
+      <form id="account-form" class="form-grid"><input name="name" placeholder="账户名称" required><input name="total_assets" type="number" step="0.01" placeholder="总资产" required><input name="cash" type="number" step="0.01" placeholder="现金" required><input name="available_cash" type="number" step="0.01" placeholder="可用资金" required><button>创建账户</button></form>
+      <form id="holding-form" class="form-grid"><input name="account_id" type="number" placeholder="账户 ID" required><input name="symbol" pattern="\d{6}" placeholder="股票代码" required><input name="name" placeholder="股票名称" required><input name="quantity" type="number" placeholder="数量" required><input name="cost_price" type="number" step="0.0001" placeholder="成本价" required><input name="current_price" type="number" step="0.0001" placeholder="真实现价" required><input name="sector" placeholder="板块"><input name="buy_reason" placeholder="买入理由"><input name="invalidation_condition" placeholder="失效条件"><input name="stop_loss_price" type="number" step="0.0001" placeholder="止损价"><button>新增持仓</button></form>
+      <div id="holdings-table" class="table-wrap"></div>
+      <h3>持仓纪律状态</h3><div class="action-row"><input id="position-account" type="number" min="1" placeholder="可选：账户 ID"><button type="button" id="position-refresh">刷新持仓纪律</button><button type="button" id="position-snapshot">保存今日状态快照</button></div><div id="position-management" class="risk-grid"></div>
+      <p class="hint">完整持仓字段可在 API 文档中新增；行情未同步时请使用真实手工价格，不得用随机数据代替。</p>
+    </section>
+
+    <section class="panel" data-view="trade-plans"><h2>交易计划生成器</h2><p>确定性规则先计算技术结构、硬止损、风险收益和仓位；AI 只归纳可追溯证据。系统不连接券商、不自动下单、不承诺涨跌。</p><div id="rule-version-card"></div>
+      <form id="trade-plan-form" class="backtest-form">
+        <label><span>股票代码</span><input name="symbol" pattern="\d{6}" placeholder="例如 300502" required></label><label><span>账户</span><select name="account_id" id="plan-account" required></select></label>
+        <label><span>交易模式</span><select name="trade_mode"><option>日线趋势波段</option></select></label><label><span>当前市场环境</span><select name="market_state"><option>无法判断</option><option>上升</option><option>震荡</option><option>下降</option></select><small>当前未接入宽基自动模型，请按真实观察选择。</small></label>
+        <label><span>行业/板块强弱</span><select name="sector_state"><option>无法判断</option><option>强</option><option>中性</option><option>弱</option></select><small>当前未接入行业指数自动强弱。</small></label><label><span>单笔风险（%）</span><input name="risk_pct" type="number" min="0.1" max="10" step="0.1" value="0.5" required></label>
+        <label><span>单只股票最大仓位（%）</span><input name="max_position_pct" type="number" min="1" max="100" value="20" required></label><label><span>账户最大总仓位（%）</span><input name="max_total_position_pct" type="number" min="1" max="100" value="80" required></label>
+        <label><span>行业集中度上限（%）</span><input name="max_industry_position_pct" type="number" min="1" max="100" value="35" required></label><label><span>逻辑失效条件（可补充）</span><textarea name="logic_invalidation" placeholder="只写可验证的行业/公司失效条件"></textarea></label>
+        <button id="generate-plan-button">生成条件式计划</button>
+      </form>
+      <div id="trade-plan-result"><div class="missing-data">输入股票代码并选择账户后生成计划。请先在“市场与主线数据”同步真实前复权日线。</div></div>
+      <div id="plan-chart-shell" class="chart-shell" hidden><canvas id="plan-kline-chart" width="1100" height="390"></canvas></div>
+      <div id="plan-actions" class="action-row" hidden><button type="button" id="save-generated-plan">确认并保存当前版本</button><button type="button" id="run-plan-ai">运行 AI 辅助研究</button></div>
+      <section id="plan-ai-section"><h3>大模型辅助研究</h3><div id="plan-ai-result" class="missing-data">未运行。即使未配置模型，规则计划仍可正常使用。</div></section>
+      <h3>该股票历史计划版本</h3><div id="plan-history" class="risk-grid"><div class="missing-data">生成计划后显示。</div></div>
+      <h3>已有计划</h3><div id="trade-plan-list" class="risk-grid"></div><details class="developer-details"><summary>技术详情 / 调试信息（默认隐藏）</summary><pre id="trade-plan-json"></pre></details>
+    </section>
+
+    <section class="panel" data-view="trades"><h2>交易记录</h2><form id="trade-form" class="form-grid"><input name="account_id" type="number" placeholder="账户 ID" required><input name="symbol" pattern="\d{6}" placeholder="股票代码" required><select name="side"><option value="BUY">买入</option><option value="SELL">卖出</option></select><input name="quantity" type="number" placeholder="数量" required><input name="price" type="number" step="0.0001" placeholder="价格" required><input name="fee" type="number" step="0.01" value="0" placeholder="费用"><input name="reason" placeholder="交易理由"><select name="is_planned"><option value="true">计划内</option><option value="false">计划外</option></select><input name="emotion" placeholder="情绪"><button>记录交易</button></form><div id="trades-table" class="table-wrap"></div><p class="hint">同时支持 UTF-8 CSV 导入：<code>POST /api/v1/trades/import-csv</code>。</p></section>
+    <section class="panel" data-view="reviews"><h2>纪律检查与复盘</h2><div class="action-row"><input id="review-account" type="number" min="1" placeholder="账户 ID"><button id="discipline-button">执行纪律检查</button><button id="daily-button">生成今日统计</button></div><div id="review-result" class="risk-grid"><div class="missing-data">请选择账户。</div></div><details class="developer-details"><summary>技术详情 / 调试信息</summary><pre id="review-json"></pre></details></section>
+    <section class="panel" data-view="market"><h2>市场与主线数据</h2><p>同步单只股票的真实现价和前复权日线。当前 P0 尚未接入宽基市场状态模型，因此不会用个股行情代替市场结论。</p><form id="market-form" class="action-row"><input name="symbol" pattern="\d{6}" placeholder="6 位股票代码" required><input name="days" type="number" value="365" min="30" max="3000"><button>同步真实行情</button></form><div id="market-result" class="cards"><div class="missing-data">尚未同步。来源：AKShare；获取状态：等待。</div></div><details class="developer-details"><summary>技术详情 / 调试信息</summary><pre id="market-json"></pre></details></section>
+    <section class="panel" data-view="technical"><h2>技术研究</h2><p>基于 AKShare 前复权 K 线，使用 pandas-ta-classic 计算指标，并用 vectorbt 验证每类信号的历史表现。指标只是确认工具，不能脱离市场、板块和公司逻辑生成买卖建议。</p><form id="technical-form" class="action-row"><input name="symbol" pattern="\d{6}" placeholder="6 位股票代码" required><button>分析当前状态</button><button type="button" id="signal-backtest-button">回测各项信号</button><button type="button" id="snapshot-button">刷新行情并记录持仓快照</button></form><div class="chart-shell"><canvas id="kline-chart" width="1100" height="430"></canvas></div><div id="technical-summary"></div><div id="signal-table" class="table-wrap"></div><details class="developer-details"><summary>技术详情 / 调试信息</summary><pre id="technical-result">请先在市场数据页同步至少 80 个交易日的前复权日线。</pre></details></section>
+    <section class="panel" data-view="company-research">
+      <h2>公司研究中心</h2>
+      <p>把财务报表、公告风险、历史估值和产业证据放在同一条时间线上。缺失字段会明确显示“暂无可靠数据”，不会由 AI 补造。</p>
+      <form id="company-research-form" class="action-row"><label><span>股票代码</span><input name="symbol" pattern="\d{6}" placeholder="例如 300502" required></label><label class="checkbox-label"><input name="include_documents" type="checkbox" checked>解析最新年报原文（耗时较长）</label><button>同步并生成研究报告</button><button type="button" id="company-load-button">只读取已有数据</button></form>
+      <div id="company-status" class="hint">输入股票代码后开始。首次同步会读取最近12个季度财报、近三年公告和估值历史。</div>
+      <div id="company-overview"></div>
+      <section class="research-block"><h3>经营与财务质量</h3><div id="financial-conclusions"></div><div id="financial-trends" class="cards"></div><div class="curve-grid"><div class="curve-panel"><h3>营收、利润与经营现金流趋势</h3><canvas id="financial-amount-chart" width="650" height="300"></canvas></div><div class="curve-panel"><h3>毛利率、ROE与负债率趋势</h3><canvas id="financial-ratio-chart" width="650" height="300"></canvas></div></div><div id="financial-anomalies" class="risk-grid"></div></section>
+      <section class="research-block"><h3>公告风险雷达</h3><div id="risk-summary" class="cards"></div><div id="risk-list" class="risk-grid"></div></section>
+      <section class="research-block"><h3>估值与情景</h3><div id="valuation-summary" class="cards"></div><div id="valuation-conclusion"></div><div id="valuation-peers" class="table-wrap"></div><div id="valuation-scenarios" class="scenario-grid"></div></section>
+      <section class="research-block"><h3>产业逻辑与证据时间线</h3><div id="industry-summary"></div><div id="industry-evidence" class="evidence-grid"></div><div class="level-list"><div><h3>验证指标</h3><ul id="industry-validation"></ul></div><div><h3>失效条件</h3><ul id="industry-invalidation"></ul></div></div><div id="industry-timeline" class="timeline"></div></section>
+      <details id="company-developer" class="developer-details"><summary>开发者详情（原始 JSON）</summary><pre id="company-json"></pre></details>
+    </section>
+    <section class="panel" data-view="x-monitor"><h2>产业线索与 X 公开资讯</h2><p>新闻和 X 只作为待验证线索，不作为一手事实。使用你有权访问的 Cookie 低频采集。</p><div id="x-status"></div><form id="x-account-form" class="action-row"><input name="username" placeholder="关注账号（不含 @）" required><button>添加账号</button></form><form id="x-query-form" class="action-row"><input name="name" placeholder="查询名称" required><input name="expression" placeholder="查询表达式" required><button>添加查询</button><button type="button" id="x-sync-button">立即同步</button></form><form id="ai-form" class="action-row"><input name="content_id" type="number" placeholder="帖子数据库 ID" required><button>执行 AI 分析</button></form><div id="ai-result" class="risk-grid"><div class="missing-data">尚未分析。</div></div><details class="developer-details"><summary>技术详情 / 调试信息</summary><pre id="ai-json"></pre></details><div id="posts-table" class="table-wrap"></div></section>
+    <section class="panel" data-view="backtests">
+      <h2>交易规则历史验证</h2>
+      <p>用历史前复权日线比较指定交易规则与“买入并持有”。这只能检验规则过去的表现，不能预测未来。</p>
+      <div class="warning"><b>制度模拟范围：</b>当前未严格模拟 T+1、涨跌停、停牌和成交量限制；滑点使用等效成交费率近似。少于 30 笔交易统一标记为“样本不足”。</div>
+      <form id="backtest-form" class="backtest-form">
+        <label><span>股票代码</span><input name="symbol" pattern="\d{6}" placeholder="例如 300502" required><small>请先在市场数据页同步至少 3 年日线。</small></label>
+        <label><span>交易规则</span><select name="strategy" id="backtest-strategy"><option value="fixed_stop">固定止损</option><option value="moving_average">技术信号：双均线交叉</option><option value="batch_buy">分批买入与止盈止损</option><option value="trend_filter">趋势过滤</option></select><small>下方会明确展示买入、卖出和重新入场规则。</small></label>
+        <label><span>开始日期</span><input name="date_from" id="backtest-date-from" type="date" required><small>默认回看至少 3 年。</small></label>
+        <label><span>结束日期</span><input name="date_to" id="backtest-date-to" type="date" required><small>不足 3 年会额外警告。</small></label>
+        <label><span>初始资金（元）</span><input name="cash" type="number" min="1000" step="1000" value="100000" required><small>策略和基准使用相同初始资金。</small></label>
+        <label><span>单次最大仓位（%）</span><input name="max_position_pct" type="number" min="1" max="99" step="1" value="20" required><small>策略每次允许使用的资金比例。</small></label>
+        <label><span>固定止损比例（%）</span><input name="stop_pct" type="number" min="1" max="50" step="0.5" value="8" required><small>固定止损和分批策略都会使用，不再隐藏默认值。</small></label>
+        <label><span>快均线周期（日）</span><input name="fast" type="number" min="2" max="120" value="5" required><small>双均线和趋势过滤的短周期。</small></label>
+        <label><span>慢均线周期（日）</span><input name="slow" type="number" min="3" max="250" value="20" required><small>必须大于快均线周期。</small></label>
+        <label><span>分批加仓跌幅（%）</span><input name="batch_drop_pct" type="number" min="0.5" max="30" step="0.5" value="3" required><small>相对上一批参考价的跌幅。</small></label>
+        <label><span>分批策略止盈（%）</span><input name="take_profit_pct" type="number" min="1" max="100" step="0.5" value="10" required><small>整体持仓达到该收益后退出。</small></label>
+        <label><span>单边手续费（%）</span><input name="commission_pct" type="number" min="0" max="2" step="0.001" value="0.03" required><small>每次买入和卖出均收取。</small></label>
+        <label><span>单边滑点（%）</span><input name="slippage_pct" type="number" min="0" max="5" step="0.01" value="0.1" required><small>以额外成交费率保守近似。</small></label>
+        <button type="submit">开始历史验证</button>
+      </form>
+      <div id="backtest-rule-preview" class="rule-box"></div>
+      <div id="backtest-result" class="backtest-result"><p class="hint">提交后将显示对比指标、资金曲线、回撤曲线和逐笔交易。</p></div>
+      <details id="backtest-developer" class="developer-details"><summary>开发者详情（原始 JSON）</summary><pre id="backtest-json"></pre></details>
+      <h3>历史验证记录</h3><div id="backtests-table" class="table-wrap"></div>
+    </section>
+    <section class="panel" data-view="settings"><h2>数据源与系统设置</h2><div id="settings-result" class="cards"><div class="missing-data">加载中…</div></div><div class="action-row"><button type="button" id="llm-test-button">测试大模型连接</button></div><div id="llm-test-result" class="hint">测试会发送一条极短的结构化请求，不会上传股票或账户数据。</div><details class="developer-details"><summary>技术详情 / 调试信息</summary><pre id="settings-json"></pre></details><p>密钥只通过 <code>.env</code> 配置，页面仅显示是否配置，不回显完整值。</p></section>
+  </main>
+  <div id="toast" role="status"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
