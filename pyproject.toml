@@ -17,6 +17,7 @@ dependencies = [
   "python-multipart>=0.0.9,<1",
   "pymysql>=1.1,<2",
   "akshare>=1.17,<2",
+  "tushare>=1.4,<2",
   "twscrape>=0.17,<1",
   "backtesting>=0.6,<1",
   "apscheduler>=3.10,<4",
