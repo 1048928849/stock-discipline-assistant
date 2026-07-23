@@ -27,7 +27,7 @@ from app.models import (
     XWatchQuery,
 )
 from app.providers.llm_provider import LLMUnavailableError, OpenAICompatibleProvider
-from app.providers.market import ProviderUnavailableError, Quote
+from app.providers.market import ProviderUnavailableError
 from app.schemas_advanced import (
     BacktestCreate,
     DisciplineAlert,
@@ -295,31 +295,39 @@ def market_sync(
             for bar in bars
         ):
             raise ProviderUnavailableError("历史行情完整性检查失败，未写入数据库")
-        if quote is None:
-            latest = bars[-1]
-            previous_quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
-            quote = Quote(
+        if any(
+            getattr(bar, "frequency", None) != "daily"
+            or getattr(bar, "adjustment", None) != "qfq"
+            for bar in bars
+        ):
+            raise ProviderUnavailableError("历史行情不符合 daily/qfq 标准契约")
+        if quote is not None:
+            stored = db.scalar(
+                select(MarketQuote).where(MarketQuote.symbol == symbol)
+            ) or MarketQuote(
                 symbol=symbol,
-                name=previous_quote.name if previous_quote and previous_quote.name else symbol,
-                price=latest.close,
-                source=latest.source,
-                source_api="history_latest_close",
-                fetched_at=latest.fetched_at,
+                name=quote.name,
+                price=quote.price,
+                source=quote.source,
+                source_api=quote.source_api,
+                fetched_at=quote.fetched_at,
             )
-        stored = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol)) or MarketQuote(
-            symbol=symbol,
-            name=quote.name,
-            price=quote.price,
-            source=quote.source,
-            source_api=quote.source_api,
-            fetched_at=quote.fetched_at,
-        )
-        db.add(stored)
-        stored.name = quote.name
-        stored.price = quote.price
-        stored.source = quote.source
-        stored.source_api = quote.source_api
-        stored.fetched_at = quote.fetched_at
+            db.add(stored)
+            for key in (
+                "name",
+                "price",
+                "source",
+                "source_api",
+                "fetched_at",
+                "previous_close",
+                "trading_date",
+                "quote_time",
+                "market_status",
+                "price_type",
+                "provider_id",
+                "data_as_of",
+            ):
+                setattr(stored, key, getattr(quote, key))
         inserted = 0
         for bar in bars:
             existing = db.scalar(
@@ -336,15 +344,22 @@ def market_sync(
                 existing.close = bar.close
                 existing.volume = bar.volume
                 existing.fetched_at = bar.fetched_at
+                existing.frequency = bar.frequency
+                existing.adjustment = bar.adjustment
+                existing.price_type = bar.price_type
+                existing.provider_id = bar.provider_id
+                existing.data_as_of = bar.data_as_of
             else:
                 db.add(MarketDailyBar(**bar.__dict__))
                 inserted += 1
         history_sources = sorted({bar.source for bar in bars})
+        quote_source = quote.source if quote else "history_latest_official_close"
+        quote_api = quote.source_api if quote else "market.daily"
         db.add(
             MarketSourceLog(
-                source=" + ".join([quote.source, *history_sources]),
-                api_name=f"{quote.source_api} + {'/'.join(history_sources)}",
-                status="success",
+                source=" + ".join([quote_source, *history_sources]),
+                api_name=f"{quote_api} + {'/'.join(history_sources)}",
+                status="success" if quote else "partial",
                 error=f"实时行情降级原因：{quote_error}" if quote_error else None,
                 row_count=inserted,
             )
@@ -354,17 +369,46 @@ def market_sync(
         job.result_count = inserted + 1
         job.last_error = None
         db.commit()
-        return {
-            "status": "success",
-            "quote": {
+        latest = bars[-1]
+        quote_payload = (
+            {
                 "symbol": symbol,
                 "price": str(quote.price),
+                "previous_close": str(quote.previous_close)
+                if quote.previous_close is not None
+                else None,
                 "source": quote.source,
                 "source_api": quote.source_api,
-                "data_date": quote.fetched_at.date().isoformat(),
-                "updated_at": quote.fetched_at.isoformat(),
+                "trading_date": quote.trading_date.isoformat()
+                if quote.trading_date
+                else None,
+                "quote_time": quote.quote_time.isoformat() if quote.quote_time else None,
+                "market_status": quote.market_status,
+                "price_type": quote.price_type,
+                "provider_id": quote.provider_id,
+                "data_as_of": (quote.data_as_of or quote.fetched_at).isoformat(),
                 "status": "success",
-            },
+            }
+            if quote
+            else {
+                "symbol": symbol,
+                "price": str(latest.close),
+                "previous_close": None,
+                "source": latest.source,
+                "source_api": "market.daily",
+                "trading_date": latest.trade_date.isoformat(),
+                "quote_time": None,
+                "market_status": "unknown",
+                "price_type": "official_close",
+                "provider_id": latest.provider_id,
+                "data_as_of": (latest.data_as_of or latest.fetched_at).isoformat(),
+                "status": "stale",
+                "message": "仅展示最新日线收盘；未写入当前报价，禁止冒充实时价格。",
+            }
+        )
+        return {
+            "status": "success" if quote else "partial",
+            "quote": quote_payload,
             "bars_inserted": inserted,
             "history_source": history_sources[0],
             "fallback_used": bool(quote_error) or history_result.fallback_used,
@@ -395,10 +439,23 @@ def market_sync(
                 "quote": {
                     "symbol": symbol,
                     "price": str(cached_quote.price),
+                    "previous_close": str(cached_quote.previous_close)
+                    if cached_quote.previous_close is not None
+                    else None,
                     "source": cached_quote.source,
                     "source_api": cached_quote.source_api,
-                    "data_date": cached_quote.fetched_at.date().isoformat(),
-                    "updated_at": cached_quote.fetched_at.isoformat(),
+                    "trading_date": cached_quote.trading_date.isoformat()
+                    if cached_quote.trading_date
+                    else None,
+                    "quote_time": cached_quote.quote_time.isoformat()
+                    if cached_quote.quote_time
+                    else None,
+                    "market_status": cached_quote.market_status,
+                    "price_type": cached_quote.price_type,
+                    "provider_id": cached_quote.provider_id or cached_quote.source,
+                    "data_as_of": (
+                        cached_quote.data_as_of or cached_quote.fetched_at
+                    ).isoformat(),
                     "status": "stale",
                 },
                 "bars_inserted": 0,
