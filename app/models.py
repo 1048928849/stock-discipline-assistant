@@ -123,6 +123,13 @@ class MarketQuote(TimestampMixin, Base):
     source: Mapped[str] = mapped_column(String(50))
     source_api: Mapped[str] = mapped_column(String(100))
     fetched_at: Mapped[datetime] = mapped_column(DateTime)
+    previous_close: Mapped[Decimal | None] = mapped_column(PRICE)
+    trading_date: Mapped[date | None] = mapped_column(Date, index=True)
+    quote_time: Mapped[datetime | None] = mapped_column(DateTime)
+    market_status: Mapped[str] = mapped_column(String(30), default="unknown")
+    price_type: Mapped[str] = mapped_column(String(30), default="intraday_snapshot")
+    provider_id: Mapped[str | None] = mapped_column(String(80))
+    data_as_of: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class MarketDailyBar(Base):
@@ -140,6 +147,11 @@ class MarketDailyBar(Base):
     volume: Mapped[Decimal] = mapped_column(Numeric(24, 4))
     source: Mapped[str] = mapped_column(String(50))
     fetched_at: Mapped[datetime] = mapped_column(DateTime)
+    frequency: Mapped[str] = mapped_column(String(20), default="daily")
+    adjustment: Mapped[str] = mapped_column(String(20), default="qfq")
+    price_type: Mapped[str] = mapped_column(String(30), default="official_close")
+    provider_id: Mapped[str | None] = mapped_column(String(80))
+    data_as_of: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class MarketSourceLog(Base):
@@ -449,6 +461,9 @@ class TradePlan(TimestampMixin, Base):
     market_snapshot: Mapped[dict | None] = mapped_column(JSON)
     account_snapshot: Mapped[dict | None] = mapped_column(JSON)
     source_snapshot: Mapped[list | None] = mapped_column(JSON)
+    plan_kind: Mapped[str] = mapped_column(String(30), index=True, default="watch")
+    can_execute: Mapped[bool] = mapped_column(Boolean, default=False)
+    execution_blocked_reasons: Mapped[list | None] = mapped_column(JSON)
     execution_status: Mapped[str] = mapped_column(String(30), index=True, default="draft")
     execution_summary: Mapped[dict | None] = mapped_column(JSON)
 
