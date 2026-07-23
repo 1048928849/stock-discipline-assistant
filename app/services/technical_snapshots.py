@@ -15,19 +15,13 @@ def load_qfq_frame(db: Session, symbol: str) -> pd.DataFrame:
         select(MarketDailyBar)
         .where(
             MarketDailyBar.symbol == symbol,
-            MarketDailyBar.source.in_(
-                (
-                    "akshare_qfq",
-                    "akshare_eastmoney_qfq",
-                    "akshare_tencent_qfq",
-                    "akshare_sina_qfq",
-                )
-            ),
+            MarketDailyBar.frequency == "daily",
+            MarketDailyBar.adjustment == "qfq",
         )
         .order_by(MarketDailyBar.trade_date)
     ).all()
     if not bars:
-        raise ValueError("没有前复权历史数据，请先执行 AKShare 行情同步")
+        raise ValueError("没有标准化的前复权日线数据，请先执行行情同步")
     sources = {}
     for item in bars:
         sources.setdefault(item.source, []).append(item)
@@ -151,7 +145,7 @@ def snapshot_all_holdings(db: Session, refresh_market: bool = False) -> dict:
             snapshot = snapshot_holding(db, holding)
             if refresh_market:
                 holding.current_price = Decimal(str(snapshot.indicators["close"]))
-                holding.price_source = "akshare_qfq_close"
+                holding.price_source = f"{snapshot.data_source}_close"
                 holding.price_updated_at = datetime.now()
             db.flush()
             created += 1

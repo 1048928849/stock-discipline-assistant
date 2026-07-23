@@ -79,7 +79,7 @@ def initialize_plan_execution(db: Session, plan: TradePlan, position_mode: str) 
     )
     if position_mode == "持仓":
         target = "holding"
-    elif plan.status == "READY":
+    elif plan.status == "READY" and plan.can_execute:
         target = "entry_triggered"
     else:
         target = "waiting_entry"
@@ -106,6 +106,14 @@ def _calculate_summary(db: Session, plan: TradePlan, current_price: Decimal | No
     entry_prices: list[Decimal] = []
     for fill in fills:
         if fill.side == "买入":
+            if not plan.can_execute:
+                violations.append(
+                    {
+                        "code": "entry_on_blocked_plan",
+                        "message": "计划保存时不可执行，实际买入属于提前买入或绕过硬规则",
+                        "fill_id": fill.id,
+                    }
+                )
             if fill.quantity % 100:
                 violations.append(
                     {"code": "invalid_lot", "message": "买入数量不是A股100股整数倍", "fill_id": fill.id}

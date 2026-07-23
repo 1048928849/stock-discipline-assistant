@@ -16,12 +16,14 @@ from app.models import (
     CompanyProfile,
     CompanyResearchEvidence,
     CompanyValuationSnapshot,
+    Holding,
     MarketDailyBar,
     MarketQuote,
     PlanAnalysisRun,
     TradePlan,
 )
 from app.providers.market import ProviderUnavailableError
+from app.providers.market import shanghai_now
 from app.schemas_workflow import (
     OneClickPlanRequest,
     TradePlanAIRequest,
@@ -33,6 +35,7 @@ from app.services.company_research import refresh_company_research_if_needed
 from app.services.data_sources import UnifiedDataService
 from app.services.trade_plan_generator import (
     GENERATOR_PARAMETERS,
+    _quote_snapshot,
     generate_trade_plan_preview,
     save_generated_plan,
 )
@@ -88,114 +91,164 @@ def _sync_stock(
     db: Session, symbol: str, provider: UnifiedDataService, refresh: bool
 ) -> tuple[dict, dict]:
     cached = _latest_bar(db, symbol)
-    stale = cached is None or cached.trade_date < date.today() - timedelta(days=5)
-    if cached and not stale and not refresh:
-        return (
-            _step(
-                "market_data",
-                "行情数据",
-                "success",
-                f"本地前复权日线有效，截止 {cached.trade_date.isoformat()}。",
-                source=cached.source,
-                data_time=cached.fetched_at.isoformat(),
-            ),
-            {"data_date": cached.trade_date.isoformat(), "source": cached.source},
-        )
-    try:
-        history_result = provider.get_history(
-            symbol, date.today() - timedelta(days=900), date.today()
-        )
-        bars = history_result.value
-        if len(bars) < 80:
-            raise ProviderUnavailableError(f"前复权日线仅有 {len(bars)} 根，少于80根")
-        quote_error = None
+    history_stale = cached is None or cached.trade_date < date.today() - timedelta(days=5)
+    bars = None
+    history_result = None
+    history_error = None
+    quote_result = None
+    quote_error = None
+    if refresh or history_stale:
         try:
-            quote = provider.get_quote(symbol).value
-        except ProviderUnavailableError as exc:
-            quote_error = str(exc)
-            latest = bars[-1]
-            old_quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
-            from app.providers.market import Quote
-
-            quote = Quote(
-                symbol=symbol,
-                name=old_quote.name if old_quote and old_quote.name else symbol,
-                price=latest.close,
-                source=latest.source,
-                source_api="history_latest_close",
-                fetched_at=latest.fetched_at,
+            history_result = provider.get_history(
+                symbol, date.today() - timedelta(days=900), date.today()
             )
-        for bar in bars:
-            item = db.scalar(
-                select(MarketDailyBar).where(
-                    MarketDailyBar.symbol == symbol,
-                    MarketDailyBar.trade_date == bar.trade_date,
-                    MarketDailyBar.source == bar.source,
-                )
-            )
-            if item is None:
-                db.add(MarketDailyBar(**bar.__dict__))
-            else:
-                for key in ("open", "high", "low", "close", "volume", "fetched_at"):
-                    setattr(item, key, getattr(bar, key))
-        stored_quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
-        if stored_quote is None:
-            stored_quote = MarketQuote(
-                symbol=symbol,
-                name=quote.name,
-                price=quote.price,
-                source=quote.source,
-                source_api=quote.source_api,
-                fetched_at=quote.fetched_at,
-            )
-            db.add(stored_quote)
-        else:
-            stored_quote.name = quote.name
-            stored_quote.price = quote.price
-            stored_quote.source = quote.source
-            stored_quote.source_api = quote.source_api
-            stored_quote.fetched_at = quote.fetched_at
-        db.commit()
-        return (
-            _step(
-                "market_data",
-                "行情数据",
-                "success",
-                f"已自动同步 {len(bars)} 根前复权日线，截止 {bars[-1].trade_date.isoformat()}。"
-                + (f" 实时行情失败，使用最新收盘：{quote_error}" if quote_error else ""),
-                fallback_used=bool(quote_error) or history_result.fallback_used,
-                source=bars[-1].source,
-                data_time=bars[-1].fetched_at.isoformat(),
-            ),
-            {"data_date": bars[-1].trade_date.isoformat(), "source": bars[-1].source},
-        )
+            bars = history_result.value
+            if len(bars) < 80:
+                raise ProviderUnavailableError(f"前复权日线仅有 {len(bars)} 根，少于80根")
+            if any(
+                getattr(item, "frequency", None) != "daily"
+                or getattr(item, "adjustment", None) != "qfq"
+                for item in bars
+            ):
+                raise ProviderUnavailableError("历史行情不符合 daily/qfq 标准契约")
+        except Exception as exc:
+            history_error = str(exc)
+            bars = None
+    try:
+        # 报价与日线采用独立刷新策略：每次一键分析都必须尝试最新报价。
+        quote_result = provider.get_quote(symbol)
+        quote = quote_result.value
     except Exception as exc:
+        quote_error = str(exc)
+        quote = None
+    try:
+        if bars:
+            for bar in bars:
+                item = db.scalar(
+                    select(MarketDailyBar).where(
+                        MarketDailyBar.symbol == symbol,
+                        MarketDailyBar.trade_date == bar.trade_date,
+                        MarketDailyBar.source == bar.source,
+                    )
+                )
+                if item is None:
+                    db.add(MarketDailyBar(**bar.__dict__))
+                else:
+                    for key in (
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume",
+                        "fetched_at",
+                        "frequency",
+                        "adjustment",
+                        "price_type",
+                        "provider_id",
+                        "data_as_of",
+                    ):
+                        setattr(item, key, getattr(bar, key))
+            cached = bars[-1]
+        stored_quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
+        if quote is not None:
+            values = {
+                key: getattr(quote, key)
+                for key in (
+                    "name",
+                    "price",
+                    "source",
+                    "source_api",
+                    "fetched_at",
+                    "previous_close",
+                    "trading_date",
+                    "quote_time",
+                    "market_status",
+                    "price_type",
+                    "provider_id",
+                    "data_as_of",
+                )
+            }
+            if stored_quote is None:
+                stored_quote = MarketQuote(symbol=symbol, **values)
+                db.add(stored_quote)
+            else:
+                for key, value in values.items():
+                    setattr(stored_quote, key, value)
+        db.commit()
+    except Exception:
         db.rollback()
-        cached = _latest_bar(db, symbol)
-        if cached:
-            return (
-                _step(
-                    "market_data",
-                    "行情数据",
-                    "partial",
-                    f"外部行情同步失败，回退到 {cached.trade_date.isoformat()} 的缓存：{exc}",
-                    fallback_used=True,
-                    source=cached.source,
-                    data_time=cached.fetched_at.isoformat(),
-                    missing=["最新行情"],
-                ),
-                {"data_date": cached.trade_date.isoformat(), "source": cached.source},
-            )
+        raise
+    cached = _latest_bar(db, symbol)
+    stored_quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
+    if cached is None:
         return (
             _step(
                 "market_data",
                 "行情数据",
                 "failed",
-                f"行情同步失败且没有可用缓存：{exc}",
-                missing=["前复权日线", "当前价格"],
+                f"行情同步失败且没有可用缓存：{history_error or '没有前复权日线'}",
+                missing=["前复权日线", "本交易日最新行情"],
             ),
-            {"data_date": None, "source": "数据不足"},
+            {
+                "data_date": None,
+                "source": "数据不足",
+                "quote": None,
+            },
         )
+    shanghai_date = shanghai_now().date()
+    quote_meta = _quote_snapshot(stored_quote) if stored_quote else None
+    quote_current = bool(
+        quote_result
+        and quote_meta
+        and quote_meta["trading_date"] == shanghai_date.isoformat()
+        and not quote_meta["stale"]
+    )
+    missing = []
+    detail_parts = []
+    if bars:
+        detail_parts.append(
+            f"已同步 {len(bars)} 根标准前复权日线，截止 {cached.trade_date.isoformat()}"
+        )
+    else:
+        detail_parts.append(f"前复权日线使用缓存，截止 {cached.trade_date.isoformat()}")
+    if history_error:
+        detail_parts.append(f"日线刷新失败：{history_error}")
+        missing.append("最新前复权日线")
+    if quote_error:
+        detail_parts.append(f"本次报价刷新失败：{quote_error}")
+    if quote_meta and quote_current:
+        detail_parts.append(
+            f"{quote_meta['price_type']} 报价 {quote_meta['current_price']}，"
+            f"时间 {quote_meta['quote_time'] or quote_meta['data_as_of']}"
+        )
+    else:
+        detail_parts.append("没有取得本交易日可核验报价；缓存不得冒充今日价格")
+        missing.append("本交易日最新行情")
+    fallback_used = bool(
+        history_error
+        or quote_error
+        or (quote_result and quote_result.fallback_used)
+        or (history_result and history_result.fallback_used)
+    )
+    status = "success" if not missing else "partial"
+    return (
+        _step(
+            "market_data",
+            "行情数据",
+            status,
+            "；".join(detail_parts) + "。",
+            fallback_used=fallback_used,
+            source=cached.source,
+            data_time=cached.fetched_at.isoformat(),
+            missing=missing,
+            quote=quote_meta,
+        ),
+        {
+            "data_date": cached.trade_date.isoformat(),
+            "source": cached.source,
+            "quote": quote_meta,
+        },
+    )
 
 
 def _series_assessment(rows: list[dict]) -> dict:
@@ -225,6 +278,57 @@ def _series_assessment(rows: list[dict]) -> dict:
         "return_20d": round(return_20d, 2),
         "drawdown_20d": round(drawdown_20d, 2),
     }
+
+
+def _refresh_portfolio_quotes(
+    db: Session,
+    account: Account,
+    analyzed_symbol: str,
+    provider: UnifiedDataService,
+) -> dict:
+    holdings = db.scalars(select(Holding).where(Holding.account_id == account.id)).all()
+    pending = [item for item in holdings if item.symbol != analyzed_symbol]
+    if not pending:
+        return _step(
+            "portfolio_quotes",
+            "账户持仓行情",
+            "success",
+            "账户没有其他持仓需要刷新。",
+            source="本地账户",
+            data_time=datetime.now().isoformat(),
+        )
+    refreshed = []
+    missing = []
+    errors = []
+    today = shanghai_now().date()
+    for holding in pending:
+        try:
+            quote_result = provider.get_quote(holding.symbol)
+            quote = quote_result.value
+            if quote.trading_date != today:
+                missing.append(holding.symbol)
+                errors.append(f"{holding.symbol} 返回的交易日不是本交易日")
+                continue
+            holding.current_price = quote.price
+            holding.price_source = (quote.provider_id or quote.source)[:30]
+            holding.price_updated_at = quote.data_as_of or quote.quote_time or quote.fetched_at
+            refreshed.append(holding.symbol)
+        except Exception as exc:
+            missing.append(holding.symbol)
+            errors.append(f"{holding.symbol}: {str(exc)[:160]}")
+    db.commit()
+    return _step(
+        "portfolio_quotes",
+        "账户持仓行情",
+        "success" if not missing else "partial",
+        f"已刷新其他持仓 {len(refreshed)} 只。"
+        + (f" 未取得本交易日价格：{'、'.join(missing)}。" if missing else ""),
+        fallback_used=bool(missing),
+        missing=[f"{symbol} 本交易日价格" for symbol in missing],
+        source="统一行情Provider",
+        data_time=datetime.now().isoformat(),
+        errors=errors,
+    )
 
 
 def _market_assessment(db: Session, provider: UnifiedDataService) -> tuple[dict, dict]:
@@ -399,7 +503,10 @@ def _sector_board_name(profile: CompanyProfile) -> str:
         (("光伏",), "光伏设备"),
         (("医药", "制药"), "化学制药"),
     )
-    return next((board for keys, board in aliases if any(key in text for key in keys)), profile.industry)
+    return next(
+        (board for keys, board in aliases if any(key in text for key in keys)),
+        profile.industry or "",
+    )
 
 
 def _sector_assessment(
@@ -610,6 +717,7 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
     try:
         stock_step, stock_meta = _sync_stock(db, payload.symbol, provider, payload.refresh)
         steps.append(stock_step)
+        steps.append(_refresh_portfolio_quotes(db, account, payload.symbol, provider))
         research_refresh = refresh_company_research_if_needed(
             db,
             payload.symbol,
@@ -786,10 +894,13 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
             "plan": preview,
             "ai": ai_result,
             "generator_request": generator_request.model_dump(mode="json"),
-            "can_save": bool(preview["buy_plan"]["hard_stop"] and preview["data_date"]),
+            "can_save": preview["can_save_as_watch_plan"],
+            "can_save_as_watch_plan": preview["can_save_as_watch_plan"],
+            "can_execute": preview["can_execute"],
+            "execution_blocked_reasons": preview["execution_blocked_reasons"],
             "save_disabled_reason": None
-            if preview["buy_plan"]["hard_stop"] and preview["data_date"]
-            else "缺少可靠买入区、硬止损或行情日期，不能冻结为正式计划。",
+            if preview["can_save_as_watch_plan"]
+            else "缺少可靠买入区、硬止损或行情日期，不能冻结为观察计划。",
         }
         run.status = "success"
         run.pipeline_steps = steps
@@ -800,11 +911,11 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
     except Exception as exc:
         logger.exception("one-click analysis failed", extra={"symbol": payload.symbol})
         db.rollback()
-        run = db.get(PlanAnalysisRun, run.id)
-        if run:
-            run.status = "failed"
-            run.pipeline_steps = steps
-            run.error = f"{type(exc).__name__}: {exc}"
+        failed_run = db.get(PlanAnalysisRun, run.id)
+        if failed_run:
+            failed_run.status = "failed"
+            failed_run.pipeline_steps = steps
+            failed_run.error = f"{type(exc).__name__}: {exc}"
             db.commit()
         raise
 
@@ -820,6 +931,12 @@ def confirm_one_click_plan(db: Session, run_id: int) -> dict:
     generator_payload = result.get("generator_request")
     if not generator_payload or not plan.get("preview_hash"):
         raise AppError(422, "ANALYSIS_NOT_SAVABLE", "分析没有形成可保存的规则快照")
+    if not plan.get("can_save_as_watch_plan"):
+        raise AppError(
+            422,
+            "ANALYSIS_NOT_SAVABLE",
+            "该分析缺少可靠买入区、硬止损或行情日期，不能保存",
+        )
     save_request = TradePlanSaveRequest(
         **generator_payload,
         preview_hash=plan["preview_hash"],

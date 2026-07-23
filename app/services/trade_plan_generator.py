@@ -23,6 +23,7 @@ from app.models import (
     TradePlanCheck,
 )
 from app.schemas_workflow import TradePlanPreviewRequest, TradePlanSaveRequest
+from app.providers.market import shanghai_now
 from app.services.technical import prepare_indicators
 from app.services.technical_snapshots import load_qfq_frame
 from app.services.workflow import ensure_default_rule_version
@@ -47,6 +48,7 @@ GENERATOR_PARAMETERS = {
     "minimum_reward_risk": 2.0,
     "maximum_stop_distance_pct": 8.0,
     "freshness_days": 5,
+    "quote_max_age_minutes": 15,
     "trial_position_ratio": 0.3333,
     "pullback_confirmed_ratio": 0.7,
 }
@@ -123,6 +125,76 @@ def _gate(
 
 def _floor_lot(value: float | Decimal) -> int:
     return max(0, int(Decimal(str(value)).to_integral_value(rounding=ROUND_FLOOR)) // 100 * 100)
+
+
+def _quote_snapshot(quote: MarketQuote | None) -> dict:
+    today = shanghai_now().date()
+    if quote is None:
+        return {
+            "current_price": None,
+            "previous_close": None,
+            "trading_date": None,
+            "quote_time": None,
+            "market_status": "unknown",
+            "price_type": None,
+            "provider_id": None,
+            "data_as_of": None,
+            "fetched_at": None,
+            "is_current_trading_day": False,
+            "stale": True,
+        }
+    trading_date = quote.trading_date
+    data_as_of = quote.data_as_of or quote.quote_time or quote.fetched_at
+    comparable_time = data_as_of
+    if comparable_time and comparable_time.tzinfo is not None:
+        comparable_time = comparable_time.astimezone().replace(tzinfo=None)
+    age_minutes = (
+        max(0.0, (datetime.now() - comparable_time).total_seconds() / 60)
+        if comparable_time
+        else None
+    )
+    requires_live_freshness = (
+        quote.price_type == "intraday_snapshot"
+        and quote.market_status in {"auction", "trading", "break"}
+    )
+    is_current = bool(
+        trading_date == today
+        and (
+            not requires_live_freshness
+            or age_minutes is not None
+            and age_minutes <= GENERATOR_PARAMETERS["quote_max_age_minutes"]
+        )
+    )
+    return {
+        "current_price": float(quote.price),
+        "previous_close": float(quote.previous_close)
+        if quote.previous_close is not None
+        else None,
+        "trading_date": trading_date.isoformat() if trading_date else None,
+        "quote_time": quote.quote_time.isoformat() if quote.quote_time else None,
+        "market_status": quote.market_status,
+        "price_type": quote.price_type,
+        "provider_id": quote.provider_id or quote.source,
+        "data_as_of": data_as_of.isoformat() if data_as_of else None,
+        "fetched_at": quote.fetched_at.isoformat(),
+        "is_current_trading_day": is_current,
+        "age_minutes": round(age_minutes, 2) if age_minutes is not None else None,
+        "stale": not is_current,
+    }
+
+
+def _limit_up_price(symbol: str, name: str, previous_close: float | None) -> float | None:
+    if previous_close is None or previous_close <= 0:
+        return None
+    if "ST" in name.upper():
+        ratio = 0.05
+    elif symbol.startswith(("300", "301", "688", "689")):
+        ratio = 0.20
+    elif symbol.startswith(("4", "8")):
+        ratio = 0.30
+    else:
+        ratio = 0.10
+    return round(previous_close * (1 + ratio) + 1e-8, 2)
 
 
 def _platform_pattern(frame: pd.DataFrame, parameters: dict) -> dict:
@@ -212,6 +284,9 @@ def _platform_pattern(frame: pd.DataFrame, parameters: dict) -> dict:
         "platform_broken": platform_broken,
         "turn_trigger_price": round(turn_trigger, 4),
         "turned_stronger": turned_stronger,
+        "turn_date": pd.Timestamp(prepared.index[-1]).date().isoformat()
+        if turned_stronger
+        else None,
         "latest_close": round(float(last["Close"]), 4),
         "latest_volume_ratio": round(
             float(last["Volume"] / last["VOL_MA20"]) if last["VOL_MA20"] else 0, 2
@@ -250,6 +325,24 @@ def _preview_digest(preview: dict) -> str:
             }
             for item in preview["gates"]
         ],
+        "quote": {
+            key: (preview.get("quote") or {}).get(key)
+            for key in (
+                "current_price",
+                "previous_close",
+                "trading_date",
+                "quote_time",
+                "market_status",
+                "price_type",
+                "provider_id",
+                "data_as_of",
+                "is_current_trading_day",
+                "stale",
+            )
+        },
+        "can_save_as_watch_plan": preview.get("can_save_as_watch_plan"),
+        "can_execute": preview.get("can_execute"),
+        "execution_blocked_reasons": preview.get("execution_blocked_reasons"),
         "data_date": preview["data_date"],
     }
     return hashlib.sha256(
@@ -271,11 +364,16 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
     )
     latest_bar = db.scalar(
         select(MarketDailyBar)
-        .where(MarketDailyBar.symbol == request.symbol)
+        .where(
+            MarketDailyBar.symbol == request.symbol,
+            MarketDailyBar.frequency == "daily",
+            MarketDailyBar.adjustment == "qfq",
+        )
         .order_by(MarketDailyBar.trade_date.desc(), MarketDailyBar.fetched_at.desc())
     )
     quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == request.symbol))
-    holding = stored_holding
+    quote_snapshot = _quote_snapshot(quote)
+    holding: Holding | SimpleNamespace | None = stored_holding
     if request.position_mode == "空仓":
         holding = None
     elif request.position_mode == "持仓" and request.holding_quantity and request.holding_cost_price:
@@ -287,12 +385,16 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             else request.holding_cost_price
         )
         holding = SimpleNamespace(
+            symbol=request.symbol,
             quantity=request.holding_quantity,
             cost_price=request.holding_cost_price,
             current_price=reference_price,
             stop_loss_price=stored_holding.stop_loss_price if stored_holding else None,
             target_price=stored_holding.target_price if stored_holding else None,
             sector=stored_holding.sector if stored_holding else (profile.industry if profile else None),
+            price_updated_at=quote.data_as_of or quote.quote_time or quote.fetched_at
+            if quote
+            else None,
         )
     missing = []
     try:
@@ -453,7 +555,13 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             gates.append(
                 _gate(code, name, "无法判断", "历史行情数据不足。", source, data_time, missing)
             )
-    current_price = float(quote.price) if quote else pattern["latest_close"] if pattern else None
+    current_price = (
+        quote_snapshot["current_price"]
+        if quote_snapshot["current_price"] is not None
+        else pattern["latest_close"]
+        if pattern
+        else None
+    )
     stop = None
     stop_distance_pct = None
     entry_reference = None
@@ -479,7 +587,7 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             reward_risk = (raw_first_target - entry_reference) / (entry_reference - stop)
     stop_status = (
         "无法判断"
-        if stop is None
+        if stop is None or stop_distance_pct is None
         else "不通过"
         if stop_distance_pct > float(parameters["maximum_stop_distance_pct"])
         else "通过"
@@ -495,6 +603,26 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             source,
             data_time,
             [] if stop is not None else ["平台下沿、有效低点或ATR"],
+        )
+    )
+    quote_status = "通过" if quote_snapshot["is_current_trading_day"] else "无法判断"
+    quote_evidence = (
+        f"{quote_snapshot['price_type']}，价格 {quote_snapshot['current_price']}，"
+        f"交易日 {quote_snapshot['trading_date']}，时间 "
+        f"{quote_snapshot['quote_time'] or quote_snapshot['data_as_of']}，"
+        f"市场状态 {quote_snapshot['market_status']}。"
+        if quote_snapshot["current_price"] is not None
+        else "没有取得可核验报价。"
+    )
+    gates.append(
+        _gate(
+            "quote",
+            "本交易日行情基准",
+            quote_status,
+            quote_evidence,
+            quote_snapshot["provider_id"] or "数据不足",
+            quote_snapshot["data_as_of"] or "数据不足",
+            [] if quote_status == "通过" else ["本交易日最新有效报价"],
         )
     )
     rr_status = (
@@ -521,6 +649,16 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
         holdings = [item for item in holdings if item.symbol != request.symbol]
     elif request.position_mode == "持仓" and holding is not None:
         holdings = [item for item in holdings if item.symbol != request.symbol] + [holding]
+    quote_day = shanghai_now().date()
+    stale_portfolio_symbols = []
+    for item in holdings:
+        price_updated_at = getattr(item, "price_updated_at", None)
+        if (
+            item.symbol != request.symbol
+            and (price_updated_at is None or price_updated_at.date() != quote_day)
+        ):
+            stale_portfolio_symbols.append(item.symbol)
+    stale_portfolio_symbols = sorted(set(stale_portfolio_symbols))
     total_value = sum(Decimal(item.quantity) * item.current_price for item in holdings)
     industry = profile.industry if profile else None
     industry_value = sum(
@@ -570,20 +708,37 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             "formula": "最终数量=min(风险预算、可用资金、单股仓位、总仓位、行业集中度允许数量)，再向下取100股整手",
         }
     position_status = (
-        "无法判断" if not calculations else "不通过" if final_quantity < 100 else "通过"
+        "无法判断"
+        if not calculations or stale_portfolio_symbols
+        else "不通过"
+        if final_quantity < 100
+        else "通过"
     )
     gates.append(
         _gate(
             "position",
             "仓位是否超过账户限制",
             position_status,
-            calculations.get("formula", "缺少有效买入价或止损价，无法计算仓位。"),
+            (
+                f"其他持仓缺少本交易日价格：{'、'.join(stale_portfolio_symbols)}；"
+                "账户总仓位和行业集中度只作参考。"
+                if stale_portfolio_symbols
+                else calculations.get("formula", "缺少有效买入价或止损价，无法计算仓位。")
+            ),
             "账户、持仓和用户风险参数",
             now.isoformat(),
-            [] if calculations else ["有效买入价与硬止损"],
+            [f"{symbol} 本交易日价格" for symbol in stale_portfolio_symbols]
+            if stale_portfolio_symbols
+            else []
+            if calculations
+            else ["有效买入价与硬止损"],
         )
     )
-    data_status = "无法判断" if missing or stale else "通过"
+    data_status = (
+        "无法判断"
+        if missing or stale or not quote_snapshot["is_current_trading_day"]
+        else "通过"
+    )
     gates.append(
         _gate(
             "data",
@@ -592,13 +747,25 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             f"最近K线 {data_date or '缺失'}；{'数据已过期' if stale else '数据在允许时效内'}；60分钟和换手率尚未接入。",
             source,
             data_time,
-            [*missing, "60分钟K线", "换手率"] if missing or stale else ["60分钟K线", "换手率"],
+            [*missing, "本交易日最新有效报价", "60分钟K线", "换手率"]
+            if missing or stale or not quote_snapshot["is_current_trading_day"]
+            else ["60分钟K线", "换手率"],
         )
     )
     statuses = {item["code"]: item["status"] for item in gates}
     critical_unknown = any(
         statuses[code] == "无法判断"
-        for code in ("market", "sector", "large_cycle", "platform", "stop", "reward_risk", "data")
+        for code in (
+            "market",
+            "sector",
+            "large_cycle",
+            "platform",
+            "stop",
+            "reward_risk",
+            "position",
+            "quote",
+            "data",
+        )
     )
     hard_fail = any(
         statuses[code] == "不通过"
@@ -650,15 +817,72 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
         hard_stop_triggered = False
         first_reduction_triggered = False
         confirmation_add_allowed = False
-    current_allowed = final_status == "READY" and trial_quantity >= 100
-    buy_low = (
-        round(entry_reference - pattern["atr14"] * 0.2, 4) if entry_reference and pattern else None
-    )
+    buy_low = round(entry_reference, 4) if entry_reference else None
     buy_high = (
         round(entry_reference + pattern["atr14"] * 0.2, 4) if entry_reference and pattern else None
     )
+    maximum_chase_price = round(entry_reference * 1.03, 4) if entry_reference else None
+    limit_up = _limit_up_price(
+        request.symbol,
+        (profile.name if profile else quote.name if quote else request.symbol)
+        or request.symbol,
+        quote_snapshot["previous_close"],
+    )
+    today_trigger_possible = None
+    if entry_reference is not None and limit_up is not None:
+        today_trigger_possible = entry_reference <= limit_up
+    confirmation_before_quote_day = bool(
+        pattern
+        and pattern["turned_stronger"]
+        and pattern["turn_date"]
+        and quote_snapshot["trading_date"]
+        and pattern["turn_date"] < quote_snapshot["trading_date"]
+    )
+    market_open = quote_snapshot["market_status"] == "trading"
+    price_in_execution_zone = bool(
+        current_price is not None
+        and buy_low is not None
+        and maximum_chase_price is not None
+        and buy_low <= current_price <= maximum_chase_price
+    )
+    current_allowed = bool(
+        final_status == "READY"
+        and trial_quantity >= 100
+        and quote_snapshot["is_current_trading_day"]
+        and market_open
+        and confirmation_before_quote_day
+        and price_in_execution_zone
+        and today_trigger_possible is not False
+    )
     reasons = [item["evidence"] for item in gates if item["status"] in {"不通过", "无法判断"}]
     next_items = [item["evidence"] for item in gates if item["status"] in {"警告", "无法判断"}][:5]
+    execution_blocked_reasons = []
+    if final_status != "READY":
+        execution_blocked_reasons.append(f"规则状态为 {final_status}，关键条件尚未全部通过")
+    if not quote_snapshot["is_current_trading_day"]:
+        execution_blocked_reasons.append("没有本交易日最新有效报价")
+    if not market_open:
+        execution_blocked_reasons.append(
+            f"当前市场状态为 {quote_snapshot['market_status']}，不能按盘中计划立即买入"
+        )
+    if not confirmation_before_quote_day:
+        execution_blocked_reasons.append("日线收盘确认尚未发生在本交易日之前")
+    if final_quantity < 100:
+        execution_blocked_reasons.append("最低一手仍超过风险或仓位预算")
+    if stop_status != "通过":
+        execution_blocked_reasons.append("硬止损无效或超过最大止损距离")
+    if not price_in_execution_zone:
+        execution_blocked_reasons.append("当前价格不在触发价至最大追价范围内")
+    if today_trigger_possible is False:
+        execution_blocked_reasons.append("触发价高于按昨收计算的今日涨停价，今日不可能触发")
+    execution_blocked_reasons = list(dict.fromkeys(execution_blocked_reasons))
+    can_save_as_watch_plan = bool(
+        buy_low is not None
+        and buy_high is not None
+        and stop is not None
+        and stop < buy_low
+        and data_date
+    )
     sources = [
         {
             "source_id": "market_bars",
@@ -666,6 +890,15 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             "data_date": data_date,
             "fetched_at": data_time,
             "stale": stale,
+        },
+        {
+            "source_id": "market_quote",
+            "name": quote_snapshot["provider_id"] or "数据不足",
+            "data_date": quote_snapshot["trading_date"],
+            "fetched_at": quote_snapshot["data_as_of"],
+            "stale": quote_snapshot["stale"],
+            "price_type": quote_snapshot["price_type"],
+            "market_status": quote_snapshot["market_status"],
         },
         {
             "source_id": "account",
@@ -699,6 +932,11 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
         ),
         "next_observations": next_items or ["持续检查板块、公司逻辑和结构是否变化。"],
         "current_buy_allowed": current_allowed,
+        "can_save_as_watch_plan": can_save_as_watch_plan,
+        "can_execute": current_allowed,
+        "execution_blocked_reasons": execution_blocked_reasons,
+        "plan_kind": "executable" if current_allowed else "watch",
+        "quote": quote_snapshot,
         "rule": {"version": rule.version, "name": rule.rules["name"], "parameters": parameters},
         "account": {
             "id": account.id,
@@ -711,6 +949,7 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             "max_position_pct": float(request.max_position_pct),
             "max_total_position_pct": float(request.max_total_position_pct),
             "max_industry_position_pct": float(request.max_industry_position_pct),
+            "stale_portfolio_price_symbols": stale_portfolio_symbols,
         },
         "existing_position": {
             "exists": bool(holding),
@@ -759,6 +998,15 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             "buy_zone": [buy_low, buy_high],
             "turn_trigger_price": pattern["turn_trigger_price"] if pattern else None,
             "trigger_condition": "收盘越过转强触发价、超过前一日高点，且成交量不低于20日均量。",
+            "activation_sequence": [
+                "日线收盘确认再次转强",
+                "最早从下一交易日开始执行",
+                "盘中最新价不得低于触发价，也不得超过最大追价价",
+            ],
+            "earliest_execution": "确认收盘后的下一交易日",
+            "maximum_chase_price": maximum_chase_price,
+            "today_limit_up": limit_up,
+            "today_trigger_possible": today_trigger_possible,
             "hard_stop": stop,
             "stop_cannot_move_down": True,
             "structure_invalidation": f"收盘跌破平台下沿 {pattern['platform_lower']} 或放量跌回平台。"
@@ -812,7 +1060,11 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             "types": ["减仓", "清仓", "硬止损", "移动止盈", "逻辑退出"],
         },
         "sources": sources,
-        "data_status": "stale" if stale else "success" if frame is not None else "insufficient",
+        "data_status": "stale"
+        if stale or quote_snapshot["stale"]
+        else "success"
+        if frame is not None
+        else "insufficient",
         "data_date": data_date,
         "generated_at": now.isoformat(),
         "disclaimer": "这是条件式研究计划，不预测涨跌、不连接券商、不自动下单。",
@@ -836,8 +1088,12 @@ def save_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
     version = (latest.plan_version or 1) + 1 if latest else 1
     buy_zone = preview["buy_plan"]["buy_zone"]
     stop = preview["buy_plan"]["hard_stop"]
-    if not buy_zone[0] or not stop:
-        raise AppError(422, "PLAN_NOT_SAVABLE", "缺少可靠买入区或硬止损，不能保存正式计划")
+    if not preview["can_save_as_watch_plan"]:
+        raise AppError(
+            422,
+            "PLAN_NOT_SAVABLE",
+            "缺少可靠买入区、硬止损或行情日期，不能保存观察计划",
+        )
     rule = ensure_generator_rule_version(db)
     quantity = preview["position_calculation"].get("final_allowed_quantity", 0)
     entry = buy_zone[1]
@@ -891,6 +1147,9 @@ def save_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
         },
         account_snapshot=preview["account"],
         source_snapshot=preview["sources"],
+        plan_kind=preview["plan_kind"],
+        can_execute=preview["can_execute"],
+        execution_blocked_reasons=preview["execution_blocked_reasons"],
     )
     db.add(plan)
     db.flush()
@@ -931,6 +1190,9 @@ def save_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
         "plan_version": version,
         "status": plan.status,
         "execution_status": plan.execution_status,
+        "plan_kind": plan.plan_kind,
+        "can_execute": plan.can_execute,
+        "execution_blocked_reasons": plan.execution_blocked_reasons,
         "preview": preview,
     }
 
@@ -947,6 +1209,9 @@ def plan_history(db: Session, account_id: int, symbol: str) -> list[dict]:
             "plan_version": item.plan_version,
             "status": item.status,
             "execution_status": item.execution_status,
+            "plan_kind": item.plan_kind,
+            "can_execute": item.can_execute,
+            "execution_blocked_reasons": item.execution_blocked_reasons or [],
             "buy_zone": [float(item.buy_zone_low), float(item.buy_zone_high)],
             "stop": float(item.initial_stop),
             "rule_version": db.get(RuleVersion, item.rule_version_id).version,

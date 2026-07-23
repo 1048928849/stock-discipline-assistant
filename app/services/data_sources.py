@@ -126,48 +126,55 @@ class UnifiedDataService:
             if not provider.configured:
                 continue
             attempted += 1
-            started = datetime.now()
-            timer = time.perf_counter()
-            try:
-                value = getattr(provider, operation)(*args, **kwargs)
-                if validator and not validator(value):
-                    raise ProviderUnavailableError("返回数据未通过完整性检查")
-                result = ProviderResult(
-                    value=value,
-                    provider_id=provider.provider_id,
-                    capability=capability,
-                    fetched_at=datetime.now(),
-                    fallback_used=attempted > 1,
-                    cache_used=False,
-                    errors=errors.copy(),
-                )
-                self._log(
-                    provider_id=provider.provider_id,
-                    capability=capability,
-                    operation=operation,
-                    symbol=symbol,
-                    status="success",
-                    started=started,
-                    duration_ms=int((time.perf_counter() - timer) * 1000),
-                    row_count=self._row_count(value),
-                    fallback_used=attempted > 1,
-                )
-                self.calls[capability] = result
-                return result
-            except Exception as exc:
-                detail = f"{provider.provider_id}: {type(exc).__name__}: {str(exc)[:300]}"
-                errors.append(detail)
-                self._log(
-                    provider_id=provider.provider_id,
-                    capability=capability,
-                    operation=operation,
-                    symbol=symbol,
-                    status="failed",
-                    started=started,
-                    duration_ms=int((time.perf_counter() - timer) * 1000),
-                    error=detail,
-                    fallback_used=attempted > 1,
-                )
+            max_attempts = max(1, int(provider.metadata.retry))
+            for retry_index in range(1, max_attempts + 1):
+                started = datetime.now()
+                timer = time.perf_counter()
+                try:
+                    value = getattr(provider, operation)(*args, **kwargs)
+                    if validator and not validator(value):
+                        raise ProviderUnavailableError("返回数据未通过完整性检查")
+                    result = ProviderResult(
+                        value=value,
+                        provider_id=provider.provider_id,
+                        capability=capability,
+                        fetched_at=datetime.now(),
+                        fallback_used=attempted > 1,
+                        cache_used=False,
+                        errors=errors.copy(),
+                    )
+                    self._log(
+                        provider_id=provider.provider_id,
+                        capability=capability,
+                        operation=operation,
+                        symbol=symbol,
+                        status="success",
+                        started=started,
+                        duration_ms=int((time.perf_counter() - timer) * 1000),
+                        row_count=self._row_count(value),
+                        fallback_used=attempted > 1,
+                    )
+                    self.calls[capability] = result
+                    return result
+                except Exception as exc:
+                    detail = (
+                        f"{provider.provider_id}[{retry_index}/{max_attempts}]: "
+                        f"{type(exc).__name__}: {str(exc)[:300]}"
+                    )
+                    errors.append(detail)
+                    self._log(
+                        provider_id=provider.provider_id,
+                        capability=capability,
+                        operation=operation,
+                        symbol=symbol,
+                        status="failed",
+                        started=started,
+                        duration_ms=int((time.perf_counter() - timer) * 1000),
+                        error=detail,
+                        fallback_used=attempted > 1,
+                    )
+                    if retry_index < max_attempts:
+                        time.sleep(min(0.25 * retry_index, 1.0))
         if cache_loader:
             cached = cache_loader()
             if cached is not None and self._row_count(cached) > 0:
