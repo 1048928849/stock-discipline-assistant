@@ -126,6 +126,9 @@ def downgrade() -> None:
     if "execution_summary" in columns:
         op.drop_column("trade_plans", "execution_summary")
     if "execution_status" in columns:
+        indexes = {item["name"] for item in inspector.get_indexes("trade_plans")}
+        if "ix_trade_plans_execution_status" in indexes:
+            op.drop_index("ix_trade_plans_execution_status", table_name="trade_plans")
         op.drop_column("trade_plans", "execution_status")
     if "company_research_refreshes" in tables:
         op.drop_table("company_research_refreshes")
