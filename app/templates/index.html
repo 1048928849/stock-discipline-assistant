@@ -23,6 +23,32 @@
     <div class="notice">仅供研究与纪律记录，不构成投资建议。系统不预测涨跌、不连接券商、不自动下单。</div>
 
     <section class="panel" data-view="dashboard">
+      <div class="hero-plan">
+        <p class="eyebrow">核心入口</p><h2>一键生成交易计划</h2>
+        <p>输入股票代码，系统自动完成行情、市场、行业、个股、风险和AI解释。最终结论由规则引擎决定，不自动下单。</p>
+        <form class="one-click-plan-form" data-result="dashboard-plan-result" data-progress="dashboard-plan-progress" data-actions="dashboard-plan-actions">
+          <div class="quick-fields">
+            <label><span>股票代码</span><input name="symbol" pattern="\d{6}" inputmode="numeric" placeholder="例如 300502" required></label>
+            <label><span>当前状态</span><select name="position_mode"><option value="空仓">空仓，准备买入</option><option value="持仓">已经持有</option></select></label>
+            <label><span>账户</span><select name="account_id" class="one-click-account"><option value="">自动选择上次账户</option></select></label>
+            <label class="capital-field"><span>本次计划资金</span><input name="plan_capital" type="number" min="10000" step="10000" value="300000"><small>没有账户时自动建立默认研究账户。</small></label>
+            <label class="holding-field" hidden><span>持仓数量</span><input name="holding_quantity" type="number" min="100" step="100"></label>
+            <label class="holding-field" hidden><span>持仓成本</span><input name="holding_cost_price" type="number" min="0.01" step="0.01"></label>
+          </div>
+          <details class="advanced-settings"><summary>高级设置（默认纪律参数）</summary><div class="quick-fields">
+            <label><span>单笔风险</span><input name="risk_pct" type="number" min="0.1" max="10" step="0.1" value="0.5"><small>按账户权益反推最大亏损。</small></label>
+            <label><span>单票最大仓位</span><input name="max_position_pct" type="number" min="1" max="100" value="30"><small>首仓约为计划仓位的三分之一。</small></label>
+            <label><span>账户最大总仓位</span><input name="max_total_position_pct" type="number" min="1" max="100" value="80"></label>
+            <label><span>行业集中度上限</span><input name="max_industry_position_pct" type="number" min="1" max="100" value="40"></label>
+            <label class="checkbox-label"><input name="enable_ai" type="checkbox" checked>生成AI辅助解释</label>
+            <label class="checkbox-label"><input name="refresh" type="checkbox">强制刷新行情</label>
+          </div></details>
+          <button class="primary-action">开始分析并生成计划</button>
+        </form>
+        <div id="dashboard-plan-progress" class="pipeline-progress"></div>
+        <div id="dashboard-plan-result" class="one-click-result"><div class="missing-data">下一步：输入股票代码并选择空仓或持仓。</div></div>
+        <div id="dashboard-plan-actions" class="action-row" hidden><button type="button" class="confirm-one-click-plan">确认并保存计划</button><span class="save-reason"></span></div>
+      </div>
       <h2>今日工作台</h2><p>只汇总可追溯数据；证据不足时明确显示“数据不足，无法判断”。</p>
       <div id="dashboard-market" class="cards"></div><h3>今天最应该处理的事项</h3><div id="dashboard-priorities" class="action-list"></div>
       <div class="workspace-grid"><section><h3>持仓风险</h3><div id="dashboard-holdings" class="risk-grid"></div></section><section><h3>接近计划条件</h3><div id="dashboard-plans" class="risk-grid"></div></section></div>
@@ -39,20 +65,23 @@
       <p class="hint">完整持仓字段可在 API 文档中新增；行情未同步时请使用真实手工价格，不得用随机数据代替。</p>
     </section>
 
-    <section class="panel" data-view="trade-plans"><h2>交易计划生成器</h2><p>确定性规则先计算技术结构、硬止损、风险收益和仓位；AI 只归纳可追溯证据。系统不连接券商、不自动下单、不承诺涨跌。</p><div id="rule-version-card"></div>
-      <form id="trade-plan-form" class="backtest-form">
-        <label><span>股票代码</span><input name="symbol" pattern="\d{6}" placeholder="例如 300502" required></label><label><span>账户</span><select name="account_id" id="plan-account" required></select></label>
-        <label><span>交易模式</span><select name="trade_mode"><option>日线趋势波段</option></select></label><label><span>当前市场环境</span><select name="market_state"><option>无法判断</option><option>上升</option><option>震荡</option><option>下降</option></select><small>当前未接入宽基自动模型，请按真实观察选择。</small></label>
-        <label><span>行业/板块强弱</span><select name="sector_state"><option>无法判断</option><option>强</option><option>中性</option><option>弱</option></select><small>当前未接入行业指数自动强弱。</small></label><label><span>单笔风险（%）</span><input name="risk_pct" type="number" min="0.1" max="10" step="0.1" value="0.5" required></label>
-        <label><span>单只股票最大仓位（%）</span><input name="max_position_pct" type="number" min="1" max="100" value="20" required></label><label><span>账户最大总仓位（%）</span><input name="max_total_position_pct" type="number" min="1" max="100" value="80" required></label>
-        <label><span>行业集中度上限（%）</span><input name="max_industry_position_pct" type="number" min="1" max="100" value="35" required></label><label><span>逻辑失效条件（可补充）</span><textarea name="logic_invalidation" placeholder="只写可验证的行业/公司失效条件"></textarea></label>
-        <button id="generate-plan-button">生成条件式计划</button>
+    <section class="panel" data-view="trade-plans"><h2>交易计划</h2><p>行情、市场、行业、个股规则、仓位和AI解释一次生成；用户最后确认保存。</p><div id="rule-version-card"></div>
+      <form class="one-click-plan-form" data-result="trade-plan-result" data-progress="trade-plan-progress" data-actions="plan-actions">
+        <div class="quick-fields"><label><span>股票代码</span><input name="symbol" pattern="\d{6}" inputmode="numeric" placeholder="例如 300502" required></label><label><span>当前状态</span><select name="position_mode"><option value="空仓">空仓，准备买入</option><option value="持仓">已经持有</option></select></label><label><span>账户</span><select name="account_id" class="one-click-account"><option value="">自动选择上次账户</option></select></label><label class="capital-field"><span>本次计划资金</span><input name="plan_capital" type="number" min="10000" step="10000" value="300000"></label><label class="holding-field" hidden><span>持仓数量</span><input name="holding_quantity" type="number" min="100" step="100"></label><label class="holding-field" hidden><span>持仓成本</span><input name="holding_cost_price" type="number" min="0.01" step="0.01"></label></div>
+        <details class="advanced-settings"><summary>高级设置</summary><div class="quick-fields"><label><span>单笔风险（%）</span><input name="risk_pct" type="number" min="0.1" max="10" step="0.1" value="0.5"></label><label><span>单票最大仓位（%）</span><input name="max_position_pct" type="number" min="1" max="100" value="30"></label><label><span>账户最大总仓位（%）</span><input name="max_total_position_pct" type="number" min="1" max="100" value="80"></label><label><span>行业集中度上限（%）</span><input name="max_industry_position_pct" type="number" min="1" max="100" value="40"></label><label><span>补充逻辑失效条件</span><textarea name="logic_invalidation"></textarea></label><label class="checkbox-label"><input name="enable_ai" type="checkbox" checked>生成AI辅助解释</label><label class="checkbox-label"><input name="refresh" type="checkbox">强制刷新行情</label></div></details>
+        <button class="primary-action">开始分析并生成计划</button>
       </form>
-      <div id="trade-plan-result"><div class="missing-data">输入股票代码并选择账户后生成计划。请先在“市场与主线数据”同步真实前复权日线。</div></div>
+      <div id="trade-plan-progress" class="pipeline-progress"></div>
+      <div id="trade-plan-result"><div class="missing-data">下一步：输入股票代码，系统会自动同步并分析，不需要先去其他页面。</div></div>
       <div id="plan-chart-shell" class="chart-shell" hidden><canvas id="plan-kline-chart" width="1100" height="390"></canvas></div>
-      <div id="plan-actions" class="action-row" hidden><button type="button" id="save-generated-plan">确认并保存当前版本</button><button type="button" id="run-plan-ai">运行 AI 辅助研究</button></div>
-      <section id="plan-ai-section"><h3>大模型辅助研究</h3><div id="plan-ai-result" class="missing-data">未运行。即使未配置模型，规则计划仍可正常使用。</div></section>
+      <div id="plan-actions" class="action-row" hidden><button type="button" class="confirm-one-click-plan">确认并保存计划</button><span class="save-reason"></span></div>
       <h3>该股票历史计划版本</h3><div id="plan-history" class="risk-grid"><div class="missing-data">生成计划后显示。</div></div>
+      <section class="research-block"><h3>历史计划执行跟踪</h3><p>仅记录用户手工确认的成交，不连接券商、不自动下单。测试成交必须勾选“测试数据”。</p>
+        <div class="action-row"><input id="execution-plan-id" type="number" min="1" placeholder="计划 ID"><button type="button" id="load-plan-execution">读取执行记录</button></div>
+        <form id="plan-fill-form" class="form-grid"><select name="side"><option value="买入">买入</option><option value="卖出">卖出</option></select><input name="quantity" type="number" min="1" step="100" placeholder="成交数量" required><input name="price" type="number" min="0.01" step="0.01" placeholder="成交价格" required><input name="fee" type="number" min="0" step="0.01" value="0" placeholder="费用"><input name="executed_at" type="datetime-local" required><select name="reason"><option>首次试仓</option><option>确认加仓</option><option>减仓</option><option>止盈</option><option>硬止损</option><option>逻辑退出</option><option>其他</option></select><select name="trigger_confirmed"><option value="">触发条件：未记录</option><option value="true">触发条件已满足</option><option value="false">触发条件未满足</option></select><label class="checkbox-label"><input name="is_test" type="checkbox">这是测试成交</label><input name="notes" placeholder="备注"><button>手工录入成交</button></form>
+        <form id="plan-execution-evaluate" class="form-grid"><input name="current_price" type="number" min="0.01" step="0.01" placeholder="当前价格（用于检查止损）"><select name="event"><option value="">只更新偏差检查</option><option value="entry_triggered">买入条件触发</option><option value="add_triggered">确认加仓触发</option><option value="reduce_triggered">减仓条件触发</option><option value="stop_triggered">硬止损触发</option><option value="take_profit_triggered">止盈条件触发</option><option value="invalidated">逻辑失效</option></select><input name="evidence" placeholder="判断依据"><button>更新计划状态</button></form>
+        <div id="plan-execution-result"><div class="missing-data">保存计划后选择计划版本查看执行跟踪。</div></div>
+      </section>
       <h3>已有计划</h3><div id="trade-plan-list" class="risk-grid"></div><details class="developer-details"><summary>技术详情 / 调试信息（默认隐藏）</summary><pre id="trade-plan-json"></pre></details>
     </section>
 

@@ -1,8 +1,8 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TradePlanCreate(BaseModel):
@@ -67,12 +67,29 @@ class TradePlanPreviewRequest(BaseModel):
     account_id: int
     trade_mode: Literal["日线趋势波段"] = "日线趋势波段"
     risk_pct: Decimal = Field(default=Decimal("0.5"), gt=0, le=10)
-    max_position_pct: Decimal = Field(default=Decimal("20"), gt=0, le=100)
+    max_position_pct: Decimal = Field(default=Decimal("30"), gt=0, le=100)
     max_total_position_pct: Decimal = Field(default=Decimal("80"), gt=0, le=100)
     max_industry_position_pct: Decimal = Field(default=Decimal("35"), gt=0, le=100)
     market_state: Literal["上升", "震荡", "下降", "无法判断"] = "无法判断"
     sector_state: Literal["强", "中性", "弱", "无法判断"] = "无法判断"
     logic_invalidation: str | None = Field(default=None, max_length=3000)
+    position_mode: Literal["空仓", "持仓"] | None = None
+    holding_quantity: int | None = Field(default=None, ge=100)
+    holding_cost_price: Decimal | None = Field(default=None, gt=0)
+    market_evidence: str | None = Field(default=None, max_length=2000)
+    market_source: str | None = Field(default=None, max_length=200)
+    market_data_time: str | None = Field(default=None, max_length=80)
+    sector_evidence: str | None = Field(default=None, max_length=2000)
+    sector_source: str | None = Field(default=None, max_length=200)
+    sector_data_time: str | None = Field(default=None, max_length=80)
+
+    @model_validator(mode="after")
+    def validate_position_input(self):
+        if self.position_mode == "持仓" and (
+            self.holding_quantity is None or self.holding_cost_price is None
+        ):
+            raise ValueError("选择已经持有时必须填写持仓数量和持仓成本")
+        return self
 
 
 class TradePlanSaveRequest(TradePlanPreviewRequest):
@@ -81,26 +98,130 @@ class TradePlanSaveRequest(TradePlanPreviewRequest):
 
 
 class EvidenceClaim(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     claim: str = Field(min_length=1, max_length=2000)
     source_ids: list[str] = Field(min_length=1, max_length=20)
     confidence: Literal["high", "medium", "low"]
 
 
+class RawFact(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    fact: str = Field(min_length=1, max_length=2000)
+    source_ids: list[str] = Field(min_length=1, max_length=20)
+    as_of: str | None = Field(default=None, max_length=40)
+    confidence: Literal["high", "medium", "low"]
+
+
+class RuleConclusion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    code: str = Field(min_length=1, max_length=80)
+    status: str = Field(min_length=1, max_length=40)
+    conclusion: str = Field(min_length=1, max_length=1000)
+    basis: str = Field(min_length=1, max_length=2000)
+
+
+class AIStatement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    topic: str = Field(min_length=1, max_length=100)
+    content: str = Field(min_length=1, max_length=3000)
+    source_ids: list[str] = Field(default_factory=list, max_length=20)
+    confidence: Literal["high", "medium", "low"]
+
+
+class InformationConflict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    description: str = Field(min_length=1, max_length=2000)
+    source_ids: list[str] = Field(min_length=2, max_length=20)
+
+
+class DataFreshnessItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    category: str = Field(min_length=1, max_length=80)
+    latest_at: str | None = Field(default=None, max_length=40)
+    stale: bool
+    source_ids: list[str] = Field(default_factory=list, max_length=50)
+
+
+class ProviderStatusItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    provider_id: str = Field(min_length=1, max_length=80)
+    status: str = Field(min_length=1, max_length=40)
+    capabilities: list[str] = Field(default_factory=list, max_length=50)
+    message: str | None = Field(default=None, max_length=1000)
+
+
 class TradePlanAIResult(BaseModel):
-    company_summary: str = Field(default="", max_length=3000)
-    business_drivers: list[str] = Field(default_factory=list, max_length=20)
-    financial_findings: list[str] = Field(default_factory=list, max_length=20)
-    industry_findings: list[str] = Field(default_factory=list, max_length=20)
-    valuation_findings: list[str] = Field(default_factory=list, max_length=20)
+    model_config = ConfigDict(extra="forbid")
+    schema_version: Literal["2.0"]
+    computed_results: dict
+    raw_facts: list[RawFact] = Field(default_factory=list, max_length=80)
+    rule_conclusions: list[RuleConclusion] = Field(default_factory=list, max_length=30)
+    ai_summaries: list[AIStatement] = Field(default_factory=list, max_length=20)
+    ai_inferences: list[AIStatement] = Field(default_factory=list, max_length=20)
     supporting_evidence: list[EvidenceClaim] = Field(default_factory=list, max_length=20)
-    counter_evidence: list[EvidenceClaim] = Field(default_factory=list, max_length=20)
-    risk_events: list[str] = Field(default_factory=list, max_length=20)
-    logic_invalidation_conditions: list[str] = Field(default_factory=list, max_length=20)
-    missing_information: list[str] = Field(default_factory=list, max_length=20)
-    conflicting_information: list[str] = Field(default_factory=list, max_length=20)
-    questions_to_verify: list[str] = Field(default_factory=list, max_length=20)
-    plain_language_summary: str = Field(default="", max_length=5000)
+    opposing_evidence: list[EvidenceClaim] = Field(default_factory=list, max_length=20)
+    conflicts: list[InformationConflict] = Field(default_factory=list, max_length=20)
+    missing_data: list[str] = Field(default_factory=list, max_length=50)
+    risk_events: list[EvidenceClaim] = Field(default_factory=list, max_length=20)
+    invalidation_conditions: list[EvidenceClaim] = Field(default_factory=list, max_length=20)
+    data_freshness: list[DataFreshnessItem] = Field(default_factory=list, max_length=30)
+    provider_status: list[ProviderStatusItem] = Field(default_factory=list, max_length=30)
 
 
 class TradePlanAIRequest(TradePlanPreviewRequest):
     preview_hash: str = Field(min_length=64, max_length=64)
+
+
+class OneClickPlanRequest(BaseModel):
+    symbol: str = Field(pattern=r"^\d{6}$")
+    position_mode: Literal["空仓", "持仓"] = "空仓"
+    account_id: int | None = None
+    plan_capital: Decimal | None = Field(default=Decimal("300000"), gt=0)
+    available_cash: Decimal | None = Field(default=None, ge=0)
+    holding_quantity: int | None = Field(default=None, ge=100)
+    holding_cost_price: Decimal | None = Field(default=None, gt=0)
+    refresh: bool = False
+    enable_ai: bool = True
+    risk_pct: Decimal = Field(default=Decimal("0.5"), gt=0, le=10)
+    max_position_pct: Decimal = Field(default=Decimal("30"), gt=0, le=100)
+    max_total_position_pct: Decimal = Field(default=Decimal("80"), gt=0, le=100)
+    max_industry_position_pct: Decimal = Field(default=Decimal("40"), gt=0, le=100)
+    logic_invalidation: str | None = Field(default=None, max_length=3000)
+
+    @model_validator(mode="after")
+    def validate_one_click_input(self):
+        if self.position_mode == "持仓" and (
+            self.holding_quantity is None or self.holding_cost_price is None
+        ):
+            raise ValueError("选择已经持有时必须填写持仓数量和持仓成本")
+        if self.available_cash is not None and self.plan_capital is not None:
+            if self.available_cash > self.plan_capital:
+                raise ValueError("可用资金不能大于本次计划资金")
+        return self
+
+
+class OneClickConfirmRequest(BaseModel):
+    user_confirmed: bool = True
+
+
+class PlanExecutionFillCreate(BaseModel):
+    side: Literal["买入", "卖出"]
+    quantity: int = Field(gt=0)
+    price: Decimal = Field(gt=0)
+    fee: Decimal = Field(default=Decimal("0"), ge=0)
+    executed_at: datetime = Field(default_factory=datetime.now)
+    reason: Literal["首次试仓", "确认加仓", "减仓", "止盈", "硬止损", "逻辑退出", "其他"]
+    trigger_confirmed: bool | None = None
+    is_test: bool = False
+    notes: str | None = Field(default=None, max_length=2000)
+
+
+class PlanExecutionEvaluate(BaseModel):
+    current_price: Decimal | None = Field(default=None, gt=0)
+    entry_triggered: bool = False
+    add_triggered: bool = False
+    reduce_triggered: bool = False
+    stop_triggered: bool = False
+    take_profit_triggered: bool = False
+    invalidated: bool = False
+    evidence: str | None = Field(default=None, max_length=3000)

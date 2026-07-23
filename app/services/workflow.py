@@ -11,6 +11,7 @@ from app.models import (
     Holding,
     MarketQuote,
     MarketSourceLog,
+    PlanAnalysisRun,
     PositionSnapshot,
     RuleSet,
     RuleVersion,
@@ -257,6 +258,8 @@ def serialize_trade_plan(db: Session, plan: TradePlan) -> dict:
         "symbol": plan.symbol,
         "name": plan.name,
         "status": plan.status,
+        "execution_status": plan.execution_status,
+        "execution_summary": plan.execution_summary,
         "trade_mode": plan.trade_mode,
         "decision_level": plan.decision_level,
         "market_state": plan.market_state,
@@ -450,6 +453,20 @@ def dashboard_summary(db: Session) -> dict:
         alerts.extend(check_discipline(db, account.id, persist=False))
     critical = [item for item in alerts if item["severity"] == "CRITICAL"]
     risk_state = "防守" if critical else "中性" if holdings else "观察"
+    latest_analysis = db.scalar(
+        select(PlanAnalysisRun)
+        .where(PlanAnalysisRun.status.in_(("success", "confirmed")))
+        .order_by(PlanAnalysisRun.created_at.desc())
+    )
+    latest_market = (
+        (latest_analysis.result_snapshot or {}).get("plan", {}).get("market_assessment")
+        if latest_analysis
+        else None
+    )
+    if latest_market:
+        risk_state = {"高": "防守", "中等": "中性", "低": "进攻"}.get(
+            latest_market.get("risk"), risk_state
+        )
     plans = db.scalars(
         select(TradePlan).where(TradePlan.status.in_(("READY", "DRAFT", "BLOCKED")))
     ).all()
@@ -524,14 +541,26 @@ def dashboard_summary(db: Session) -> dict:
         priorities.append("复核候选计划触发条件；没有条件出现时保持观察。")
     return {
         "market": {
-            "state": "无法判断",
+            "state": latest_market.get("state", "无法判断") if latest_market else "无法判断",
             "risk_state": risk_state,
-            "explanation": "P0 尚未接入可靠宽基指数市场状态模型，因此不以个股数据代替市场结论。",
-            "missing_data": ["宽基指数多周期状态", "市场成交额与主线持续性"],
-            "source": "系统数据完整性检查",
-            "data_date": date.today().isoformat(),
-            "updated_at": datetime.now().isoformat(),
-            "status": "insufficient",
+            "explanation": (
+                f"最近一次一键分析使用沪深300规则模型：20日涨跌 {latest_market.get('return_20d')}%，市场风险 {latest_market.get('risk')}。"
+                if latest_market
+                else "尚未运行一键分析，暂无宽基市场判断。"
+            ),
+            "missing_data": ["市场成交额与多行业主线持续性"]
+            if latest_market
+            else ["沪深300规则状态", "市场成交额与主线持续性"],
+            "source": "最近一次一键分析 / 沪深300确定性规则"
+            if latest_market
+            else "系统数据完整性检查",
+            "data_date": latest_analysis.created_at.date().isoformat()
+            if latest_analysis
+            else date.today().isoformat(),
+            "updated_at": latest_analysis.updated_at.isoformat()
+            if latest_analysis
+            else datetime.now().isoformat(),
+            "status": "success" if latest_market else "insufficient",
         },
         "holding_risks": [
             item for item in holdings if item["hard_stop_triggered"] or not item["trade_plan_id"]

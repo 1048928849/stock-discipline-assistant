@@ -228,7 +228,7 @@ def test_holding_confirmation_add_stop_reduction_and_industry_limit(client, sess
 
 
 def evidence_package(symbol="300502"):
-    return {
+    package = {
         "symbol": symbol,
         "sources": [
             {
@@ -239,31 +239,60 @@ def evidence_package(symbol="300502"):
             }
         ],
     }
+    package["canonical_backend_fields"] = {
+        "schema_version": "2.0",
+        "computed_results": {"final_status": "WAIT", "quantity": 100},
+        "raw_facts": [
+            {
+                "fact": "营收为100",
+                "source_ids": ["financial:1"],
+                "as_of": "2026-03-31",
+                "confidence": "high",
+            }
+        ],
+        "rule_conclusions": [
+            {"code": "market", "status": "警告", "conclusion": "市场环境", "basis": "震荡"}
+        ],
+        "data_freshness": [
+            {
+                "category": "financial",
+                "latest_at": "2026-03-31",
+                "stale": False,
+                "source_ids": ["financial:1"],
+            }
+        ],
+        "provider_status": [],
+    }
+    return package
 
 
-def valid_ai_result():
+def valid_ai_result(package=None):
+    package = package or evidence_package()
     return {
-        "company_summary": "营收为100，仍需结合现金流验证。",
-        "business_drivers": [],
-        "financial_findings": ["营收为100"],
-        "industry_findings": [],
-        "valuation_findings": [],
+        **package["canonical_backend_fields"],
+        "ai_summaries": [
+            {
+                "topic": "财务",
+                "content": "营收为100，仍需结合现金流验证。",
+                "source_ids": ["financial:1"],
+                "confidence": "high",
+            }
+        ],
+        "ai_inferences": [],
         "supporting_evidence": [
             {"claim": "营收为100", "source_ids": ["financial:1"], "confidence": "high"}
         ],
-        "counter_evidence": [],
+        "opposing_evidence": [],
+        "conflicts": [],
+        "missing_data": ["产业数据缺失"],
         "risk_events": [],
-        "logic_invalidation_conditions": [],
-        "missing_information": ["产业数据缺失"],
-        "conflicting_information": [],
-        "questions_to_verify": [],
-        "plain_language_summary": "资料有限。",
+        "invalidation_conditions": [],
     }
 
 
 def test_ai_schema_and_source_validation():
     output, validation = validate_ai_output(valid_ai_result(), evidence_package())
-    assert output["financial_findings"]
+    assert output["ai_summaries"]
     assert validation["valid"] is True
     bad = valid_ai_result()
     bad["supporting_evidence"][0]["source_ids"] = ["missing:9"]
@@ -280,7 +309,7 @@ def test_ai_rejects_other_symbol_numbers_and_rule_override():
     with pytest.raises(ValueError, match="其他股票"):
         validate_ai_output(bad_symbol, package)
     invented = valid_ai_result()
-    invented["financial_findings"] = ["利润增长999"]
+    invented["ai_summaries"][0]["content"] = "利润增长999"
     with pytest.raises(ValueError, match="不存在的数字"):
         validate_ai_output(invented, evidence_package())
     override = valid_ai_result() | {"final_status": "READY"}
@@ -334,9 +363,15 @@ def test_ai_cache_hit_and_evidence_change_invalidates_cache(client, session, mon
 
     def fake_analysis(self, evidence_package, correction=None):
         calls.append(evidence_package["evidence_hash"])
-        result = valid_ai_result()
-        result["company_summary"] = "公司业务来自已提供证据。"
-        result["financial_findings"] = []
+        result = valid_ai_result(evidence_package)
+        result["ai_summaries"] = [
+            {
+                "topic": "公司业务",
+                "content": "公司业务来自已提供证据。",
+                "source_ids": [f"profile:{profile.id}"],
+                "confidence": "high",
+            }
+        ]
         result["supporting_evidence"] = [
             {
                 "claim": "公司业务来自已提供证据",
@@ -369,3 +404,153 @@ def test_ai_cache_hit_and_evidence_change_invalidates_cache(client, session, mon
     ).json()
     assert changed["cache_hit"] is False
     assert len(calls) == 2
+
+
+def test_ai_invalid_schema_retries_once_and_rule_plan_survives(client, session, monkeypatch):
+    account = create_account(client)
+    seed_pattern(session)
+    request = payload(account["id"])
+    settings = Settings(
+        database_url="sqlite://",
+        scheduler_enabled=False,
+        llm_enabled=True,
+        llm_base_url="https://llm.example.test/v1",
+        llm_api_key="test-only",
+        llm_model="test-model",
+        llm_max_retries=1,
+    )
+    monkeypatch.setattr("app.services.trade_plan_ai.get_settings", lambda: settings)
+    attempts = []
+
+    def invalid_then_valid(self, package, correction=None):
+        attempts.append(correction)
+        if len(attempts) == 1:
+            return {"output": {"invalid": True}, "usage": {}, "duration_ms": 1}
+        output = {
+            **package["canonical_backend_fields"],
+            "ai_summaries": [],
+            "ai_inferences": [],
+            "supporting_evidence": [],
+            "opposing_evidence": [],
+            "conflicts": [],
+            "missing_data": ["没有公司研究证据"],
+            "risk_events": [],
+            "invalidation_conditions": [],
+        }
+        return {
+            "output": output,
+            "usage": {"total_tokens": 20},
+            "duration_ms": 2,
+        }
+
+    monkeypatch.setattr(
+        OpenAICompatibleProvider, "analyze_trade_plan", invalid_then_valid
+    )
+    preview = client.post("/api/v1/trade-plan-generator/preview", json=request).json()
+    result = client.post(
+        "/api/v1/trade-plan-generator/ai",
+        json={**request, "preview_hash": preview["preview_hash"]},
+    ).json()
+    assert result["status"] == "success"
+    assert len(attempts) == 2
+    assert attempts[1]
+    assert preview["status"] == "READY"
+
+
+def test_ai_timeout_is_audited_without_breaking_rule_plan(client, session, monkeypatch):
+    account = create_account(client)
+    seed_pattern(session)
+    request = payload(account["id"])
+    settings = Settings(
+        database_url="sqlite://",
+        scheduler_enabled=False,
+        llm_enabled=True,
+        llm_base_url="https://llm.example.test/v1",
+        llm_api_key="test-only",
+        llm_model="timeout-model",
+        llm_max_retries=1,
+    )
+    monkeypatch.setattr("app.services.trade_plan_ai.get_settings", lambda: settings)
+
+    def timeout(self, package, correction=None):
+        raise TimeoutError("test timeout")
+
+    monkeypatch.setattr(OpenAICompatibleProvider, "analyze_trade_plan", timeout)
+    preview = client.post("/api/v1/trade-plan-generator/preview", json=request).json()
+    result = client.post(
+        "/api/v1/trade-plan-generator/ai",
+        json={**request, "preview_hash": preview["preview_hash"]},
+    ).json()
+    assert result["status"] == "failed"
+    assert "TimeoutError" in result["error"]
+    assert preview["status"] == "READY"
+
+
+def test_confirmed_plan_manual_fills_and_execution_deviations(client, session):
+    account = create_account(client)
+    seed_pattern(session)
+    request = payload(account["id"])
+    preview = client.post("/api/v1/trade-plan-generator/preview", json=request).json()
+    saved = client.post(
+        "/api/v1/trade-plan-generator/save",
+        json={**request, "preview_hash": preview["preview_hash"]},
+    ).json()
+    plan_id = saved["id"]
+    assert saved["execution_status"] in {"entry_triggered", "waiting_entry"}
+    buy_price = preview["buy_plan"]["buy_zone"][0]
+    first = client.post(
+        f"/api/v1/trade-plans/{plan_id}/execution/fills",
+        json={
+            "side": "买入",
+            "quantity": 100,
+            "price": buy_price,
+            "fee": 0,
+            "executed_at": datetime.now().isoformat(),
+            "reason": "首次试仓",
+            "trigger_confirmed": True,
+            "is_test": True,
+        },
+    )
+    assert first.status_code == 201, first.text
+    second = client.post(
+        f"/api/v1/trade-plans/{plan_id}/execution/fills",
+        json={
+            "side": "买入",
+            "quantity": 100,
+            "price": round(buy_price * 0.95, 4),
+            "fee": 0,
+            "executed_at": datetime.now().isoformat(),
+            "reason": "确认加仓",
+            "trigger_confirmed": False,
+            "is_test": True,
+        },
+    ).json()
+    codes = {item["code"] for item in second["summary"]["violations"]}
+    assert {"loss_averaging", "entry_without_trigger"}.issubset(codes)
+    stopped = client.post(
+        f"/api/v1/trade-plans/{plan_id}/execution/evaluate",
+        json={
+            "current_price": float(preview["buy_plan"]["hard_stop"]) - 0.01,
+            "stop_triggered": True,
+            "evidence": "测试检查硬止损",
+        },
+    ).json()
+    assert stopped["execution_status"] == "stop_triggered"
+    assert "missed_stop" in {
+        item["code"] for item in stopped["summary"]["violations"]
+    }
+    final = client.post(
+        f"/api/v1/trade-plans/{plan_id}/execution/fills",
+        json={
+            "side": "卖出",
+            "quantity": 200,
+            "price": float(preview["buy_plan"]["hard_stop"]),
+            "fee": 0,
+            "executed_at": datetime.now().isoformat(),
+            "reason": "硬止损",
+            "trigger_confirmed": True,
+            "is_test": True,
+        },
+    ).json()
+    assert final["execution_status"] == "closed"
+    assert final["summary"]["realized_r"] is not None

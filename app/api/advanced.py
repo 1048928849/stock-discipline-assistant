@@ -26,10 +26,8 @@ from app.models import (
     XWatchAccount,
     XWatchQuery,
 )
-from app.providers.akshare_provider import AKShareProvider
 from app.providers.llm_provider import LLMUnavailableError, OpenAICompatibleProvider
 from app.providers.market import ProviderUnavailableError, Quote
-from app.providers.x_provider import TWScrapeProvider, XUnavailableError
 from app.schemas_advanced import (
     BacktestCreate,
     DisciplineAlert,
@@ -43,6 +41,7 @@ from app.schemas_advanced import (
 )
 from app.services.backtests import run_backtest
 from app.services.discipline import check_discipline
+from app.services.data_sources import UnifiedDataService
 from app.services.reviews import review_metrics
 
 
@@ -208,23 +207,32 @@ def _live_market_call(callback):
 
 
 @router.get("/market/symbols")
-def market_symbols():
-    return _live_market_call(AKShareProvider().list_symbols)
+def market_symbols(db: Session = Depends(get_db)):
+    return _live_market_call(lambda: UnifiedDataService(db).list_symbols().value)
 
 
 @router.get("/market/indices")
-def market_indices(family: str = Query(default="上证系列指数", max_length=30)):
-    return _live_market_call(lambda: AKShareProvider().list_indices(family))
+def market_indices(
+    family: str = Query(default="上证系列指数", max_length=30),
+    db: Session = Depends(get_db),
+):
+    return _live_market_call(lambda: UnifiedDataService(db).list_indices(family).value)
 
 
 @router.get("/market/sectors")
-def market_sectors():
-    return _live_market_call(AKShareProvider().list_sectors)
+def market_sectors(db: Session = Depends(get_db)):
+    return _live_market_call(lambda: UnifiedDataService(db).list_sectors().value)
 
 
 @router.get("/market/announcements/{symbol}")
-def market_announcements(symbol: str, day: date = Query(default_factory=date.today)):
-    return _live_market_call(lambda: AKShareProvider().announcements(symbol, day))
+def market_announcements(
+    symbol: str,
+    day: date = Query(default_factory=date.today),
+    db: Session = Depends(get_db),
+):
+    return _live_market_call(
+        lambda: UnifiedDataService(db).daily_announcements(symbol, day).value
+    )
 
 
 @router.get("/market/history/{symbol}")
@@ -266,15 +274,18 @@ def market_sync(
     job.status = "running"
     job.started_at = datetime.now()
     db.commit()
-    provider = AKShareProvider()
+    provider = UnifiedDataService(db)
     try:
         quote_error = None
         try:
-            quote = provider.get_quote(symbol)
+            quote = provider.get_quote(symbol).value
         except ProviderUnavailableError as exc:
             quote = None
             quote_error = str(exc)
-        bars = provider.get_history(symbol, date.today() - timedelta(days=days), date.today())
+        history_result = provider.get_history(
+            symbol, date.today() - timedelta(days=days), date.today()
+        )
+        bars = history_result.value
         if not bars:
             raise ProviderUnavailableError("历史行情为空，未写入数据库")
         dates = [bar.trade_date for bar in bars]
@@ -356,7 +367,7 @@ def market_sync(
             },
             "bars_inserted": inserted,
             "history_source": history_sources[0],
-            "fallback_used": bool(quote_error) or history_sources[0] != "akshare_eastmoney_qfq",
+            "fallback_used": bool(quote_error) or history_result.fallback_used,
             "data_date": bars[-1].trade_date.isoformat(),
             "updated_at": datetime.now().isoformat(),
         }
@@ -462,7 +473,6 @@ def x_sync(limit: int = Query(default=20, ge=1, le=100), db: Session = Depends(g
     job.started_at = datetime.now()
     job.last_error = None
     db.commit()
-    provider = TWScrapeProvider(get_settings())
     expressions = [
         q.expression for q in db.scalars(select(XWatchQuery).where(XWatchQuery.enabled)).all()
     ]
@@ -477,8 +487,8 @@ def x_sync(limit: int = Query(default=20, ge=1, le=100), db: Session = Depends(g
         db.commit()
         raise AppError(422, "X_QUERY_REQUIRED", "请先添加关注账号或查询表达式")
     try:
-        posts = provider.collect(expressions, limit)
-    except XUnavailableError as exc:
+        posts = UnifiedDataService(db).collect_social_queries(expressions, limit).value
+    except ProviderUnavailableError as exc:
         job.status = "paused"
         job.finished_at = datetime.now()
         job.last_error = str(exc)
@@ -487,9 +497,9 @@ def x_sync(limit: int = Query(default=20, ge=1, le=100), db: Session = Depends(g
     inserted = 0
     for post in posts:
         if not db.scalar(
-            select(XPost.id).where(XPost.platform == "x", XPost.post_id == post.post_id)
+            select(XPost.id).where(XPost.platform == "x", XPost.post_id == post["post_id"])
         ):
-            db.add(XPost(platform="x", **post.__dict__))
+            db.add(XPost(platform="x", **post))
             inserted += 1
     job.status = "success"
     job.finished_at = datetime.now()

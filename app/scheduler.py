@@ -6,9 +6,9 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.database import SessionLocal
 from app.models import Account, SystemJob, TradeReview, XPost, XWatchAccount, XWatchQuery
-from app.providers.x_provider import TWScrapeProvider
 from app.services.reviews import review_metrics
 from app.services.technical_snapshots import snapshot_all_holdings
+from app.services.data_sources import UnifiedDataService
 
 
 scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
@@ -89,14 +89,16 @@ def sync_x_posts() -> None:
                 job.finished_at = datetime.now()
                 db.commit()
                 return
-            posts = TWScrapeProvider(get_settings()).collect(queries, limit=20)
+            posts = UnifiedDataService(db).collect_social_queries(queries, limit=20).value
             count = 0
             for post in posts:
                 exists = db.scalar(
-                    select(XPost.id).where(XPost.platform == "x", XPost.post_id == post.post_id)
+                    select(XPost.id).where(
+                        XPost.platform == "x", XPost.post_id == post["post_id"]
+                    )
                 )
                 if not exists:
-                    db.add(XPost(platform="x", **post.__dict__))
+                    db.add(XPost(platform="x", **post))
                     count += 1
             job.status = "success"
             job.result_count = count

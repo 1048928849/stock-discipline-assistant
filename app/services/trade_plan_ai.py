@@ -23,9 +23,10 @@ from app.models import (
 from app.providers.llm_provider import OpenAICompatibleProvider
 from app.schemas_workflow import TradePlanAIRequest, TradePlanAIResult, TradePlanPreviewRequest
 from app.services.trade_plan_generator import generate_trade_plan_preview
+from app.services.data_sources import UnifiedDataService
 
 
-PROMPT_VERSION = "trade-plan-research-1.0"
+PROMPT_VERSION = "trade-plan-research-2.0"
 FORBIDDEN_KEYS = {
     "status",
     "final_status",
@@ -129,45 +130,45 @@ def build_evidence_package(db: Session, symbol: str, preview: dict) -> dict:
         "accounts_receivable",
         "inventory",
     )
-    for item in financials:
+    for financial_item in financials:
         records.append(
             _source(
-                f"financial:{item.id}",
+                f"financial:{financial_item.id}",
                 symbol,
                 "financial",
-                item.source,
-                item.source_url,
-                item.report_date,
-                item.fetched_at,
+                financial_item.source,
+                financial_item.source_url,
+                financial_item.report_date,
+                financial_item.fetched_at,
                 {
-                    "report_date": item.report_date,
-                    "period_label": item.period_label,
-                    **{name: getattr(item, name) for name in metric_names},
+                    "report_date": financial_item.report_date,
+                    "period_label": financial_item.period_label,
+                    **{name: getattr(financial_item, name) for name in metric_names},
                 },
-                primary="巨潮" in item.source or "报告" in item.source,
+                primary="巨潮" in financial_item.source or "报告" in financial_item.source,
             )
         )
     announcements = db.scalars(
         select(CompanyAnnouncement)
         .where(CompanyAnnouncement.symbol == symbol)
         .order_by(CompanyAnnouncement.published_date.desc())
-        .limit(20)
+        .limit(15)
     ).all()
-    for item in announcements:
+    for announcement_item in announcements:
         records.append(
             _source(
-                f"announcement:{item.id}",
+                f"announcement:{announcement_item.id}",
                 symbol,
                 "announcement",
-                item.catalog_source,
-                item.source_document_url or item.url,
-                item.published_date,
-                item.fetched_at,
+                announcement_item.catalog_source,
+                announcement_item.source_document_url or announcement_item.url,
+                announcement_item.published_date,
+                announcement_item.fetched_at,
                 {
-                    "title": _clean_external_text(item.title),
-                    "category": item.announcement_category,
-                    "risk_level": item.risk_level,
-                    "exchange": item.exchange,
+                    "title": _clean_external_text(announcement_item.title),
+                    "category": announcement_item.announcement_category,
+                    "risk_level": announcement_item.risk_level,
+                    "exchange": announcement_item.exchange,
                 },
                 primary=True,
             )
@@ -210,26 +211,89 @@ def build_evidence_package(db: Session, symbol: str, preview: dict) -> dict:
         .order_by(CompanyResearchEvidence.source_date.desc(), CompanyResearchEvidence.id.desc())
         .limit(20)
     ).all()
-    for item in evidence:
+    for evidence_item in evidence:
         records.append(
             _source(
-                f"research:{item.id}",
+                f"research:{evidence_item.id}",
                 symbol,
-                item.topic,
-                item.source_name,
-                item.source_url,
-                item.source_date,
-                item.fetched_at,
+                evidence_item.topic,
+                evidence_item.source_name,
+                evidence_item.source_url,
+                evidence_item.source_date,
+                evidence_item.fetched_at,
                 {
-                    "information_type": item.information_type,
-                    "content": _clean_external_text(item.content),
+                    "information_type": evidence_item.information_type,
+                    "content": _clean_external_text(evidence_item.content),
                 },
-                primary=item.information_type in {"事实", "公司表态"},
+                primary=evidence_item.information_type in {"事实", "公司表态"},
                 confidence="low"
-                if item.information_type in {"个人观点", "未经证实传闻"}
+                if evidence_item.information_type in {"个人观点", "未经证实传闻"}
                 else "medium",
             )
         )
+    raw_facts = [
+        {
+            "fact": f"{item['category']}："
+            + _clean_external_text(
+                json.dumps(item["content"], ensure_ascii=False, default=str), limit=500
+            ),
+            "source_ids": [item["source_id"]],
+            "as_of": item.get("published_at") or item.get("fetched_at"),
+            "confidence": item["confidence"],
+        }
+        for item in records
+    ]
+    rule_conclusions = [
+        {
+            "code": item["code"],
+            "status": item["status"],
+            "conclusion": item["name"],
+            "basis": item["evidence"],
+        }
+        for item in preview["gates"]
+    ]
+    data_freshness = []
+    for category in sorted({item["category"] for item in records}):
+        items = [item for item in records if item["category"] == category]
+        latest = max((str(item.get("fetched_at") or "") for item in items), default="")
+        data_freshness.append(
+            {
+                "category": category,
+                "latest_at": latest or None,
+                "stale": all(bool(item.get("stale")) for item in items),
+                "source_ids": [item["source_id"] for item in items],
+            }
+        )
+    provider_rows = preview.get("research_inventory", {}).get("provider_status", [])
+    if not provider_rows:
+        provider_rows = UnifiedDataService(db).provider_status()
+    provider_status = [
+        {
+            "provider_id": item["provider_id"],
+            "status": item.get("health_status", "unknown"),
+            "capabilities": item.get("supported_capabilities", []),
+            "message": item.get("health_message"),
+        }
+        for item in provider_rows
+    ]
+    canonical_backend_fields = {
+        "schema_version": "2.0",
+        "computed_results": {
+            "final_status": preview["status"],
+            "rule_version": preview["rule"]["version"],
+            "analysis_date": preview["data_date"],
+            "market_state": preview.get("market_assessment", {}).get("state"),
+            "industry_state": preview.get("industry_assessment", {}).get("state"),
+            "buy_plan": preview["buy_plan"],
+            "position_calculation": preview["position_calculation"],
+            "confirmation_add": preview["confirmation_add"],
+            "exit_plan": preview["exit_plan"],
+        },
+        "raw_facts": raw_facts,
+        "rule_conclusions": rule_conclusions,
+        "data_freshness": data_freshness,
+        "provider_status": provider_status,
+    }
     package = {
         "version": preview["preview_hash"][:16],
         "symbol": symbol,
@@ -249,6 +313,7 @@ def build_evidence_package(db: Session, symbol: str, preview: dict) -> dict:
             "immutable_rule_status": preview["status"],
         },
         "sources": records,
+        "canonical_backend_fields": canonical_backend_fields,
         "missing_categories": [
             name
             for name, present in {
@@ -279,48 +344,25 @@ def _walk_keys(value):
 
 
 def _normalize_ai_output(raw: dict) -> dict:
-    """只做结构限长和丢弃无引用声明，不补写任何事实。"""
-    normalized = dict(raw)
-    string_arrays = (
-        "business_drivers",
-        "financial_findings",
-        "industry_findings",
-        "valuation_findings",
-        "risk_events",
-        "logic_invalidation_conditions",
-        "missing_information",
-        "conflicting_information",
-        "questions_to_verify",
-    )
-    for name in string_arrays:
-        value = normalized.get(name, [])
-        normalized[name] = (
-            [str(item)[:2000] for item in value[:20]] if isinstance(value, list) else []
-        )
-    normalized["company_summary"] = str(normalized.get("company_summary", ""))[:3000]
-    normalized["plain_language_summary"] = str(normalized.get("plain_language_summary", ""))[:5000]
-    for name in ("supporting_evidence", "counter_evidence"):
-        valid_claims = []
-        value = normalized.get(name, [])
-        for item in value[:20] if isinstance(value, list) else []:
-            if not isinstance(item, dict) or not item.get("claim") or not item.get("source_ids"):
-                continue
-            confidence = item.get("confidence")
-            if confidence not in {"high", "medium", "low"}:
-                confidence = "low"
-            valid_claims.append(
-                {
-                    "claim": str(item["claim"])[:2000],
-                    "source_ids": [str(source_id) for source_id in item["source_ids"][:20]],
-                    "confidence": confidence,
-                }
-            )
-        normalized[name] = valid_claims
-    return normalized
+    """统一Schema禁止静默补字段，避免把缺失字段伪装成有效分析。"""
+    return raw
 
 
 def validate_ai_output(raw: dict, package: dict) -> tuple[dict, dict]:
-    forbidden = sorted({key for key in _walk_keys(raw) if key.lower() in FORBIDDEN_KEYS})
+    canonical = package["canonical_backend_fields"]
+    frozen_fields = (
+        "schema_version",
+        "computed_results",
+        "raw_facts",
+        "rule_conclusions",
+        "data_freshness",
+        "provider_status",
+    )
+    for field in frozen_fields:
+        if raw.get(field) != canonical[field]:
+            raise ValueError(f"模型试图修改后端冻结字段：{field}")
+    ai_owned = {key: value for key, value in raw.items() if key not in frozen_fields}
+    forbidden = sorted({key for key in _walk_keys(ai_owned) if key.lower() in FORBIDDEN_KEYS})
     if forbidden:
         raise ValueError(f"模型试图输出规则引擎专属字段：{', '.join(forbidden)}")
     try:
@@ -330,8 +372,19 @@ def validate_ai_output(raw: dict, package: dict) -> tuple[dict, dict]:
     known = {item["source_id"]: item for item in package["sources"]}
     cited: set[str] = set()
     warnings = []
-    for claim in [*result.supporting_evidence, *result.counter_evidence]:
-        for source_id in claim.source_ids:
+    cited_items = [
+        *result.supporting_evidence,
+        *result.opposing_evidence,
+        *result.risk_events,
+        *result.invalidation_conditions,
+        *result.conflicts,
+    ]
+    for statement in [*result.ai_summaries, *result.ai_inferences]:
+        if not statement.source_ids:
+            raise ValueError("AI归纳或推断缺少source_id")
+        cited_items.append(statement)
+    for claim in cited_items:
+        for source_id in getattr(claim, "source_ids", []):
             item = known.get(source_id)
             if not item:
                 raise ValueError(f"引用不存在的source_id：{source_id}")
@@ -340,19 +393,9 @@ def validate_ai_output(raw: dict, package: dict) -> tuple[dict, dict]:
             if item.get("stale"):
                 warnings.append(f"{source_id} 已过期，结论需谨慎")
             cited.add(source_id)
-    factual_sections = [
-        result.company_summary,
-        *result.business_drivers,
-        *result.financial_findings,
-        *result.industry_findings,
-        *result.valuation_findings,
-        *result.risk_events,
-    ]
-    if any(str(item).strip() for item in factual_sections) and not cited:
-        raise ValueError("事实性结论没有引用source_id")
-    # 对带数字的事实做保守核验：大于3的数字必须能在证据包中找到。
+    # 只核验AI自有文本；后端冻结字段允许包含规则引擎计算数字。
     evidence_text = json.dumps(package, ensure_ascii=False, default=str)
-    output_text = json.dumps(raw, ensure_ascii=False)
+    output_text = json.dumps(ai_owned, ensure_ascii=False)
     known_numbers = [float(token) for token in re.findall(r"\d+(?:\.\d+)?", evidence_text)]
     unknown_numbers = sorted(
         {

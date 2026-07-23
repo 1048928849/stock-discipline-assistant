@@ -7,11 +7,25 @@ from app.errors import AppError
 from app.models import RuleSet, TradePlan, TradePlanAIAnalysis
 from app.schemas_workflow import (
     PositionAssessment,
+    OneClickPlanRequest,
+    PlanExecutionEvaluate,
+    PlanExecutionFillCreate,
     RuleVersionUpdate,
     TradePlanAIRequest,
     TradePlanCreate,
     TradePlanPreviewRequest,
     TradePlanSaveRequest,
+)
+from app.services.one_click_pipeline import (
+    confirm_one_click_plan,
+    get_analysis_run,
+    run_one_click_analysis,
+)
+from app.services.data_sources import UnifiedDataService
+from app.services.plan_execution import (
+    add_manual_fill,
+    evaluate_plan_execution,
+    execution_detail,
 )
 from app.services.trade_plan_ai import run_ai_analysis, serialize_ai_analysis
 from app.services.trade_plan_generator import (
@@ -33,6 +47,22 @@ from app.services.workflow import (
 
 
 router = APIRouter(prefix="/api/v1")
+
+
+@router.post("/trade-plan-generator/analyze")
+def analyze_and_generate_plan(payload: OneClickPlanRequest, db: Session = Depends(get_db)):
+    """普通用户入口：自动取数、规则计算、AI降级解释，一次返回完整计划。"""
+    return run_one_click_analysis(db, payload)
+
+
+@router.get("/trade-plan-generator/analyze/{run_id}")
+def get_one_click_analysis(run_id: int, db: Session = Depends(get_db)):
+    return get_analysis_run(db, run_id)
+
+
+@router.post("/trade-plan-generator/analyze/{run_id}/confirm", status_code=status.HTTP_201_CREATED)
+def confirm_analyzed_plan(run_id: int, db: Session = Depends(get_db)):
+    return confirm_one_click_plan(db, run_id)
 
 
 @router.post("/trade-plan-generator/preview")
@@ -91,6 +121,30 @@ def get_trade_plan_generator_rules(db: Session = Depends(get_db)):
         "effective_from": version.effective_from.isoformat(),
         "updated_at": version.updated_at.isoformat(),
     }
+
+
+@router.get("/data-sources/status")
+def data_source_status(probe: bool = False, db: Session = Depends(get_db)):
+    return UnifiedDataService(db).registry.public_status(probe=probe)
+
+
+@router.get("/trade-plans/{plan_id}/execution")
+def get_plan_execution(plan_id: int, db: Session = Depends(get_db)):
+    return execution_detail(db, plan_id)
+
+
+@router.post("/trade-plans/{plan_id}/execution/fills", status_code=status.HTTP_201_CREATED)
+def add_plan_execution_fill(
+    plan_id: int, payload: PlanExecutionFillCreate, db: Session = Depends(get_db)
+):
+    return add_manual_fill(db, plan_id, payload)
+
+
+@router.post("/trade-plans/{plan_id}/execution/evaluate")
+def evaluate_execution(
+    plan_id: int, payload: PlanExecutionEvaluate, db: Session = Depends(get_db)
+):
+    return evaluate_plan_execution(db, plan_id, payload)
 
 
 @router.get("/dashboard/summary")

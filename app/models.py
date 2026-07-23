@@ -153,6 +153,23 @@ class MarketSourceLog(Base):
     row_count: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class DataProviderCallLog(Base):
+    __tablename__ = "data_provider_call_logs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    provider_id: Mapped[str] = mapped_column(String(80), index=True)
+    capability: Mapped[str] = mapped_column(String(80), index=True)
+    operation: Mapped[str] = mapped_column(String(100))
+    symbol: Mapped[str | None] = mapped_column(String(12), index=True)
+    status: Mapped[str] = mapped_column(String(30), index=True)
+    fallback_used: Mapped[bool] = mapped_column(Boolean, default=False)
+    cache_used: Mapped[bool] = mapped_column(Boolean, default=False)
+    row_count: Mapped[int] = mapped_column(Integer, default=0)
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    error: Mapped[str | None] = mapped_column(Text)
+    requested_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
 class XWatchAccount(TimestampMixin, Base):
     __tablename__ = "x_watch_accounts"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -346,6 +363,26 @@ class CompanyResearchEvidence(Base):
     fetched_at: Mapped[datetime] = mapped_column(DateTime)
 
 
+class CompanyResearchRefresh(Base):
+    __tablename__ = "company_research_refreshes"
+    __table_args__ = (
+        UniqueConstraint("symbol", "section", name="uq_company_research_refresh_section"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    section: Mapped[str] = mapped_column(String(50), index=True)
+    status: Mapped[str] = mapped_column(String(30))
+    provider_id: Mapped[str | None] = mapped_column(String(80))
+    source_name: Mapped[str | None] = mapped_column(String(200))
+    row_count: Mapped[int] = mapped_column(Integer, default=0)
+    cache_used: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_attempt_at: Mapped[datetime] = mapped_column(DateTime)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime)
+    data_date: Mapped[date | None] = mapped_column(Date)
+    stale_after: Mapped[datetime | None] = mapped_column(DateTime)
+    error: Mapped[str | None] = mapped_column(Text)
+
+
 class RuleSet(TimestampMixin, Base):
     __tablename__ = "rule_sets"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -412,6 +449,8 @@ class TradePlan(TimestampMixin, Base):
     market_snapshot: Mapped[dict | None] = mapped_column(JSON)
     account_snapshot: Mapped[dict | None] = mapped_column(JSON)
     source_snapshot: Mapped[list | None] = mapped_column(JSON)
+    execution_status: Mapped[str] = mapped_column(String(30), index=True, default="draft")
+    execution_summary: Mapped[dict | None] = mapped_column(JSON)
 
 
 class TradePlanCheck(Base):
@@ -474,4 +513,58 @@ class TradePlanAIAnalysis(Base):
     total_tokens: Mapped[int | None] = mapped_column(Integer)
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class PlanAnalysisRun(TimestampMixin, Base):
+    """一次一键分析的完整审计快照；预览与正式计划分离。"""
+
+    __tablename__ = "plan_analysis_runs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    position_mode: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(30), index=True)
+    request_snapshot: Mapped[dict] = mapped_column(JSON)
+    pipeline_steps: Mapped[list] = mapped_column(JSON)
+    result_snapshot: Mapped[dict | None] = mapped_column(JSON)
+    ai_analysis_id: Mapped[int | None] = mapped_column(
+        ForeignKey("trade_plan_ai_analyses.id"), index=True
+    )
+    user_confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
+    confirmed_plan_id: Mapped[int | None] = mapped_column(ForeignKey("trade_plans.id"), index=True)
+    error: Mapped[str | None] = mapped_column(Text)
+
+
+class PlanExecutionEvent(Base):
+    __tablename__ = "plan_execution_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trade_plan_id: Mapped[int] = mapped_column(
+        ForeignKey("trade_plans.id", ondelete="CASCADE"), index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(50), index=True)
+    from_status: Mapped[str | None] = mapped_column(String(30))
+    to_status: Mapped[str] = mapped_column(String(30), index=True)
+    event_time: Mapped[datetime] = mapped_column(DateTime, index=True)
+    source: Mapped[str] = mapped_column(String(30), default="manual")
+    details: Mapped[dict] = mapped_column(JSON)
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class PlanExecutionFill(Base):
+    __tablename__ = "plan_execution_fills"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trade_plan_id: Mapped[int] = mapped_column(
+        ForeignKey("trade_plans.id", ondelete="CASCADE"), index=True
+    )
+    side: Mapped[str] = mapped_column(String(8))
+    quantity: Mapped[int] = mapped_column(Integer)
+    price: Mapped[Decimal] = mapped_column(PRICE)
+    fee: Mapped[Decimal] = mapped_column(MONEY, default=0)
+    executed_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    reason: Mapped[str] = mapped_column(String(100))
+    trigger_confirmed: Mapped[bool | None] = mapped_column(Boolean)
+    is_test: Mapped[bool] = mapped_column(Boolean, default=False)
+    notes: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

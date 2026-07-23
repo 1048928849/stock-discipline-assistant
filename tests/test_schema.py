@@ -30,5 +30,10 @@ def test_initial_schema_contains_required_tables(session):
         "trade_plan_checks",
         "position_snapshots",
         "trade_plan_ai_analyses",
+        "plan_analysis_runs",
+        "data_provider_call_logs",
+        "company_research_refreshes",
+        "plan_execution_events",
+        "plan_execution_fills",
     }
     assert required == set(inspect(session.bind).get_table_names())

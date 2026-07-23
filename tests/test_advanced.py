@@ -11,6 +11,8 @@ from app.providers.x_provider import CollectedPost
 from app.providers.akshare_provider import AKShareProvider
 from app.providers.llm_provider import OpenAICompatibleProvider
 from app.providers.market import DailyBar, ProviderUnavailableError
+from app.providers.registry import ProviderRegistry
+from app.providers.x_social_provider import XSocialClueProvider
 from app.providers.x_provider import TWScrapeProvider, XUnavailableError
 from app.services.backtests import run_backtest
 from app.services.discipline import check_discipline
@@ -544,7 +546,13 @@ def test_x_sync_deduplicates_posts(client, monkeypatch):
         url="https://x.com/a/status/123",
     )
     monkeypatch.setattr(
-        "app.api.advanced.TWScrapeProvider.collect", lambda *_args, **_kwargs: [post]
+        "app.providers.x_social_provider.XSocialClueProvider.search",
+        lambda *_args, **_kwargs: [post.__dict__],
+    )
+    registry = ProviderRegistry()
+    registry.register(XSocialClueProvider(Settings(x_cookie="test-cookie")))
+    monkeypatch.setattr(
+        "app.services.data_sources.build_provider_registry", lambda: registry
     )
     first = client.post("/api/v1/x/sync").json()
     second = client.post("/api/v1/x/sync").json()

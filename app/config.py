@@ -23,6 +23,24 @@ class Settings(BaseSettings):
     llm_max_input_chars: int = 40000
     llm_daily_limit: int = 20
     llm_cache_hours: int = 24
+    provider_timeout_seconds: float = 20
+    provider_max_retries: int = 2
+    market_data_fresh_hours: int = 36
+    research_profile_fresh_hours: int = 168
+    research_financial_fresh_hours: int = 168
+    research_valuation_fresh_hours: int = 36
+    research_announcement_fresh_hours: int = 24
+    tushare_enabled: bool = False
+    tushare_token: str = Field(default="", repr=False)
+    tushare_priority: int = 20
+    professional_market_api_enabled: bool = False
+    professional_market_api_priority: int = 10
+    professional_market_api_url: str = ""
+    professional_market_api_key: str = Field(default="", repr=False)
+    news_api_enabled: bool = False
+    news_api_priority: int = 30
+    news_api_url: str = ""
+    news_api_key: str = Field(default="", repr=False)
     x_cookie: str = Field(default="", repr=False)
     scheduler_enabled: bool = True
     x_sync_minutes: int = 15

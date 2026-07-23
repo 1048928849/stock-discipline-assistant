@@ -1,0 +1,866 @@
+from __future__ import annotations
+
+import logging
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+
+import pandas as pd
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.errors import AppError
+from app.models import (
+    Account,
+    CompanyAnnouncement,
+    CompanyFinancialPeriod,
+    CompanyProfile,
+    CompanyResearchEvidence,
+    CompanyValuationSnapshot,
+    MarketDailyBar,
+    MarketQuote,
+    PlanAnalysisRun,
+    TradePlan,
+)
+from app.providers.market import ProviderUnavailableError
+from app.schemas_workflow import (
+    OneClickPlanRequest,
+    TradePlanAIRequest,
+    TradePlanPreviewRequest,
+    TradePlanSaveRequest,
+)
+from app.services.trade_plan_ai import run_ai_analysis
+from app.services.company_research import refresh_company_research_if_needed
+from app.services.data_sources import UnifiedDataService
+from app.services.trade_plan_generator import (
+    GENERATOR_PARAMETERS,
+    generate_trade_plan_preview,
+    save_generated_plan,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+def _step(code: str, name: str, status: str, detail: str, **extra) -> dict:
+    return {
+        "code": code,
+        "name": name,
+        "status": status,
+        "detail": detail,
+        "fallback_used": bool(extra.pop("fallback_used", False)),
+        "missing": extra.pop("missing", []),
+        **extra,
+    }
+
+
+def _default_account(db: Session, payload: OneClickPlanRequest) -> tuple[Account, bool]:
+    if payload.account_id is not None:
+        account = db.get(Account, payload.account_id)
+        if account is None:
+            raise AppError(404, "ACCOUNT_NOT_FOUND", "所选账户不存在，请重新选择")
+        return account, False
+    account = db.scalar(select(Account).order_by(Account.updated_at.desc(), Account.id.desc()))
+    if account:
+        return account, False
+    capital = payload.plan_capital or Decimal(str(GENERATOR_PARAMETERS["default_account_equity"]))
+    available = payload.available_cash if payload.available_cash is not None else capital
+    account = Account(
+        name="默认研究账户",
+        total_assets=capital,
+        cash=available,
+        available_cash=available,
+    )
+    db.add(account)
+    db.commit()
+    db.refresh(account)
+    return account, True
+
+
+def _latest_bar(db: Session, symbol: str) -> MarketDailyBar | None:
+    return db.scalar(
+        select(MarketDailyBar)
+        .where(MarketDailyBar.symbol == symbol)
+        .order_by(MarketDailyBar.trade_date.desc(), MarketDailyBar.fetched_at.desc())
+    )
+
+
+def _sync_stock(
+    db: Session, symbol: str, provider: UnifiedDataService, refresh: bool
+) -> tuple[dict, dict]:
+    cached = _latest_bar(db, symbol)
+    stale = cached is None or cached.trade_date < date.today() - timedelta(days=5)
+    if cached and not stale and not refresh:
+        return (
+            _step(
+                "market_data",
+                "行情数据",
+                "success",
+                f"本地前复权日线有效，截止 {cached.trade_date.isoformat()}。",
+                source=cached.source,
+                data_time=cached.fetched_at.isoformat(),
+            ),
+            {"data_date": cached.trade_date.isoformat(), "source": cached.source},
+        )
+    try:
+        history_result = provider.get_history(
+            symbol, date.today() - timedelta(days=900), date.today()
+        )
+        bars = history_result.value
+        if len(bars) < 80:
+            raise ProviderUnavailableError(f"前复权日线仅有 {len(bars)} 根，少于80根")
+        quote_error = None
+        try:
+            quote = provider.get_quote(symbol).value
+        except ProviderUnavailableError as exc:
+            quote_error = str(exc)
+            latest = bars[-1]
+            old_quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
+            from app.providers.market import Quote
+
+            quote = Quote(
+                symbol=symbol,
+                name=old_quote.name if old_quote and old_quote.name else symbol,
+                price=latest.close,
+                source=latest.source,
+                source_api="history_latest_close",
+                fetched_at=latest.fetched_at,
+            )
+        for bar in bars:
+            item = db.scalar(
+                select(MarketDailyBar).where(
+                    MarketDailyBar.symbol == symbol,
+                    MarketDailyBar.trade_date == bar.trade_date,
+                    MarketDailyBar.source == bar.source,
+                )
+            )
+            if item is None:
+                db.add(MarketDailyBar(**bar.__dict__))
+            else:
+                for key in ("open", "high", "low", "close", "volume", "fetched_at"):
+                    setattr(item, key, getattr(bar, key))
+        stored_quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
+        if stored_quote is None:
+            stored_quote = MarketQuote(
+                symbol=symbol,
+                name=quote.name,
+                price=quote.price,
+                source=quote.source,
+                source_api=quote.source_api,
+                fetched_at=quote.fetched_at,
+            )
+            db.add(stored_quote)
+        else:
+            stored_quote.name = quote.name
+            stored_quote.price = quote.price
+            stored_quote.source = quote.source
+            stored_quote.source_api = quote.source_api
+            stored_quote.fetched_at = quote.fetched_at
+        db.commit()
+        return (
+            _step(
+                "market_data",
+                "行情数据",
+                "success",
+                f"已自动同步 {len(bars)} 根前复权日线，截止 {bars[-1].trade_date.isoformat()}。"
+                + (f" 实时行情失败，使用最新收盘：{quote_error}" if quote_error else ""),
+                fallback_used=bool(quote_error) or history_result.fallback_used,
+                source=bars[-1].source,
+                data_time=bars[-1].fetched_at.isoformat(),
+            ),
+            {"data_date": bars[-1].trade_date.isoformat(), "source": bars[-1].source},
+        )
+    except Exception as exc:
+        db.rollback()
+        cached = _latest_bar(db, symbol)
+        if cached:
+            return (
+                _step(
+                    "market_data",
+                    "行情数据",
+                    "partial",
+                    f"外部行情同步失败，回退到 {cached.trade_date.isoformat()} 的缓存：{exc}",
+                    fallback_used=True,
+                    source=cached.source,
+                    data_time=cached.fetched_at.isoformat(),
+                    missing=["最新行情"],
+                ),
+                {"data_date": cached.trade_date.isoformat(), "source": cached.source},
+            )
+        return (
+            _step(
+                "market_data",
+                "行情数据",
+                "failed",
+                f"行情同步失败且没有可用缓存：{exc}",
+                missing=["前复权日线", "当前价格"],
+            ),
+            {"data_date": None, "source": "数据不足"},
+        )
+
+
+def _series_assessment(rows: list[dict]) -> dict:
+    frame = pd.DataFrame(rows).sort_values("date")
+    close = frame["close"].astype(float)
+    if len(close) < 60:
+        return {"state": "无法判断", "risk": "无法判断", "return_20d": None}
+    current = float(close.iloc[-1])
+    ma20 = float(close.rolling(20).mean().iloc[-1])
+    ma60 = float(close.rolling(60).mean().iloc[-1])
+    return_20d = (current / float(close.iloc[-21]) - 1) * 100
+    drawdown_20d = (current / float(close.tail(20).max()) - 1) * 100
+    state = (
+        "上升"
+        if current > ma20 > ma60 and return_20d > 0
+        else "下降"
+        if current < ma20 < ma60 and return_20d < -3
+        else "震荡"
+    )
+    risk = "高" if state == "下降" or drawdown_20d <= -8 else "低" if state == "上升" else "中等"
+    return {
+        "state": state,
+        "risk": risk,
+        "close": round(current, 4),
+        "ma20": round(ma20, 4),
+        "ma60": round(ma60, 4),
+        "return_20d": round(return_20d, 2),
+        "drawdown_20d": round(drawdown_20d, 2),
+    }
+
+
+def _market_assessment(db: Session, provider: UnifiedDataService) -> tuple[dict, dict]:
+    cache_symbol = "CSI000300"
+    cached = db.scalars(
+        select(MarketDailyBar)
+        .where(MarketDailyBar.symbol == cache_symbol)
+        .order_by(MarketDailyBar.trade_date)
+    ).all()
+    if cached and cached[-1].trade_date >= date.today() - timedelta(days=5):
+        rows = [
+            {"date": item.trade_date, "close": float(item.close), "volume": float(item.volume)}
+            for item in cached
+        ]
+        assessment = _series_assessment(rows)
+        detail = (
+            f"沪深300：20日涨跌 {assessment['return_20d']}%，收盘 {assessment.get('close')}，"
+            f"MA20 {assessment.get('ma20')}，MA60 {assessment.get('ma60')}；市场风险 {assessment['risk']}。"
+        )
+        return assessment, _step(
+            "market_judgement",
+            "市场判断",
+            "success",
+            detail,
+            source=cached[-1].source,
+            data_time=cached[-1].fetched_at.isoformat(),
+        )
+    try:
+        history_result = provider.get_index_history(
+            "csi000300", date.today() - timedelta(days=240), date.today()
+        )
+        history = history_result.value
+        for row in history["rows"]:
+            existing = db.scalar(
+                select(MarketDailyBar).where(
+                    MarketDailyBar.symbol == cache_symbol,
+                    MarketDailyBar.trade_date == row["date"],
+                    MarketDailyBar.source == history["source"],
+                )
+            )
+            if existing is None:
+                close = Decimal(str(row["close"]))
+                db.add(
+                    MarketDailyBar(
+                        symbol=cache_symbol,
+                        trade_date=row["date"],
+                        open=close,
+                        high=close,
+                        low=close,
+                        close=close,
+                        volume=Decimal(str(row.get("volume") or 0)),
+                        source=history["source"],
+                        fetched_at=history["fetched_at"],
+                    )
+                )
+        db.commit()
+        assessment = _series_assessment(history["rows"])
+        detail = (
+            f"沪深300：20日涨跌 {assessment['return_20d']}%，"
+            f"收盘 {assessment.get('close')}，MA20 {assessment.get('ma20')}，"
+            f"MA60 {assessment.get('ma60')}；市场风险 {assessment['risk']}。"
+        )
+        return assessment, _step(
+            "market_judgement",
+            "市场判断",
+            "success" if assessment["state"] != "无法判断" else "partial",
+            detail,
+            source=history["source"],
+            data_time=history["fetched_at"].isoformat(),
+        )
+    except Exception as exc:
+        db.rollback()
+        if cached:
+            rows = [
+                {"date": item.trade_date, "close": float(item.close), "volume": float(item.volume)}
+                for item in cached
+            ]
+            assessment = _series_assessment(rows)
+            return assessment, _step(
+                "market_judgement",
+                "市场判断",
+                "partial",
+                f"指数刷新失败，回退到 {cached[-1].trade_date.isoformat()} 的缓存：{exc}",
+                fallback_used=True,
+                source=cached[-1].source,
+                data_time=cached[-1].fetched_at.isoformat(),
+                missing=["最新沪深300行情"],
+            )
+        assessment = {"state": "无法判断", "risk": "无法判断", "return_20d": None}
+        return assessment, _step(
+            "market_judgement",
+            "市场判断",
+            "partial",
+            f"宽基指数获取失败，市场环境不作猜测：{exc}",
+            missing=["沪深300近60个交易日"],
+        )
+
+
+def _pick(raw: dict, *keys):
+    return next((raw.get(key) for key in keys if raw.get(key) not in (None, "")), None)
+
+
+def _ensure_profile(
+    db: Session, symbol: str, provider: UnifiedDataService
+) -> tuple[CompanyProfile | None, dict]:
+    profile = db.scalar(select(CompanyProfile).where(CompanyProfile.symbol == symbol))
+    if profile and profile.industry:
+        return profile, _step(
+            "company_mapping",
+            "公司与行业识别",
+            "success",
+            f"{profile.name}，所属行业：{profile.industry}。",
+            source=profile.source,
+            data_time=profile.fetched_at.isoformat(),
+            missing=["概念板块自动映射", "完整产业链节点"] if not profile.raw_data else [],
+        )
+    try:
+        profile_result = provider.company_profile(symbol)
+        raw = profile_result.value
+        now = datetime.now()
+        values = {
+            "name": str(_pick(raw, "A股简称", "公司名称") or symbol),
+            "industry": _pick(raw, "细分行业", "所属行业"),
+            "market": _pick(raw, "所属市场"),
+            "main_business": _pick(raw, "主营业务"),
+            "business_scope": _pick(raw, "经营范围"),
+            "website": _pick(raw, "官方网站"),
+            "source": "巨潮资讯公司概况（AKShare）",
+            "source_url": "http://www.cninfo.com.cn/new/commonUrl?url=data/stock/stockDetail",
+            "raw_data": raw,
+            "fetched_at": now,
+        }
+        if profile is None:
+            profile = CompanyProfile(symbol=symbol, **values)
+            db.add(profile)
+        else:
+            for key, value in values.items():
+                setattr(profile, key, value)
+        db.commit()
+        return profile, _step(
+            "company_mapping",
+            "公司与行业识别",
+            "success" if profile.industry else "partial",
+            f"识别为 {profile.name}；行业：{profile.industry or '暂无可靠数据'}。",
+            source=profile.source,
+            data_time=now.isoformat(),
+            missing=[] if profile.industry else ["所属行业", "概念板块", "产业链节点"],
+        )
+    except Exception as exc:
+        return profile, _step(
+            "company_mapping",
+            "公司与行业识别",
+            "partial",
+            f"公司行业识别失败，保留已有信息：{exc}",
+            fallback_used=profile is not None,
+            missing=["所属行业", "概念板块", "产业链节点"],
+        )
+
+
+def _sector_board_name(profile: CompanyProfile) -> str:
+    text = f"{profile.industry or ''} {profile.main_business or ''}"
+    aliases = (
+        (("光模块", "光通信", "通信设备"), "通信设备"),
+        (("半导体", "集成电路", "芯片"), "半导体"),
+        (("软件", "信息技术服务"), "软件开发"),
+        (("银行",), "银行"),
+        (("证券",), "证券"),
+        (("保险",), "保险"),
+        (("汽车",), "汽车整车"),
+        (("白酒",), "酿酒行业"),
+        (("电池", "锂电"), "电池"),
+        (("光伏",), "光伏设备"),
+        (("医药", "制药"), "化学制药"),
+    )
+    return next((board for keys, board in aliases if any(key in text for key in keys)), profile.industry)
+
+
+def _sector_assessment(
+    db: Session,
+    provider: UnifiedDataService,
+    profile: CompanyProfile | None,
+    market: dict,
+    refresh: bool = False,
+) -> tuple[dict, dict]:
+    result: dict[str, object]
+    if profile is None or not profile.industry:
+        result = {"state": "无法判断", "relative_20d": None, "is_mainline": None}
+        return result, _step(
+            "industry_judgement",
+            "行业判断",
+            "partial",
+            "缺少可靠所属行业，无法计算行业相对强弱。",
+            missing=["所属行业", "行业指数"],
+        )
+    if not refresh:
+        previous = db.scalar(
+            select(PlanAnalysisRun)
+            .where(
+                PlanAnalysisRun.symbol == profile.symbol,
+                PlanAnalysisRun.status.in_(("success", "confirmed")),
+                PlanAnalysisRun.created_at >= datetime.now() - timedelta(hours=24),
+            )
+            .order_by(PlanAnalysisRun.created_at.desc())
+        )
+        previous_result = previous.result_snapshot if previous else None
+        cached_assessment = (previous_result or {}).get("plan", {}).get("industry_assessment")
+        cached_step = next(
+            (
+                item
+                for item in (previous_result or {}).get("steps", [])
+                if item.get("code") == "industry_judgement" and item.get("status") == "success"
+            ),
+            None,
+        )
+        if cached_assessment and cached_step:
+            prefix = "使用24小时内行业判断缓存；"
+            detail = cached_step["detail"]
+            while detail.startswith(prefix + prefix):
+                detail = detail[len(prefix) :]
+            return cached_assessment, {
+                **cached_step,
+                "detail": detail if detail.startswith(prefix) else f"{prefix}{detail}",
+                "fallback_used": True,
+            }
+    try:
+        board_name = _sector_board_name(profile)
+        history_result = provider.get_sector_history(
+            board_name, date.today() - timedelta(days=240), date.today()
+        )
+        history = history_result.value
+        assessment = _series_assessment(history["rows"])
+        market_return = market.get("return_20d")
+        relative = (
+            assessment["return_20d"] - market_return
+            if assessment["return_20d"] is not None and market_return is not None
+            else None
+        )
+        state = (
+            "强"
+            if relative is not None and relative >= 3 and assessment["state"] == "上升"
+            else "弱"
+            if relative is not None and relative <= -3 and assessment["state"] == "下降"
+            else "中性"
+        )
+        result = {
+            "state": state,
+            "industry": profile.industry,
+            "board_name": board_name,
+            "return_20d": assessment["return_20d"],
+            "relative_20d": round(relative, 2) if relative is not None else None,
+            "is_mainline": bool(state == "强"),
+            "mainline_method": "行业20日涨跌相对沪深300的规则代理，不等同于完整资金主线模型",
+        }
+        return result, _step(
+            "industry_judgement",
+            "行业判断",
+            "success",
+            f"{profile.industry}（行情代理板块：{board_name}）20日涨跌 {assessment['return_20d']}%，"
+            f"相对沪深300 {result['relative_20d']}个百分点，判定为{state}。",
+            source=history["source"],
+            data_time=history["fetched_at"].isoformat(),
+        )
+    except Exception as exc:
+        result = {"state": "无法判断", "relative_20d": None, "is_mainline": None}
+        return result, _step(
+            "industry_judgement",
+            "行业判断",
+            "partial",
+            f"已识别行业“{profile.industry}”，但行业指数获取失败：{exc}",
+            missing=["行业指数近60个交易日", "行业相对强度"],
+        )
+
+
+def _research_inventory(db: Session, symbol: str) -> tuple[dict, dict]:
+    financials = db.scalars(
+        select(CompanyFinancialPeriod).where(CompanyFinancialPeriod.symbol == symbol)
+    ).all()
+    announcements = db.scalars(
+        select(CompanyAnnouncement).where(CompanyAnnouncement.symbol == symbol)
+    ).all()
+    evidence = db.scalars(
+        select(CompanyResearchEvidence).where(CompanyResearchEvidence.symbol == symbol)
+    ).all()
+    valuation = db.scalar(
+        select(CompanyValuationSnapshot)
+        .where(CompanyValuationSnapshot.symbol == symbol)
+        .order_by(CompanyValuationSnapshot.trade_date.desc())
+    )
+    risks = [item for item in announcements if item.risk_level in {"红", "黄"}]
+    missing = []
+    if not financials:
+        missing.append("最近12季度财务数据")
+    if not announcements:
+        missing.append("公司公告目录")
+    if not evidence:
+        missing.append("产业与公开信息证据")
+    if not valuation:
+        missing.append("估值数据")
+    result = {
+        "financial_periods": len(financials),
+        "announcements": len(announcements),
+        "risk_events": [
+            {
+                "title": item.title,
+                "risk_level": item.risk_level,
+                "published_date": item.published_date.isoformat(),
+                "source": item.catalog_source,
+                "url": item.source_document_url or item.url,
+            }
+            for item in sorted(risks, key=lambda x: x.published_date, reverse=True)[:10]
+        ],
+        "evidence_count": len(evidence),
+        "valuation_available": valuation is not None,
+        "missing": missing,
+    }
+    return result, _step(
+        "company_risk",
+        "公司风险与公开信息",
+        "success" if not missing else "partial",
+        f"本地已有财务期数 {len(financials)}、公告 {len(announcements)}、产业证据 {len(evidence)}。",
+        missing=missing,
+        source="本地公司研究中心（原始来源保留在证据记录）",
+        data_time=datetime.now().isoformat(),
+    )
+
+
+def _decision(preview: dict, position_mode: str) -> dict:
+    holding = preview["existing_position"]
+    if position_mode == "持仓":
+        if holding["hard_stop_triggered"] or preview.get("pattern", {}).get("platform_broken"):
+            status, label = "PLAN_INVALID_EXIT", "计划失效，需要退出"
+        elif holding["first_reduction_triggered"]:
+            status, label = "REDUCE", "建议减仓"
+        elif holding["confirmation_add_allowed"]:
+            status, label = "CONDITIONAL_ADD", "允许条件式加仓"
+        elif preview["status"] == "NO_TRADE":
+            status, label = "REDUCE", "建议减仓"
+        else:
+            status, label = "HOLD", "允许持有"
+    elif preview["status"] == "READY" and preview["current_buy_allowed"]:
+        status, label = "TRIAL_ALLOWED", "允许试仓"
+    elif preview["status"] == "NO_TRADE":
+        status, label = "BUY_PROHIBITED", "禁止买入"
+    else:
+        status, label = "WAIT", "等待观察"
+    return {
+        "status": status,
+        "label": label,
+        "next_action": preview["next_observations"][0]
+        if preview["next_observations"]
+        else "等待下一次有效触发并重新分析。",
+        "rule_authority": "最终状态、仓位、止损和加仓均由确定性规则引擎决定，AI无权修改。",
+    }
+
+
+def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
+    account, created_account = _default_account(db, payload)
+    run = PlanAnalysisRun(
+        symbol=payload.symbol,
+        account_id=account.id,
+        position_mode=payload.position_mode,
+        status="running",
+        request_snapshot=payload.model_dump(mode="json"),
+        pipeline_steps=[],
+        result_snapshot=None,
+        user_confirmed=False,
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    provider = UnifiedDataService(db)
+    steps = [
+        _step(
+            "account",
+            "账户与持仓",
+            "success",
+            f"使用账户“{account.name}”，权益 {float(account.total_assets):.2f} 元。"
+            + (" 已自动建立默认研究账户。" if created_account else ""),
+            source="本地账户设置",
+            data_time=datetime.now().isoformat(),
+        )
+    ]
+    try:
+        stock_step, stock_meta = _sync_stock(db, payload.symbol, provider, payload.refresh)
+        steps.append(stock_step)
+        research_refresh = refresh_company_research_if_needed(
+            db,
+            payload.symbol,
+            force=payload.refresh,
+            include_documents=False,
+            data_service=provider,
+        )
+        refresh_sections = research_refresh.get("sections", {})
+        refresh_failed = [
+            name
+            for name, item in refresh_sections.items()
+            if item.get("status") in {"unavailable", "failed"}
+        ]
+        refresh_cached = [
+            name
+            for name, item in refresh_sections.items()
+            if item.get("status") == "cache_fallback"
+        ]
+        steps.append(
+            _step(
+                "company_research_refresh",
+                "公司研究刷新",
+                "success"
+                if not refresh_failed and not research_refresh.get("missing_data")
+                else "partial",
+                (
+                    f"已检查公司概况、最近12季度财务、估值、公告和风险事件；"
+                    f"实际刷新：{'、'.join(research_refresh.get('refreshed_sections') or ['无需刷新'])}。"
+                    + (f" 使用缓存：{'、'.join(refresh_cached)}。" if refresh_cached else "")
+                ),
+                fallback_used=bool(refresh_cached),
+                missing=research_refresh.get("missing_data", []),
+                source="统一数据服务",
+                data_time=research_refresh.get("updated_at"),
+                provider_status=provider.provider_status(),
+                freshness=research_refresh.get("freshness", []),
+            )
+        )
+        profile, profile_step = _ensure_profile(db, payload.symbol, provider)
+        steps.append(profile_step)
+        market, market_step = _market_assessment(db, provider)
+        steps.append(market_step)
+        sector, sector_step = _sector_assessment(db, provider, profile, market, payload.refresh)
+        steps.append(sector_step)
+        research, research_step = _research_inventory(db, payload.symbol)
+        research["refresh"] = research_refresh
+        research["provider_status"] = provider.provider_status()
+        steps.append(research_step)
+
+        effective_total_cap = payload.max_total_position_pct
+        if market["risk"] == "高":
+            effective_total_cap = min(
+                effective_total_cap,
+                Decimal(str(GENERATOR_PARAMETERS["market_high_risk_total_cap_pct"])),
+            )
+        elif market["risk"] == "中等":
+            effective_total_cap = min(
+                effective_total_cap,
+                Decimal(str(GENERATOR_PARAMETERS["market_neutral_total_cap_pct"])),
+            )
+        generator_request = TradePlanPreviewRequest(
+            symbol=payload.symbol,
+            account_id=account.id,
+            risk_pct=payload.risk_pct,
+            max_position_pct=payload.max_position_pct,
+            max_total_position_pct=effective_total_cap,
+            max_industry_position_pct=payload.max_industry_position_pct,
+            market_state=market["state"],
+            sector_state=sector["state"],
+            logic_invalidation=payload.logic_invalidation,
+            position_mode=payload.position_mode,
+            holding_quantity=payload.holding_quantity,
+            holding_cost_price=payload.holding_cost_price,
+            market_evidence=market_step["detail"],
+            market_source=market_step.get("source", "数据不足"),
+            market_data_time=market_step.get("data_time", datetime.now().isoformat()),
+            sector_evidence=sector_step["detail"],
+            sector_source=sector_step.get("source", "数据不足"),
+            sector_data_time=sector_step.get("data_time", datetime.now().isoformat()),
+        )
+        preview = generate_trade_plan_preview(db, generator_request)
+        decision = _decision(preview, payload.position_mode)
+        preview["decision"] = decision
+        preview["market_assessment"] = market
+        preview["industry_assessment"] = sector
+        preview["research_inventory"] = research
+        steps.extend(
+            [
+                _step(
+                    "stock_analysis",
+                    "个股分析",
+                    "success" if preview["pattern"] else "partial",
+                    "已完成多周期、平台、均线、量能、MACD、RSI、ATR及关键结构计算。"
+                    if preview["pattern"]
+                    else "个股行情不足，技术结构无法完整计算。",
+                    missing=[] if preview["pattern"] else ["至少80根前复权日线"],
+                    source=stock_meta["source"],
+                    data_time=preview.get("data_date"),
+                ),
+                _step(
+                    "risk_calculation",
+                    "风险计算",
+                    "success" if preview["position_calculation"] else "partial",
+                    preview["position_calculation"].get(
+                        "formula", "买入触发价或止损不足，无法计算仓位。"
+                    ),
+                    missing=[]
+                    if preview["position_calculation"]
+                    else ["有效买入触发价", "硬止损价"],
+                    source="确定性规则引擎 + 本地账户",
+                    data_time=datetime.now().isoformat(),
+                ),
+            ]
+        )
+        ai_result = None
+        ai_id = None
+        if payload.enable_ai:
+            ai_request = TradePlanAIRequest(
+                **generator_request.model_dump(), preview_hash=preview["preview_hash"]
+            )
+            ai_result = run_ai_analysis(db, ai_request)
+            ai_id = ai_result.get("id")
+            steps.append(
+                _step(
+                    "ai_explanation",
+                    "AI解释",
+                    "success" if ai_result.get("status") == "success" else "partial",
+                    "AI已基于证据包生成解释；不改变规则结论。"
+                    if ai_result.get("status") == "success"
+                    else ai_result.get("error", "AI未配置或暂不可用，规则计划不受影响。"),
+                    fallback_used=ai_result.get("status") != "success",
+                    missing=[]
+                    if ai_result.get("status") == "success"
+                    else ["AI辅助解释"],
+                    source=f"{ai_result.get('provider', '未配置')}/{ai_result.get('model', '未配置')}",
+                    data_time=ai_result.get("created_at", datetime.now().isoformat()),
+                )
+            )
+        else:
+            ai_result = {
+                "status": "skipped",
+                "error": "用户关闭了AI辅助分析；规则计划已独立完成。",
+                "result": None,
+            }
+            steps.append(
+                _step(
+                    "ai_explanation",
+                    "AI解释",
+                    "skipped",
+                    "用户在高级设置中关闭了AI；规则计划已完整生成。",
+                    missing=["AI辅助解释"],
+                )
+            )
+        steps.append(
+            _step(
+                "plan_output",
+                "生成计划",
+                "success",
+                f"确定性结论：{decision['label']}。等待用户确认后保存正式版本。",
+                source=f"规则 {preview['rule']['version']}",
+                data_time=preview["generated_at"],
+            )
+        )
+        result = {
+            "run_id": run.id,
+            "status": "success",
+            "account": {
+                "id": account.id,
+                "name": account.name,
+                "auto_created": created_account,
+            },
+            "steps": steps,
+            "decision": decision,
+            "plan": preview,
+            "ai": ai_result,
+            "generator_request": generator_request.model_dump(mode="json"),
+            "can_save": bool(preview["buy_plan"]["hard_stop"] and preview["data_date"]),
+            "save_disabled_reason": None
+            if preview["buy_plan"]["hard_stop"] and preview["data_date"]
+            else "缺少可靠买入区、硬止损或行情日期，不能冻结为正式计划。",
+        }
+        run.status = "success"
+        run.pipeline_steps = steps
+        run.result_snapshot = result
+        run.ai_analysis_id = ai_id
+        db.commit()
+        return result
+    except Exception as exc:
+        logger.exception("one-click analysis failed", extra={"symbol": payload.symbol})
+        db.rollback()
+        run = db.get(PlanAnalysisRun, run.id)
+        if run:
+            run.status = "failed"
+            run.pipeline_steps = steps
+            run.error = f"{type(exc).__name__}: {exc}"
+            db.commit()
+        raise
+
+
+def confirm_one_click_plan(db: Session, run_id: int) -> dict:
+    run = db.get(PlanAnalysisRun, run_id)
+    if run is None:
+        raise AppError(404, "ANALYSIS_RUN_NOT_FOUND", "一键分析记录不存在")
+    if run.confirmed_plan_id:
+        raise AppError(409, "ANALYSIS_ALREADY_CONFIRMED", "该分析已经保存为正式计划")
+    result = run.result_snapshot or {}
+    plan = result.get("plan") or {}
+    generator_payload = result.get("generator_request")
+    if not generator_payload or not plan.get("preview_hash"):
+        raise AppError(422, "ANALYSIS_NOT_SAVABLE", "分析没有形成可保存的规则快照")
+    save_request = TradePlanSaveRequest(
+        **generator_payload,
+        preview_hash=plan["preview_hash"],
+        ai_analysis_id=run.ai_analysis_id,
+    )
+    saved = save_generated_plan(db, save_request)
+    frozen_plan = db.get(TradePlan, saved["id"])
+    if frozen_plan:
+        frozen_plan.engine_snapshot = plan
+        frozen_plan.market_snapshot = {
+            "market_assessment": plan.get("market_assessment"),
+            "industry_assessment": plan.get("industry_assessment"),
+        }
+        frozen_plan.source_snapshot = (
+            (result.get("ai") or {}).get("sources")
+            or plan.get("sources")
+            or []
+        )
+    run.user_confirmed = True
+    run.confirmed_plan_id = saved["id"]
+    run.status = "confirmed"
+    db.commit()
+    return {**saved, "run_id": run.id, "user_confirmed": True}
+
+
+def get_analysis_run(db: Session, run_id: int) -> dict:
+    run = db.get(PlanAnalysisRun, run_id)
+    if run is None:
+        raise AppError(404, "ANALYSIS_RUN_NOT_FOUND", "一键分析记录不存在")
+    return {
+        "id": run.id,
+        "symbol": run.symbol,
+        "account_id": run.account_id,
+        "position_mode": run.position_mode,
+        "status": run.status,
+        "steps": run.pipeline_steps,
+        "result": run.result_snapshot,
+        "ai_analysis_id": run.ai_analysis_id,
+        "user_confirmed": run.user_confirmed,
+        "confirmed_plan_id": run.confirmed_plan_id,
+        "error": run.error,
+        "created_at": run.created_at.isoformat(),
+        "updated_at": run.updated_at.isoformat(),
+    }

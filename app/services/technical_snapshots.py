@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Holding, MarketDailyBar, TechnicalSnapshot
-from app.providers.akshare_provider import AKShareProvider
+from app.services.data_sources import UnifiedDataService
 from app.services.technical import analyze_frame, compare_states
 
 
@@ -99,7 +99,9 @@ def snapshot_holding(db: Session, holding: Holding) -> TechnicalSnapshot:
 
 
 def refresh_qfq_history(db: Session, symbol: str, days: int = 550) -> int:
-    bars = AKShareProvider().get_history(symbol, date.today() - timedelta(days=days), date.today())
+    bars = UnifiedDataService(db).get_history(
+        symbol, date.today() - timedelta(days=days), date.today()
+    ).value
     source = bars[0].source if bars else "akshare_qfq"
     existing = {
         item.trade_date: item

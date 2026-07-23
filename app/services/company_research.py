@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -16,10 +16,12 @@ from app.models import (
     CompanyFinancialPeriod,
     CompanyProfile,
     CompanyResearchEvidence,
+    CompanyResearchRefresh,
     CompanyValuationSnapshot,
     XPost,
 )
-from app.providers.akshare_provider import AKShareProvider
+from app.config import get_settings
+from app.services.data_sources import ProviderResult, UnifiedDataService
 
 
 PROFILE_URL = "http://www.cninfo.com.cn/new/commonUrl?url=data/stock/stockDetail"
@@ -251,12 +253,24 @@ def _implied_scenarios(current_pe: float | None, pe_history: list[float]):
     }
 
 
-def _peer_operating_comparison(provider: AKShareProvider, peer_rows: list[dict]) -> list[dict]:
+def _provider_value(value):
+    return value.value if isinstance(value, ProviderResult) else value
+
+
+def _provider_source(provider, capability: str, default: str) -> str:
+    if isinstance(provider, UnifiedDataService):
+        call = provider.calls.get(capability)
+        if call:
+            return call.provider_id
+    return getattr(provider, "provider_id", default)
+
+
+def _peer_operating_comparison(provider, peer_rows: list[dict]) -> list[dict]:
     result = []
     for peer in peer_rows[:3]:
         code = str(peer.get("代码", ""))
         try:
-            periods = _financial_values(provider.financial_statements(code))
+            periods = _financial_values(_provider_value(provider.financial_statements(code)))
             latest = periods[-1]
             prior = periods[-5] if len(periods) >= 5 else None
             result.append(
@@ -367,16 +381,17 @@ def _annual_report_text(announcement: CompanyAnnouncement) -> str | None:
 def sync_company_research(
     db: Session,
     symbol: str,
-    provider: AKShareProvider | None = None,
+    provider=None,
     include_documents: bool = True,
 ) -> dict:
-    provider = provider or AKShareProvider(retries=1)
+    provider = provider or UnifiedDataService(db)
     fetched_at = datetime.now()
     sections = {}
     profile = None
 
     try:
-        raw_profile = provider.company_profile(symbol)
+        raw_profile = _provider_value(provider.company_profile(symbol))
+        profile_source = _provider_source(provider, "fundamental.profile", "巨潮资讯公司概况")
         profile = db.scalar(select(CompanyProfile).where(CompanyProfile.symbol == symbol))
         values = {
             "name": str(raw_profile.get("A股简称") or raw_profile.get("公司名称") or symbol),
@@ -385,7 +400,7 @@ def sync_company_research(
             "main_business": raw_profile.get("主营业务"),
             "business_scope": raw_profile.get("经营范围"),
             "website": raw_profile.get("官方网站"),
-            "source": "巨潮资讯公司概况",
+            "source": profile_source,
             "source_url": PROFILE_URL,
             "raw_data": raw_profile,
             "fetched_at": fetched_at,
@@ -403,7 +418,7 @@ def sync_company_research(
                 topic="主营业务",
                 information_type="事实",
                 content=profile.main_business,
-                source_name="巨潮资讯公司概况",
+                source_name=profile_source,
                 source_url=PROFILE_URL,
                 source_date=None,
                 raw_data={"field": "主营业务"},
@@ -414,10 +429,15 @@ def sync_company_research(
         sections["profile"] = {"status": "unavailable", "message": str(exc)}
 
     try:
-        statements = provider.financial_statements(symbol)
-        rows = _financial_values(statements)
+        statements = _provider_value(provider.financial_statements(symbol))
+        financial_source = _provider_source(
+            provider, "fundamental.statements", "新浪财经三大财务报表"
+        )
+        rows = sorted(
+            _financial_values(statements), key=lambda item: item["report_date"], reverse=True
+        )[:12]
         for values in rows:
-            item = db.scalar(
+            financial_item = db.scalar(
                 select(CompanyFinancialPeriod).where(
                     CompanyFinancialPeriod.symbol == symbol,
                     CompanyFinancialPeriod.report_date == values["report_date"],
@@ -425,23 +445,25 @@ def sync_company_research(
             )
             payload = {
                 **values,
-                "source": "新浪财经三大财务报表",
+                "source": financial_source,
                 "source_url": FINANCIAL_URL.format(symbol=symbol),
                 "fetched_at": fetched_at,
             }
-            if item is None:
+            if financial_item is None:
                 db.add(CompanyFinancialPeriod(symbol=symbol, **payload))
             else:
                 for key, value in payload.items():
-                    setattr(item, key, value)
+                    setattr(financial_item, key, value)
         sections["financials"] = {"status": "success", "rows": len(rows)}
         db.flush()
     except Exception as exc:
         sections["financials"] = {"status": "unavailable", "message": str(exc)}
 
     try:
-        announcement_rows = provider.company_announcements(
-            symbol, date.today() - timedelta(days=3 * 366), date.today()
+        announcement_rows = _provider_value(
+            provider.company_announcements(
+                symbol, date.today() - timedelta(days=3 * 366), date.today()
+            )
         )
         inserted = 0
         document_resolution_attempts = 0
@@ -458,7 +480,7 @@ def sync_company_research(
                 document_url = _resolve_announcement_document_url(url)
                 if document_url:
                     resolved_documents += 1
-            item = db.scalar(
+            announcement_item = db.scalar(
                 select(CompanyAnnouncement).where(
                     CompanyAnnouncement.symbol == symbol, CompanyAnnouncement.url == url
                 )
@@ -475,12 +497,12 @@ def sync_company_research(
                 "raw_data": row,
                 "fetched_at": fetched_at,
             }
-            if item is None:
+            if announcement_item is None:
                 db.add(CompanyAnnouncement(symbol=symbol, **values))
                 inserted += 1
             else:
                 for key, value in values.items():
-                    setattr(item, key, value)
+                    setattr(announcement_item, key, value)
         sections["announcements"] = {
             "status": "success",
             "rows": len(announcement_rows),
@@ -492,29 +514,34 @@ def sync_company_research(
         sections["announcements"] = {"status": "unavailable", "message": str(exc)}
 
     try:
-        history = provider.valuation_history(symbol)
+        history = _provider_value(provider.valuation_history(symbol))
+        valuation_source = _provider_source(
+            provider, "fundamental.valuation", "百度股市通历史估值 + 东方财富同行比较"
+        )
         comparison = []
         try:
-            comparison = provider.valuation_comparison(symbol)
+            comparison = _provider_value(provider.valuation_comparison(symbol))
         except Exception:
             comparison = []
         pe_date, pe = _latest_history(history.get("pe_ttm", []))
         pb_date, pb = _latest_history(history.get("pb", []))
         cap_date, cap = _latest_history(history.get("market_cap", []))
-        target_row = next((row for row in comparison if str(row.get("代码")) == symbol), {})
+        target_row: dict = next(
+            (row for row in comparison if str(row.get("代码")) == symbol), {}
+        )
         ps = _float(target_row.get("市销率-TTM"))
         financials = db.scalars(
             select(CompanyFinancialPeriod)
             .where(CompanyFinancialPeriod.symbol == symbol)
             .order_by(CompanyFinancialPeriod.report_date)
         ).all()
-        ps_values = _ps_history(financials, history.get("market_cap", []))
+        ps_values = _ps_history(list(financials), history.get("market_cap", []))
         pe_values = [_float(row.get("value")) for row in history.get("pe_ttm", [])]
         pb_values = [_float(row.get("value")) for row in history.get("pb", [])]
         trade_date = _date(
             max(value for value in (pe_date, pb_date, cap_date) if value is not None)
         )
-        item = db.scalar(
+        valuation_item = db.scalar(
             select(CompanyValuationSnapshot).where(
                 CompanyValuationSnapshot.symbol == symbol,
                 CompanyValuationSnapshot.trade_date == trade_date,
@@ -548,15 +575,15 @@ def sync_company_research(
                 ),
             },
             "implied_growth": _implied_scenarios(pe, pe_values),
-            "source": "百度股市通历史估值 + 东方财富同行比较",
+            "source": valuation_source,
             "source_url": VALUATION_URL.format(symbol=symbol),
             "fetched_at": fetched_at,
         }
-        if item is None:
+        if valuation_item is None:
             db.add(CompanyValuationSnapshot(symbol=symbol, trade_date=trade_date, **values))
         else:
             for key, value in values.items():
-                setattr(item, key, value)
+                setattr(valuation_item, key, value)
         sections["valuation"] = {"status": "success", "rows": 1}
     except Exception as exc:
         sections["valuation"] = {"status": "unavailable", "message": str(exc)}
@@ -573,13 +600,13 @@ def sync_company_research(
         )
         text = _annual_report_text(annual_report) if annual_report else None
         extracted = extract_report_evidence(text) if text else []
-        for item in extracted:
+        for extracted_item in extracted:
             _upsert_evidence(
                 db,
                 symbol=symbol,
-                topic=item["topic"],
+                topic=extracted_item["topic"],
                 information_type="公司表态",
-                content=item["content"],
+                content=extracted_item["content"],
                 source_name=annual_report.title,
                 source_url=annual_report.source_document_url or annual_report.url,
                 source_date=annual_report.published_date,
@@ -625,6 +652,108 @@ def sync_company_research(
             fetched_at=fetched_at,
         )
 
+    db.flush()
+    cached_counts = {
+        "profile": 1
+        if db.scalar(select(CompanyProfile.id).where(CompanyProfile.symbol == symbol))
+        else 0,
+        "financials": len(
+            db.scalars(
+                select(CompanyFinancialPeriod.id).where(CompanyFinancialPeriod.symbol == symbol)
+            ).all()
+        ),
+        "announcements": len(
+            db.scalars(
+                select(CompanyAnnouncement.id).where(CompanyAnnouncement.symbol == symbol)
+            ).all()
+        ),
+        "valuation": len(
+            db.scalars(
+                select(CompanyValuationSnapshot.id).where(
+                    CompanyValuationSnapshot.symbol == symbol
+                )
+            ).all()
+        ),
+        "annual_report_parse": len(
+            db.scalars(
+                select(CompanyResearchEvidence.id).where(
+                    CompanyResearchEvidence.symbol == symbol
+                )
+            ).all()
+        ),
+    }
+    settings = get_settings()
+    fresh_hours = {
+        "profile": settings.research_profile_fresh_hours,
+        "financials": settings.research_financial_fresh_hours,
+        "announcements": settings.research_announcement_fresh_hours,
+        "valuation": settings.research_valuation_fresh_hours,
+        "annual_report_parse": settings.research_announcement_fresh_hours,
+    }
+    capability_by_section = {
+        "profile": "fundamental.profile",
+        "financials": "fundamental.statements",
+        "announcements": "announcement.catalog",
+        "valuation": "fundamental.valuation",
+        "annual_report_parse": "announcement.catalog",
+    }
+    for section, result in sections.items():
+        existing = db.scalar(
+            select(CompanyResearchRefresh).where(
+                CompanyResearchRefresh.symbol == symbol,
+                CompanyResearchRefresh.section == section,
+            )
+        )
+        external_success = result["status"] == "success"
+        raw_row_count = result.get("rows")
+        row_count = (
+            int(raw_row_count)
+            if isinstance(raw_row_count, (int, float, str))
+            else cached_counts.get(section, 0)
+        )
+        cache_used = not external_success and cached_counts.get(section, 0) > 0
+        if cache_used:
+            result["status"] = "cache_fallback"
+            result["cache_used"] = True
+            row_count = cached_counts[section]
+            if isinstance(provider, UnifiedDataService):
+                provider.record_cache_fallback(
+                    capability_by_section[section],
+                    section,
+                    symbol,
+                    row_count,
+                    str(result.get("message", "外部Provider失败")),
+                )
+        call = (
+            provider.calls.get(capability_by_section[section])
+            if isinstance(provider, UnifiedDataService)
+            else None
+        )
+        values = {
+            "status": result["status"],
+            "provider_id": call.provider_id
+            if call
+            else getattr(provider, "provider_id", provider.__class__.__name__),
+            "source_name": call.provider_id
+            if call
+            else getattr(provider, "provider_id", provider.__class__.__name__),
+            "row_count": row_count,
+            "cache_used": cache_used,
+            "last_attempt_at": fetched_at,
+            "last_success_at": fetched_at
+            if external_success
+            else (existing.last_success_at if existing else None),
+            "data_date": date.today() if row_count else None,
+            "stale_after": fetched_at + timedelta(hours=fresh_hours[section])
+            if external_success
+            else (existing.stale_after if existing else None),
+            "error": result.get("message") if not external_success else None,
+        }
+        if existing is None:
+            db.add(CompanyResearchRefresh(symbol=symbol, section=section, **values))
+        else:
+            for key, value in values.items():
+                setattr(existing, key, value)
     db.commit()
     return {
         "symbol": symbol,
@@ -633,6 +762,117 @@ def sync_company_research(
         else "success",
         "sections": sections,
         "updated_at": fetched_at.isoformat(),
+    }
+
+
+def refresh_company_research_if_needed(
+    db: Session,
+    symbol: str,
+    *,
+    force: bool = False,
+    include_documents: bool = False,
+    data_service: UnifiedDataService | None = None,
+) -> dict:
+    """检查四类公司研究数据，新鲜则复用，过期则经统一Provider自动刷新。"""
+    settings = get_settings()
+    now = datetime.now()
+    latest = {
+        "profile": db.scalar(
+            select(func.max(CompanyProfile.fetched_at)).where(CompanyProfile.symbol == symbol)
+        ),
+        "financials": db.scalar(
+            select(func.max(CompanyFinancialPeriod.fetched_at)).where(
+                CompanyFinancialPeriod.symbol == symbol
+            )
+        ),
+        "announcements": db.scalar(
+            select(func.max(CompanyAnnouncement.fetched_at)).where(
+                CompanyAnnouncement.symbol == symbol
+            )
+        ),
+        "valuation": db.scalar(
+            select(func.max(CompanyValuationSnapshot.fetched_at)).where(
+                CompanyValuationSnapshot.symbol == symbol
+            )
+        ),
+    }
+    limits = {
+        "profile": settings.research_profile_fresh_hours,
+        "financials": settings.research_financial_fresh_hours,
+        "announcements": settings.research_announcement_fresh_hours,
+        "valuation": settings.research_valuation_fresh_hours,
+    }
+    stale = [
+        name
+        for name, updated in latest.items()
+        if force or updated is None or updated < now - timedelta(hours=limits[name])
+    ]
+    if stale:
+        result = sync_company_research(
+            db,
+            symbol,
+            provider=data_service or UnifiedDataService(db),
+            include_documents=include_documents,
+        )
+    else:
+        result = {
+            "symbol": symbol,
+            "status": "fresh",
+            "sections": {
+                name: {
+                    "status": "fresh",
+                    "rows": 1,
+                    "updated_at": updated.isoformat() if updated else None,
+                    "cache_used": False,
+                }
+                for name, updated in latest.items()
+            },
+            "updated_at": now.isoformat(),
+        }
+    presence = {
+        "profile": bool(
+            db.scalar(select(CompanyProfile.id).where(CompanyProfile.symbol == symbol))
+        ),
+        "financials": bool(
+            db.scalar(
+                select(CompanyFinancialPeriod.id).where(CompanyFinancialPeriod.symbol == symbol)
+            )
+        ),
+        "announcements": bool(
+            db.scalar(
+                select(CompanyAnnouncement.id).where(CompanyAnnouncement.symbol == symbol)
+            )
+        ),
+        "valuation": bool(
+            db.scalar(
+                select(CompanyValuationSnapshot.id).where(
+                    CompanyValuationSnapshot.symbol == symbol
+                )
+            )
+        ),
+    }
+    states = db.scalars(
+        select(CompanyResearchRefresh).where(CompanyResearchRefresh.symbol == symbol)
+    ).all()
+    return {
+        **result,
+        "checked_at": now.isoformat(),
+        "refreshed_sections": stale,
+        "missing_data": [name for name, available in presence.items() if not available],
+        "freshness": [
+            {
+                "section": item.section,
+                "status": item.status,
+                "provider_id": item.provider_id,
+                "last_success_at": item.last_success_at.isoformat()
+                if item.last_success_at
+                else None,
+                "stale_after": item.stale_after.isoformat() if item.stale_after else None,
+                "cache_used": item.cache_used,
+                "row_count": item.row_count,
+            }
+            for item in states
+        ],
     }
 
 
@@ -879,7 +1119,9 @@ def _valuation_report(item: CompanyValuationSnapshot | None) -> dict:
 
 
 def _industry_report(profile: CompanyProfile | None, evidence: list[CompanyResearchEvidence]):
-    grouped = {topic: [] for topic in (*TOPIC_KEYWORDS, "产业资讯")}
+    grouped: dict[str, list[dict]] = {
+        topic: [] for topic in (*TOPIC_KEYWORDS, "产业资讯")
+    }
     for item in evidence:
         grouped.setdefault(item.topic, []).append(
             {
@@ -944,10 +1186,10 @@ def build_company_report(db: Session, symbol: str) -> dict:
         .where(CompanyResearchEvidence.symbol == symbol)
         .order_by(CompanyResearchEvidence.source_date.desc())
     ).all()
-    financial_report = _financial_report(financials)
-    risk_report = _risk_report(announcements)
+    financial_report = _financial_report(list(financials))
+    risk_report = _risk_report(list(announcements))
     valuation_report = _valuation_report(valuation)
-    industry_report = _industry_report(profile, evidence)
+    industry_report = _industry_report(profile, list(evidence))
     latest_updates = [
         value
         for value in (

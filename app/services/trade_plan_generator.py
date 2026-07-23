@@ -4,6 +4,7 @@ import hashlib
 import json
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_FLOOR
+from types import SimpleNamespace
 
 import pandas as pd
 from sqlalchemy import select
@@ -28,6 +29,14 @@ from app.services.workflow import ensure_default_rule_version
 
 
 GENERATOR_PARAMETERS = {
+    "default_account_equity": 300000,
+    "default_risk_pct": 0.5,
+    "max_single_position_pct": 30,
+    "max_total_position_pct": 80,
+    "max_industry_position_pct": 40,
+    "position_tranches": 3,
+    "market_high_risk_total_cap_pct": 30,
+    "market_neutral_total_cap_pct": 60,
     "platform_min_days": 20,
     "breakout_pct": 1.0,
     "breakout_volume_multiple": 1.5,
@@ -38,7 +47,7 @@ GENERATOR_PARAMETERS = {
     "minimum_reward_risk": 2.0,
     "maximum_stop_distance_pct": 8.0,
     "freshness_days": 5,
-    "trial_position_ratio": 0.3,
+    "trial_position_ratio": 0.3333,
     "pullback_confirmed_ratio": 0.7,
 }
 
@@ -61,16 +70,16 @@ GENERATOR_RULES = {
 
 def ensure_generator_rule_version(db: Session) -> RuleVersion:
     current = ensure_default_rule_version(db)
-    if "platform_min_days" in current.parameters:
+    if all(key in current.parameters for key in GENERATOR_PARAMETERS):
         return current
     current.active = False
     parameters = {**current.parameters, **GENERATOR_PARAMETERS}
     version = RuleVersion(
         rule_set_id=current.rule_set_id,
-        version="1.1.0",
+        version="1.2.0" if "platform_min_days" in current.parameters else "1.1.0",
         parameters=parameters,
         rules={**current.rules, **GENERATOR_RULES},
-        change_note="新增可配置的平台突破—回踩确认生成器参数；旧计划保持原规则版本。",
+        change_note="集中一键计划的账户、风险、分批仓位和市场降风险参数；旧计划保持原规则版本。",
         effective_from=date.today(),
         active=True,
     )
@@ -255,7 +264,7 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
     rule = ensure_generator_rule_version(db)
     parameters = {**GENERATOR_PARAMETERS, **rule.parameters}
     profile = db.scalar(select(CompanyProfile).where(CompanyProfile.symbol == request.symbol))
-    holding = db.scalar(
+    stored_holding = db.scalar(
         select(Holding).where(
             Holding.account_id == request.account_id, Holding.symbol == request.symbol
         )
@@ -266,6 +275,25 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
         .order_by(MarketDailyBar.trade_date.desc(), MarketDailyBar.fetched_at.desc())
     )
     quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == request.symbol))
+    holding = stored_holding
+    if request.position_mode == "空仓":
+        holding = None
+    elif request.position_mode == "持仓" and request.holding_quantity and request.holding_cost_price:
+        reference_price = (
+            quote.price
+            if quote
+            else latest_bar.close
+            if latest_bar
+            else request.holding_cost_price
+        )
+        holding = SimpleNamespace(
+            quantity=request.holding_quantity,
+            cost_price=request.holding_cost_price,
+            current_price=reference_price,
+            stop_loss_price=stored_holding.stop_loss_price if stored_holding else None,
+            target_price=stored_holding.target_price if stored_holding else None,
+            sector=stored_holding.sector if stored_holding else (profile.industry if profile else None),
+        )
     missing = []
     try:
         frame = load_qfq_frame(db, request.symbol)
@@ -295,9 +323,9 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             "market",
             "市场环境",
             market_status,
-            f"用户选择：{request.market_state}；尚无自动宽基市场模型。",
-            "用户判断",
-            now.isoformat(),
+            request.market_evidence or f"兼容旧入口的用户选择：{request.market_state}。",
+            request.market_source or "用户判断（旧入口）",
+            request.market_data_time or now.isoformat(),
             ["可靠宽基指数状态"] if request.market_state == "无法判断" else [],
         )
     )
@@ -315,9 +343,11 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             "sector",
             "行业/板块强弱",
             sector_status,
-            f"行业：{profile.industry if profile else '数据不足'}；用户选择板块状态：{request.sector_state}。",
-            "巨潮公司概况 + 用户判断",
-            profile.fetched_at.isoformat() if profile else now.isoformat(),
+            request.sector_evidence
+            or f"行业：{profile.industry if profile else '数据不足'}；兼容旧入口的用户选择：{request.sector_state}。",
+            request.sector_source or "公司概况 + 用户判断（旧入口）",
+            request.sector_data_time
+            or (profile.fetched_at.isoformat() if profile else now.isoformat()),
             ["行业指数相对强弱"] if request.sector_state == "无法判断" else [],
         )
     )
@@ -429,6 +459,7 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
     entry_reference = None
     reward_risk = None
     first_target = None
+    second_target = None
     if pattern and pattern["valid_platform"]:
         atr_buffer = pattern["atr14"] * float(parameters["atr_buffer_multiple"])
         recent_low = float(frame["Low"].tail(10).min())
@@ -444,6 +475,7 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             )
             raw_first_target = max(platform_target, minimum_r_target)
             first_target = round(raw_first_target, 4)
+            second_target = round(entry_reference + 3 * (entry_reference - stop), 4)
             reward_risk = (raw_first_target - entry_reference) / (entry_reference - stop)
     stop_status = (
         "无法判断"
@@ -485,6 +517,10 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
         )
     )
     holdings = db.scalars(select(Holding).where(Holding.account_id == account.id)).all()
+    if request.position_mode == "空仓":
+        holdings = [item for item in holdings if item.symbol != request.symbol]
+    elif request.position_mode == "持仓" and holding is not None:
+        holdings = [item for item in holdings if item.symbol != request.symbol] + [holding]
     total_value = sum(Decimal(item.quantity) * item.current_price for item in holdings)
     industry = profile.industry if profile else None
     industry_value = sum(
@@ -646,8 +682,8 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             "stale": profile is None,
         },
         {
-            "source_id": "user_market_sector",
-            "name": "用户判断",
+            "source_id": "market_sector_context",
+            "name": "自动市场/行业规则" if request.market_evidence else "用户判断（旧入口）",
             "data_date": date.today().isoformat(),
             "fetched_at": now.isoformat(),
             "stale": False,
@@ -760,6 +796,9 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
         "exit_plan": {
             "first_reduction": f"到达平台高度目标 {first_target} 或达到 {parameters['minimum_reward_risk']}R 后评估减仓。"
             if first_target
+            else "数据不足，无法判断",
+            "second_reduction": f"价格达到 {second_target}（约3R）后，结合周线压力与量价状态再次分批减仓。"
+            if second_target
             else "数据不足，无法判断",
             "trailing_stop": "按最近有效回踩低点、5/20日均线、趋势线或ATR移动止盈；不得向下放宽硬止损。",
             "final_exit": [
@@ -877,8 +916,23 @@ def save_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
                 checked_at=datetime.now(),
             )
         )
+    from app.services.plan_execution import initialize_plan_execution
+
+    initialize_plan_execution(
+        db,
+        plan,
+        request.position_mode or ("持仓" if preview["existing_position"]["exists"] else "空仓"),
+    )
     db.commit()
-    return {"id": plan.id, "plan_version": version, "status": plan.status, "preview": preview}
+    return {
+        "id": plan.id,
+        "account_id": plan.account_id,
+        "symbol": plan.symbol,
+        "plan_version": version,
+        "status": plan.status,
+        "execution_status": plan.execution_status,
+        "preview": preview,
+    }
 
 
 def plan_history(db: Session, account_id: int, symbol: str) -> list[dict]:
@@ -892,6 +946,9 @@ def plan_history(db: Session, account_id: int, symbol: str) -> list[dict]:
             "id": item.id,
             "plan_version": item.plan_version,
             "status": item.status,
+            "execution_status": item.execution_status,
+            "buy_zone": [float(item.buy_zone_low), float(item.buy_zone_high)],
+            "stop": float(item.initial_stop),
             "rule_version": db.get(RuleVersion, item.rule_version_id).version,
             "data_date": item.data_date.isoformat(),
             "created_at": item.created_at.isoformat(),

@@ -1,5 +1,19 @@
 # 股票纪律助手
 
+## 从股票代码开始：一键交易计划
+
+首页现在提供普通用户的核心入口。只需输入 6 位A股代码并选择“空仓”或“已经持有”；系统会自动选择最近账户，没有账户时按默认 30 万元建立研究账户。持仓模式只需额外填写数量和成本。
+
+点击“开始分析并生成计划”后，后端依次执行：前复权行情检查与自动同步、沪深300市场风险、行业板块相对强度、个股多周期与平台结构、账户风险和仓位、AI证据解释、统一计划输出。AI失败或未配置不会改变或阻断规则计划。
+
+结果只使用“禁止买入、等待观察、允许试仓、允许持有、允许条件式加仓、建议减仓、计划失效需要退出”七类结论。用户确认后才保存正式计划版本；分析预览、步骤、数据来源、规则快照与AI审计会保留。
+
+主要接口：
+
+- `POST /api/v1/trade-plan-generator/analyze`：一键分析，不自动保存正式计划；
+- `POST /api/v1/trade-plan-generator/analyze/{run_id}/confirm`：用户确认并冻结计划；
+- `GET /api/v1/trade-plan-generator/analyze/{run_id}`：读取分析步骤与审计快照。
+
 一个仅用于个人研究、交易记录与纪律提醒的 A 股辅助系统。它不预测股价、不提供“必买/必涨”结论，不连接券商，也不会自动下单。
 
 首次使用请先阅读：[启动与环境说明](./启动与环境说明.md)。该文档列出了当前电脑已经具备和仍然缺少的运行环境。
@@ -158,7 +172,7 @@ POST /api/v1/holdings
 
 ## 交易计划生成器与持仓纪律
 
-打开 `/trade-plans`，先在“市场与主线数据”同步真实前复权日线，然后选择账户、市场状态和板块状态。当前宽基市场模型与行业指数强弱尚未接入，因此这两项由用户选择且明确标记为“用户判断”。系统按以下公式计算风险数量，并与可用现金、单股仓位、总仓位和行业集中度取最小值后向下取 100 股整手：
+打开 `/trade-plans` 后只需输入股票代码、选择空仓或持仓；系统自动检查并刷新前复权日线、公司概况、最近12季度财务、估值、公告和风险事件，再计算沪深300环境、行业相对强度、技术结构和账户风险。外部源失败时保留最近成功缓存并标记；没有缓存时列入 `missing_data`。
 
 `可买数量 ≈（账户权益 × 单笔风险比例）÷（计划买入价 − 初始止损价）`
 
@@ -175,8 +189,18 @@ POST /api/v1/holdings
 - `POST /api/v1/trade-plan-generator/holding-check`
 - `GET /api/v1/trade-plan-generator/rules`
 - `POST /api/v1/trade-plan-generator/ai`
+- `POST /api/v1/trade-plan-generator/analyze`
+- `POST /api/v1/trade-plan-generator/analyze/{run_id}/confirm`
+- `GET /api/v1/trade-plans/{plan_id}/execution`
+- `POST /api/v1/trade-plans/{plan_id}/execution/fills`
+- `POST /api/v1/trade-plans/{plan_id}/execution/evaluate`
+- `GET /api/v1/data-sources/status`
 
-`/dashboard` 汇总持仓风险、接近计划区的候选股、纪律事件、过期/失败数据和当日优先事项。P0 尚未接入可靠宽基市场状态模型，因此市场方向会显示“无法判断”，不会拿个股行情代替市场结论。
+AI响应采用 `schema_version=2.0` 的严格结构，后端冻结 `computed_results`、`raw_facts`、`rule_conclusions`、`data_freshness` 和 `provider_status`；模型只能填写证据归纳、推断、支持/反方证据、冲突和风险。模型修改规则字段、引用不存在或其他股票的 `source_id`、生成证据中不存在的数字时，分析会被拒绝并自动重试一次。AI失败不影响规则计划。
+
+正式计划确认后可手工录入成交。系统记录 `waiting_entry`、`entry_triggered`、`partially_executed`、`holding`、`add_triggered`、`reduce_triggered`、`stop_triggered`、`take_profit_triggered`、`invalidated`、`closed` 等状态，并检查超仓、亏损补仓、未满足条件买入和未执行止损。系统不连接券商、不自动下单。
+
+数据访问统一经过Provider注册和路由层。当前免费源为AKShare；Tushare、标准专业行情HTTP API、标准新闻HTTP API和X线索Provider均支持启用/禁用、能力与凭据检测，未配置时安全跳过。业务规则不直接调用具体供应商。
 
 ## 数据库迁移与备份
 

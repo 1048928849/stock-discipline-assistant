@@ -2,10 +2,24 @@ import time
 from datetime import date, datetime
 from decimal import Decimal
 
-from app.providers.market import DailyBar, MarketDataProvider, ProviderUnavailableError, Quote
+from app.providers.base import (
+    AnnouncementProvider,
+    FundamentalDataProvider,
+    IndustryConceptProvider,
+    MarketDataProvider,
+    NewsProvider,
+    ProviderMetadata,
+)
+from app.providers.market import DailyBar, ProviderUnavailableError, Quote
 
 
-class AKShareProvider(MarketDataProvider):
+class AKShareProvider(
+    MarketDataProvider,
+    FundamentalDataProvider,
+    AnnouncementProvider,
+    IndustryConceptProvider,
+    NewsProvider,
+):
     """AKShare 适配器，按东方财富→腾讯→新浪顺序自动故障切换。"""
 
     source = "akshare"
@@ -13,6 +27,45 @@ class AKShareProvider(MarketDataProvider):
     def __init__(self, retries: int = 2, timeout: float = 20):
         self.retries = max(1, retries)
         self.timeout = timeout
+        self.metadata = ProviderMetadata(
+            provider_id="akshare",
+            supported_capabilities=(
+                "market.quote",
+                "market.daily",
+                "market.index_daily",
+                "market.sector_daily",
+                "market.symbols",
+                "market.indices",
+                "market.sectors",
+                "fundamental.profile",
+                "fundamental.statements",
+                "fundamental.valuation",
+                "announcement.catalog",
+                "announcement.daily",
+                "industry.membership",
+                "news.company",
+            ),
+            enabled=True,
+            priority=50,
+            health_status="unknown",
+            realtime_supported=True,
+            timeout=timeout,
+            retry=self.retries,
+            rate_limit="公开接口限制，应用内有限重试",
+        )
+
+    def health_check(self, probe: bool = False) -> dict:
+        try:
+            ak = self._ak()
+            if not probe:
+                return {
+                    "status": "available",
+                    "message": f"AKShare {getattr(ak, '__version__', 'unknown')} 已安装",
+                }
+            frame = ak.stock_info_a_code_name()
+            return {"status": "healthy", "message": f"健康检查成功，返回{len(frame)}行"}
+        except Exception as exc:
+            return {"status": "unhealthy", "message": f"{type(exc).__name__}: {str(exc)[:160]}"}
 
     @staticmethod
     def _ak():
@@ -209,6 +262,78 @@ class AKShareProvider(MarketDataProvider):
         raise ProviderUnavailableError("前复权历史行情全部数据源失败：" + "；".join(errors))
 
     @staticmethod
+    def _benchmark_rows(frame, source: str) -> dict:
+        aliases = {
+            "date": ("日期", "date"),
+            "close": ("收盘", "close"),
+            "volume": ("成交量", "volume"),
+        }
+        selected = {}
+        for target, names in aliases.items():
+            selected[target] = next((name for name in names if name in frame.columns), None)
+        if not selected["date"] or not selected["close"]:
+            raise ProviderUnavailableError(f"{source} 返回结构变化，缺少日期或收盘字段")
+        rows = []
+        for _, row in frame.iterrows():
+            rows.append(
+                {
+                    "date": date.fromisoformat(str(row[selected["date"]])[:10]),
+                    "close": float(row[selected["close"]]),
+                    "volume": float(row[selected["volume"]]) if selected["volume"] else None,
+                }
+            )
+        if len(rows) < 20:
+            raise ProviderUnavailableError(f"{source} 历史数据不足20个交易日")
+        rows.sort(key=lambda item: str(item["date"]))
+        return {"rows": rows, "source": source, "fetched_at": datetime.now()}
+
+    def get_index_history(self, symbol: str, start: date, end: date) -> dict:
+        errors = []
+        providers = (
+            (
+                "东方财富指数",
+                lambda: self._ak().stock_zh_index_daily_em(
+                    symbol=symbol,
+                    start_date=start.strftime("%Y%m%d"),
+                    end_date=end.strftime("%Y%m%d"),
+                ),
+                f"AKShare/东方财富指数 {symbol}",
+            ),
+            (
+                "东方财富指数备用",
+                lambda: self._ak().index_zh_a_hist(
+                    symbol=symbol[-6:],
+                    period="daily",
+                    start_date=start.strftime("%Y%m%d"),
+                    end_date=end.strftime("%Y%m%d"),
+                ),
+                f"AKShare/index_zh_a_hist {symbol[-6:]}",
+            ),
+        )
+        for name, callback, source in providers:
+            try:
+                return self._benchmark_rows(self._retry(name, callback), source)
+            except Exception as exc:
+                errors.append(str(exc))
+        raise ProviderUnavailableError("宽基指数数据暂不可用：" + "；".join(errors))
+
+    def get_sector_history(self, industry: str, start: date, end: date) -> dict:
+        try:
+            frame = self._retry(
+                "东方财富行业板块",
+                lambda: self._ak().stock_board_industry_hist_em(
+                    symbol=industry,
+                    start_date=start.strftime("%Y%m%d"),
+                    end_date=end.strftime("%Y%m%d"),
+                    period="日k",
+                    adjust="qfq",
+                ),
+            )
+            return self._benchmark_rows(frame, f"AKShare/东方财富行业板块 {industry}")
+        except Exception as exc:
+            raise ProviderUnavailableError(f"行业指数数据暂不可用：{exc}") from exc
+
+    @staticmethod
     def _records(frame, limit: int = 500) -> list[dict]:
         import pandas as pd
 
@@ -243,6 +368,29 @@ class AKShareProvider(MarketDataProvider):
             return self._records(self._ak().stock_board_industry_name_em())
         except Exception as exc:
             raise ProviderUnavailableError(f"行业板块暂不可用：{type(exc).__name__}") from exc
+
+    def company_industry_concepts(self, symbol: str) -> dict:
+        profile = self.company_profile(symbol)
+        industry = profile.get("细分行业") or profile.get("所属行业")
+        return {
+            "industries": [{"name": industry, "level": "provider"}] if industry else [],
+            "concepts": [],
+            "source": "AKShare/巨潮公司概况",
+        }
+
+    def company_news(self, symbol: str, start: datetime, end: datetime) -> list[dict]:
+        try:
+            frame = self._ak().stock_news_em(symbol=symbol)
+            rows = self._records(frame, 100)
+            return [
+                row
+                for row in rows
+                if start.date().isoformat()
+                <= str(row.get("发布时间") or row.get("日期") or end.date())[:10]
+                <= end.date().isoformat()
+            ]
+        except Exception as exc:
+            raise ProviderUnavailableError(f"公开新闻暂不可用：{type(exc).__name__}") from exc
 
     def announcements(self, symbol: str, day: date) -> list[dict]:
         try:
