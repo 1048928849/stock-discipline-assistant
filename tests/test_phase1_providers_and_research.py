@@ -1,4 +1,7 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+
+import pandas as pd
 
 from app.config import Settings
 from app.models import (
@@ -10,10 +13,12 @@ from app.providers.external_http_provider import (
     ConfiguredNewsApiProvider,
     ProfessionalMarketApiProvider,
 )
+from app.providers.akshare_provider import AKShareProvider
 from app.providers.registry import ProviderRegistry
 from app.providers.tushare_provider import TushareProvider
 from app.services.company_research import refresh_company_research_if_needed
 from app.services.data_sources import UnifiedDataService
+from app.providers.market import Quote
 
 
 def _statements():
@@ -185,3 +190,66 @@ def test_no_provider_and_no_cache_is_explicit_missing_data(session):
         "valuation",
     }
     assert result["status"] == "partial"
+
+
+class RetryQuoteProvider:
+    provider_id = "retry_test"
+
+    def __init__(self):
+        self.calls = 0
+        self.metadata = ProviderMetadata(
+            provider_id=self.provider_id,
+            supported_capabilities=("market.quote",),
+            priority=1,
+            retry=2,
+        )
+
+    @property
+    def configured(self):
+        return True
+
+    def health_check(self, probe=False):
+        return {"status": "healthy"}
+
+    def credential_status(self):
+        return {"configured": True, "required_credentials": []}
+
+    def get_quote(self, symbol):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("temporary")
+        now = datetime.now()
+        return Quote(
+            symbol=symbol,
+            name="测试",
+            price=Decimal("10"),
+            source="retry_test",
+            source_api="test",
+            fetched_at=now,
+        )
+
+
+def test_unified_service_applies_provider_retry_metadata(session):
+    provider = RetryQuoteProvider()
+    result = _service(session, provider).get_quote("300502")
+    assert result.provider_id == "retry_test"
+    assert provider.calls == 2
+    logs = session.query(DataProviderCallLog).all()
+    assert [item.status for item in logs] == ["failed", "success"]
+
+
+def test_akshare_quote_does_not_claim_today_when_trade_calendar_is_unverified(
+    monkeypatch,
+):
+    provider = AKShareProvider()
+    monkeypatch.setattr(provider, "_is_trade_date", lambda day: False)
+    quote = provider._quote_from_frame(
+        pd.DataFrame(
+            [{"代码": "300502", "名称": "测试公司", "最新价": 10.5, "昨收": 10}]
+        ),
+        "300502",
+        "akshare_test",
+        "test_api",
+    )
+    assert quote.trading_date is None
+    assert quote.market_status == "closed"

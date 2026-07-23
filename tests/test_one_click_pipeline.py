@@ -2,6 +2,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from app.models import CompanyProfile, MarketDailyBar, MarketQuote
+from app.providers.market import Quote, shanghai_now
 
 
 def create_account(client, assets="100000", cash="80000"):
@@ -27,7 +28,8 @@ def seed_pattern(session, symbol="300502"):
         rows.append((close, close + 0.12, close - 0.12, 100.0))
     rows.extend([(10.55, 10.65, 10.15, 220.0), (10.32, 10.48, 10.12, 55.0)])
     rows.append((10.82, 10.9, 10.3, 180.0))
-    start = date.today() - timedelta(days=len(rows) - 1)
+    # 收盘确认发生在上一交易日，本交易日盘中报价才允许执行。
+    start = date.today() - timedelta(days=len(rows))
     for index, (close, high, low, volume) in enumerate(rows):
         session.add(
             MarketDailyBar(
@@ -46,10 +48,17 @@ def seed_pattern(session, symbol="300502"):
         MarketQuote(
             symbol=symbol,
             name="测试公司",
-            price=Decimal("10.82"),
+            price=Decimal("10.75"),
             source="akshare_sina",
             source_api="stock_zh_a_spot",
             fetched_at=now,
+            previous_close=Decimal("10.2"),
+            trading_date=shanghai_now().date(),
+            quote_time=now,
+            market_status="trading",
+            price_type="intraday_snapshot",
+            provider_id="akshare",
+            data_as_of=now,
         )
     )
     session.commit()
@@ -84,6 +93,25 @@ def seed_profile(session):
 
 
 def patch_benchmarks(monkeypatch, market="up", sector="up"):
+    now = datetime.now()
+    monkeypatch.setattr(
+        "app.providers.akshare_provider.AKShareProvider.get_quote",
+        lambda self, symbol: Quote(
+            symbol=symbol,
+            name="测试公司",
+            price=Decimal("10.75"),
+            source="akshare_test",
+            source_api="test_quote",
+            fetched_at=now,
+            previous_close=Decimal("10.2"),
+            trading_date=shanghai_now().date(),
+            quote_time=now,
+            market_status="trading",
+            price_type="intraday_snapshot",
+            provider_id="akshare",
+            data_as_of=now,
+        ),
+    )
     monkeypatch.setattr(
         "app.providers.akshare_provider.AKShareProvider.get_index_history",
         lambda self, symbol, start, end: benchmark_rows(market),
@@ -143,6 +171,41 @@ def test_one_click_empty_position_generates_and_confirms_plan(client, session, m
     assert saved.status_code == 201, saved.text
     assert saved.json()["user_confirmed"] is True
     assert saved.json()["plan_version"] == 1
+    assert saved.json()["plan_kind"] == "executable"
+    assert saved.json()["can_execute"] is True
+
+
+def test_fresh_daily_cache_still_refreshes_current_quote(client, session, monkeypatch):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    calls = {"quote": 0}
+    patch_benchmarks(monkeypatch)
+    original = __import__(
+        "app.providers.akshare_provider", fromlist=["AKShareProvider"]
+    ).AKShareProvider.get_quote
+
+    def counted(self, symbol):
+        calls["quote"] += 1
+        return original(self, symbol)
+
+    monkeypatch.setattr(
+        "app.providers.akshare_provider.AKShareProvider.get_quote", counted
+    )
+    response = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert calls["quote"] == 1
+    quote = response.json()["plan"]["quote"]
+    assert quote["is_current_trading_day"] is True
+    assert quote["price_type"] == "intraday_snapshot"
 
 
 def test_one_click_holding_mode_uses_inline_position(client, session, monkeypatch):

@@ -6,8 +6,13 @@ import pytest
 from app.config import Settings
 from app.models import CompanyProfile, MarketDailyBar, MarketQuote
 from app.providers.llm_provider import OpenAICompatibleProvider
+from app.providers.market import shanghai_now
 from app.services.trade_plan_ai import validate_ai_output
-from app.services.trade_plan_generator import _floor_lot, ensure_generator_rule_version
+from app.services.trade_plan_generator import (
+    _floor_lot,
+    _platform_pattern,
+    ensure_generator_rule_version,
+)
 
 
 def create_account(client, assets="100000", cash="80000"):
@@ -44,8 +49,8 @@ def seed_pattern(session, symbol="300502", state="ready", price=None):
             rows.append((10.4, 10.5, 10.2, 70.0))
     else:
         rows.extend([(10.02, 10.15, 9.9, 100.0)] * 3)
-    # 让最后一根始终落在今天，满足新鲜度检查。
-    start = date.today() - timedelta(days=len(rows) - 1)
+    # 收盘确认发生在上一交易日，本交易日盘中报价才允许执行。
+    start = date.today() - timedelta(days=len(rows))
     for index, (close, high, low, volume) in enumerate(rows):
         session.add(
             MarketDailyBar(
@@ -69,6 +74,13 @@ def seed_pattern(session, symbol="300502", state="ready", price=None):
             source="akshare_sina",
             source_api="stock_zh_a_spot",
             fetched_at=now,
+            previous_close=Decimal("10.2"),
+            trading_date=shanghai_now().date(),
+            quote_time=now,
+            market_status="trading",
+            price_type="intraday_snapshot",
+            provider_id="akshare",
+            data_as_of=now,
         )
     )
     session.commit()
@@ -104,7 +116,55 @@ def test_plan_pattern_states(client, session, pattern_state, expected):
         for item in result.json()["gates"]
         if item["status"] != "通过"
     ]
-    assert len(result.json()["gates"]) == 12
+    assert len(result.json()["gates"]) == 13
+
+
+def test_execution_requires_current_quote_and_ordered_entry_zone(client, session):
+    account = create_account(client)
+    seed_pattern(session)
+    preview = client.post(
+        "/api/v1/trade-plan-generator/preview", json=payload(account["id"])
+    ).json()
+    buy = preview["buy_plan"]
+    assert buy["buy_zone"][0] == buy["turn_trigger_price"]
+    assert buy["buy_zone"][0] <= buy["buy_zone"][1] <= buy["maximum_chase_price"]
+    assert preview["can_save_as_watch_plan"] is True
+
+    quote = session.query(MarketQuote).filter_by(symbol="300502").one()
+    quote.trading_date = shanghai_now().date() - timedelta(days=1)
+    session.commit()
+    stale = client.post(
+        "/api/v1/trade-plan-generator/preview", json=payload(account["id"])
+    ).json()
+    assert stale["can_execute"] is False
+    assert stale["plan_kind"] == "watch"
+    assert "没有本交易日最新有效报价" in stale["execution_blocked_reasons"]
+    assert next(item for item in stale["gates"] if item["code"] == "quote")["status"] == "无法判断"
+
+
+def test_invalid_stop_boundary_is_blocked_without_runtime_error(
+    client, session, monkeypatch
+):
+    account = create_account(client)
+    seed_pattern(session)
+
+    def invalid_stop_pattern(frame, parameters):
+        result = _platform_pattern(frame, parameters)
+        result["platform_lower"] = result["turn_trigger_price"] + 1
+        return result
+
+    monkeypatch.setattr(
+        "app.services.trade_plan_generator._platform_pattern", invalid_stop_pattern
+    )
+    response = client.post(
+        "/api/v1/trade-plan-generator/preview", json=payload(account["id"])
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["can_execute"] is False
+    assert next(item for item in result["gates"] if item["code"] == "stop")[
+        "status"
+    ] == "无法判断"
 
 
 def test_market_down_and_missing_data_are_explicit(client, session):
