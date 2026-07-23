@@ -73,13 +73,26 @@ class ProfessionalMarketApiProvider(MarketDataProvider):
 
     def get_quote(self, symbol: str) -> Quote:
         row = self._get("/market/quote", {"symbol": symbol})
+        fetched_at = datetime.fromisoformat(row.get("fetched_at") or datetime.now().isoformat())
+        quote_time = datetime.fromisoformat(row.get("quote_time") or fetched_at.isoformat())
         return Quote(
             symbol=symbol,
             name=str(row.get("name") or symbol),
             price=Decimal(str(row["price"])),
             source="professional_market_api",
             source_api="/market/quote",
-            fetched_at=datetime.fromisoformat(row.get("fetched_at") or datetime.now().isoformat()),
+            fetched_at=fetched_at,
+            previous_close=Decimal(str(row["previous_close"]))
+            if row.get("previous_close") is not None
+            else None,
+            trading_date=date.fromisoformat(str(row["trading_date"])[:10])
+            if row.get("trading_date")
+            else None,
+            quote_time=quote_time,
+            market_status=str(row.get("market_status") or "unknown"),
+            price_type=str(row.get("price_type") or "intraday_snapshot"),
+            provider_id="professional_market_api",
+            data_as_of=datetime.fromisoformat(row.get("data_as_of") or quote_time.isoformat()),
         )
 
     def get_history(self, symbol: str, start: date, end: date) -> list[DailyBar]:
@@ -94,6 +107,9 @@ class ProfessionalMarketApiProvider(MarketDataProvider):
             },
         )
         rows = body.get("rows", body)
+        adjustment = body.get("adjustment", "qfq") if isinstance(body, dict) else "qfq"
+        if adjustment != "qfq":
+            raise ProviderUnavailableError("专业行情历史数据不是前复权(qfq)，已拒绝进入规则引擎")
         return [
             DailyBar(
                 symbol=symbol,
@@ -106,6 +122,15 @@ class ProfessionalMarketApiProvider(MarketDataProvider):
                 source="professional_market_api_qfq",
                 fetched_at=datetime.fromisoformat(
                     row.get("fetched_at") or datetime.now().isoformat()
+                ),
+                frequency="daily",
+                adjustment="qfq",
+                price_type="official_close",
+                provider_id="professional_market_api",
+                data_as_of=datetime.fromisoformat(
+                    row.get("data_as_of")
+                    or row.get("fetched_at")
+                    or datetime.now().isoformat()
                 ),
             )
             for row in rows

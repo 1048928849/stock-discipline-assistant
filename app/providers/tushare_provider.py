@@ -89,13 +89,24 @@ class TushareProvider(
         if not rows:
             raise ProviderUnavailableError("Tushare免费日线没有当日行情；该Provider不冒充实时行情")
         row = rows[0]
+        trade_date = datetime.strptime(str(row["trade_date"]), "%Y%m%d").date()
+        fetched_at = datetime.now()
         return Quote(
             symbol=symbol,
             name=symbol,
             price=Decimal(str(row["close"])),
             source="tushare_daily_close",
             source_api="daily",
-            fetched_at=datetime.now(),
+            fetched_at=fetched_at,
+            previous_close=Decimal(str(row["pre_close"]))
+            if row.get("pre_close") is not None
+            else None,
+            trading_date=trade_date,
+            quote_time=fetched_at,
+            market_status="closed",
+            price_type="official_close",
+            provider_id="tushare",
+            data_as_of=fetched_at,
         )
 
     def get_history(self, symbol: str, start: date, end: date) -> list[DailyBar]:
@@ -104,20 +115,45 @@ class TushareProvider(
             start_date=start.strftime("%Y%m%d"),
             end_date=end.strftime("%Y%m%d"),
         )
+        raw_rows = list(reversed(self._records(frame)))
+        factor_frame = self._pro().adj_factor(
+            ts_code=self._code(symbol),
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+        )
+        factors = {
+            str(item["trade_date"]): Decimal(str(item["adj_factor"]))
+            for item in self._records(factor_frame)
+            if item.get("adj_factor") is not None
+        }
+        if not raw_rows or not factors:
+            raise ProviderUnavailableError("Tushare前复权需要daily与adj_factor完整返回")
+        latest_factor = factors.get(str(raw_rows[-1]["trade_date"]))
+        if latest_factor is None or latest_factor <= 0:
+            raise ProviderUnavailableError("Tushare缺少最新交易日复权因子")
         rows = []
         fetched_at = datetime.now()
-        for row in reversed(self._records(frame)):
+        for row in raw_rows:
+            factor = factors.get(str(row["trade_date"]))
+            if factor is None:
+                continue
+            ratio = factor / latest_factor
             rows.append(
                 DailyBar(
                     symbol=symbol,
                     trade_date=datetime.strptime(str(row["trade_date"]), "%Y%m%d").date(),
-                    open=Decimal(str(row["open"])),
-                    high=Decimal(str(row["high"])),
-                    low=Decimal(str(row["low"])),
-                    close=Decimal(str(row["close"])),
+                    open=Decimal(str(row["open"])) * ratio,
+                    high=Decimal(str(row["high"])) * ratio,
+                    low=Decimal(str(row["low"])) * ratio,
+                    close=Decimal(str(row["close"])) * ratio,
                     volume=Decimal(str(row["vol"])) * 100,
-                    source="tushare_daily_unadjusted",
+                    source="tushare_daily_qfq",
                     fetched_at=fetched_at,
+                    frequency="daily",
+                    adjustment="qfq",
+                    price_type="official_close",
+                    provider_id="tushare",
+                    data_as_of=fetched_at,
                 )
             )
         if not rows:

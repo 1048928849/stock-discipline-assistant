@@ -10,7 +10,13 @@ from app.providers.base import (
     NewsProvider,
     ProviderMetadata,
 )
-from app.providers.market import DailyBar, ProviderUnavailableError, Quote
+from app.providers.market import (
+    DailyBar,
+    ProviderUnavailableError,
+    Quote,
+    infer_a_share_market_status,
+    shanghai_now,
+)
 
 
 class AKShareProvider(
@@ -27,6 +33,7 @@ class AKShareProvider(
     def __init__(self, retries: int = 2, timeout: float = 20):
         self.retries = max(1, retries)
         self.timeout = timeout
+        self._trade_calendar_cache: tuple[date, bool] | None = None
         self.metadata = ProviderMetadata(
             provider_id="akshare",
             supported_capabilities=(
@@ -96,8 +103,27 @@ class AKShareProvider(
                     time.sleep(0.3 * attempt)
         raise RuntimeError("；".join(errors))
 
-    @staticmethod
-    def _quote_from_frame(frame, symbol: str, source: str, api_name: str) -> Quote:
+    def _is_trade_date(self, day: date) -> bool:
+        if self._trade_calendar_cache and self._trade_calendar_cache[0] == day:
+            return self._trade_calendar_cache[1]
+        try:
+            frame = self._retry("新浪交易日历", lambda: self._ak().tool_trade_date_hist_sina())
+            column = next(
+                (name for name in ("trade_date", "交易日", "日期") if name in frame.columns),
+                None,
+            )
+            if column is None:
+                raise ProviderUnavailableError("交易日历缺少日期字段")
+            result = day.isoformat() in {
+                str(value)[:10] for value in frame[column].tolist()
+            }
+        except Exception:
+            # 无法验证交易日时宁可不标记为今日行情，也不把昨收冒充当前价。
+            result = False
+        self._trade_calendar_cache = (day, result)
+        return result
+
+    def _quote_from_frame(self, frame, symbol: str, source: str, api_name: str) -> Quote:
         required = {"代码", "名称", "最新价"}
         if not required.issubset(frame.columns):
             raise ProviderUnavailableError(
@@ -108,13 +134,28 @@ class AKShareProvider(
         if rows.empty:
             raise ProviderUnavailableError(f"{api_name} 未找到股票代码 {symbol}")
         row = rows.iloc[0]
+        now = shanghai_now().replace(tzinfo=None)
+        market_status = infer_a_share_market_status()
+        is_trade_date = self._is_trade_date(now.date())
+        if not is_trade_date:
+            market_status = "closed"
+        previous_close = row.get("昨收")
         return Quote(
             symbol=symbol,
             name=str(row["名称"]),
             price=Decimal(str(row["最新价"])),
             source=source,
             source_api=api_name,
-            fetched_at=datetime.now(),
+            fetched_at=now,
+            previous_close=Decimal(str(previous_close))
+            if previous_close not in (None, "", "-")
+            else None,
+            trading_date=now.date() if is_trade_date and market_status != "pre_open" else None,
+            quote_time=now,
+            market_status=market_status,
+            price_type="intraday_snapshot",
+            provider_id="akshare",
+            data_as_of=now,
         )
 
     def get_quote(self, symbol: str) -> Quote:
@@ -174,6 +215,11 @@ class AKShareProvider(
                     volume=Decimal(str(row[columns["volume"]])) * volume_multiplier,
                     source=source,
                     fetched_at=fetched_at,
+                    frequency="daily",
+                    adjustment="qfq",
+                    price_type="official_close",
+                    provider_id="akshare",
+                    data_as_of=fetched_at,
                 )
             )
         if not rows:
