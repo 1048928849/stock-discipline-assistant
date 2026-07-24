@@ -21,6 +21,7 @@ from app.models import (
     XPost,
 )
 from app.config import get_settings
+from app.data_hub.router import DataHubRouter
 from app.services.data_sources import ProviderResult, UnifiedDataService
 
 
@@ -254,11 +255,11 @@ def _implied_scenarios(current_pe: float | None, pe_history: list[float]):
 
 
 def _provider_value(value):
-    return value.value if isinstance(value, ProviderResult) else value
+    return value.require_value() if isinstance(value, ProviderResult) else value
 
 
 def _provider_source(provider, capability: str, default: str) -> str:
-    if isinstance(provider, UnifiedDataService):
+    if isinstance(provider, DataHubRouter):
         call = provider.calls.get(capability)
         if call:
             return call.provider_id
@@ -716,7 +717,7 @@ def sync_company_research(
             result["status"] = "cache_fallback"
             result["cache_used"] = True
             row_count = cached_counts[section]
-            if isinstance(provider, UnifiedDataService):
+            if isinstance(provider, DataHubRouter):
                 provider.record_cache_fallback(
                     capability_by_section[section],
                     section,
@@ -726,7 +727,7 @@ def sync_company_research(
                 )
         call = (
             provider.calls.get(capability_by_section[section])
-            if isinstance(provider, UnifiedDataService)
+            if isinstance(provider, DataHubRouter)
             else None
         )
         values = {

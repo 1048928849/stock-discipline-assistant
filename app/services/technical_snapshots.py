@@ -101,7 +101,7 @@ def snapshot_holding(db: Session, holding: Holding) -> TechnicalSnapshot:
 def refresh_qfq_history(db: Session, symbol: str, days: int = 550) -> int:
     bars = UnifiedDataService(db).get_history(
         symbol, date.today() - timedelta(days=days), date.today()
-    ).value
+    ).require_value()
     source = bars[0].source if bars else "akshare_qfq"
     existing = {
         item.trade_date: item

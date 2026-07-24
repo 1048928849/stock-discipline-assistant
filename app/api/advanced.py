@@ -207,7 +207,7 @@ def _live_market_call(callback):
 
 @router.get("/market/symbols")
 def market_symbols(db: Session = Depends(get_db)):
-    return _live_market_call(lambda: build_data_hub(db).list_symbols().value)
+    return _live_market_call(lambda: build_data_hub(db).list_symbols().require_value())
 
 
 @router.get("/market/indices")
@@ -215,12 +215,14 @@ def market_indices(
     family: str = Query(default="上证系列指数", max_length=30),
     db: Session = Depends(get_db),
 ):
-    return _live_market_call(lambda: build_data_hub(db).list_indices(family).value)
+    return _live_market_call(
+        lambda: build_data_hub(db).list_indices(family).require_value()
+    )
 
 
 @router.get("/market/sectors")
 def market_sectors(db: Session = Depends(get_db)):
-    return _live_market_call(lambda: build_data_hub(db).list_sectors().value)
+    return _live_market_call(lambda: build_data_hub(db).list_sectors().require_value())
 
 
 @router.get("/market/announcements/{symbol}")
@@ -230,7 +232,7 @@ def market_announcements(
     db: Session = Depends(get_db),
 ):
     return _live_market_call(
-        lambda: build_data_hub(db).daily_announcements(symbol, day).value
+        lambda: build_data_hub(db).daily_announcements(symbol, day).require_value()
     )
 
 
@@ -277,7 +279,10 @@ def market_sync(
     try:
         quote_error = None
         try:
-            quote = provider.get_quote(symbol).value
+            quote_result = provider.get_quote(symbol)
+            quote = quote_result.value
+            if quote is None:
+                quote_error = "; ".join(quote_result.errors) or "quote unavailable"
         except ProviderUnavailableError as exc:
             quote = None
             quote_error = str(exc)
@@ -486,7 +491,11 @@ def x_sync(limit: int = Query(default=20, ge=1, le=100), db: Session = Depends(g
         db.commit()
         raise AppError(422, "X_QUERY_REQUIRED", "请先添加关注账号或查询表达式")
     try:
-        posts = build_data_hub(db).collect_social_queries(expressions, limit).value
+        posts = (
+            build_data_hub(db)
+            .collect_social_queries(expressions, limit)
+            .require_value()
+        )
     except ProviderUnavailableError as exc:
         job.status = "paused"
         job.finished_at = datetime.now()

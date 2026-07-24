@@ -1,34 +1,8 @@
-from app.data_hub.contracts import (
-    AnnouncementProvider,
-    DailyBar,
-    DataProvider,
-    FundamentalDataProvider,
-    IndustryConceptProvider,
-    MarketDataProvider,
-    NewsProvider,
-    ProviderMetadata,
-    ProviderUnavailableError,
-    Quote,
-    SocialClueProvider,
-)
-from app.data_hub.quality import DataQualityStatus
-from app.data_hub.registry import ProviderRegistry
-from app.data_hub.router import DataHubRouter, ProviderResult
+"""Data Hub package.
 
-__all__ = [
-    "AnnouncementProvider",
-    "DailyBar",
-    "DataHubRouter",
-    "DataProvider",
-    "DataQualityStatus",
-    "FundamentalDataProvider",
-    "IndustryConceptProvider",
-    "MarketDataProvider",
-    "NewsProvider",
-    "ProviderMetadata",
-    "ProviderRegistry",
-    "ProviderResult",
-    "ProviderUnavailableError",
-    "Quote",
-    "SocialClueProvider",
-]
+Import concrete contracts from ``app.data_hub.contracts`` and runtime routing
+from the application composition root. Keeping this module empty prevents a
+type-only import from loading ORM and provider adapters.
+"""
+
+__all__: list[str] = []
