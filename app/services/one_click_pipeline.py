@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 
 from app.data_hub.contracts import ProviderUnavailableError
 from app.data_hub.router import DataHubRouter
+from app.data_hub.trading_calendar import get_trading_calendar
+from app.data_hub.quality import observation_is_stale, policy_for
 from app.domain.package_builder import build_decision_package
 from app.errors import AppError
 from app.models import (
@@ -34,10 +36,11 @@ from app.schemas_workflow import (
 )
 from app.services.trade_plan_ai import run_ai_analysis
 from app.services.company_research import refresh_company_research_if_needed
+from app.services.data_sources import build_data_hub
+from app.services.plan_freeze import freeze_trade_plan
 from app.services.trade_plan_generator import (
     GENERATOR_PARAMETERS,
     generate_trade_plan_preview,
-    save_generated_plan,
 )
 
 
@@ -91,7 +94,7 @@ def _sync_stock(
     db: Session, symbol: str, provider: DataHubRouter, refresh: bool
 ) -> tuple[dict, dict]:
     cached = _latest_bar(db, symbol)
-    stale = cached is None or cached.trade_date < date.today() - timedelta(days=5)
+    stale = cached is None or get_trading_calendar().session_lag(cached.trade_date) > 0
     if cached and not stale and not refresh:
         return (
             _step(
@@ -101,6 +104,7 @@ def _sync_stock(
                 f"本地前复权日线有效，截止 {cached.trade_date.isoformat()}。",
                 source=cached.source,
                 data_time=cached.fetched_at.isoformat(),
+                observed_at=cached.trade_date.isoformat(),
             ),
             {"data_date": cached.trade_date.isoformat(), "source": cached.source},
         )
@@ -108,12 +112,12 @@ def _sync_stock(
         history_result = provider.get_history(
             symbol, date.today() - timedelta(days=900), date.today()
         )
-        bars = history_result.value
+        bars = history_result.require_value()
         if len(bars) < 80:
             raise ProviderUnavailableError(f"前复权日线仅有 {len(bars)} 根，少于80根")
         quote_error = None
         try:
-            quote = provider.get_quote(symbol).value
+            quote = provider.get_quote(symbol).require_value()
         except ProviderUnavailableError as exc:
             quote_error = str(exc)
             latest = bars[-1]
@@ -168,6 +172,11 @@ def _sync_stock(
                 + (f" 实时行情失败，使用最新收盘：{quote_error}" if quote_error else ""),
                 fallback_used=bool(quote_error) or history_result.fallback_used,
                 quality_status=history_result.quality_status.value,
+                observed_at=history_result.observed_at.isoformat()
+                if history_result.observed_at
+                else None,
+                fetched_at=history_result.fetched_at.isoformat(),
+                provider_observations=history_result.provider_observations,
                 source=bars[-1].source,
                 data_time=bars[-1].fetched_at.isoformat(),
             ),
@@ -238,7 +247,7 @@ def _market_assessment(db: Session, provider: DataHubRouter) -> tuple[dict, dict
         .where(MarketDailyBar.symbol == cache_symbol)
         .order_by(MarketDailyBar.trade_date)
     ).all()
-    if cached and cached[-1].trade_date >= date.today() - timedelta(days=5):
+    if cached and get_trading_calendar().session_lag(cached[-1].trade_date) == 0:
         rows = [
             {"date": item.trade_date, "close": float(item.close), "volume": float(item.volume)}
             for item in cached
@@ -255,12 +264,13 @@ def _market_assessment(db: Session, provider: DataHubRouter) -> tuple[dict, dict
             detail,
             source=cached[-1].source,
             data_time=cached[-1].fetched_at.isoformat(),
+            observed_at=cached[-1].trade_date.isoformat(),
         )
     try:
         history_result = provider.get_index_history(
             "csi000300", date.today() - timedelta(days=240), date.today()
         )
-        history = history_result.value
+        history = history_result.require_value()
         for row in history["rows"]:
             existing = db.scalar(
                 select(MarketDailyBar).where(
@@ -299,6 +309,11 @@ def _market_assessment(db: Session, provider: DataHubRouter) -> tuple[dict, dict
             source=history["source"],
             data_time=history["fetched_at"].isoformat(),
             quality_status=history_result.quality_status.value,
+            observed_at=history_result.observed_at.isoformat()
+            if history_result.observed_at
+            else None,
+            fetched_at=history_result.fetched_at.isoformat(),
+            provider_observations=history_result.provider_observations,
         )
     except Exception as exc:
         db.rollback()
@@ -337,6 +352,14 @@ def _ensure_profile(
 ) -> tuple[CompanyProfile | None, dict]:
     profile = db.scalar(select(CompanyProfile).where(CompanyProfile.symbol == symbol))
     if profile and profile.industry:
+        profile_quality = (
+            "STALE"
+            if observation_is_stale(
+                profile.fetched_at,
+                policy_for("fundamental.profile"),
+            )
+            else "SINGLE_SOURCE"
+        )
         return profile, _step(
             "company_mapping",
             "公司与行业识别",
@@ -344,11 +367,13 @@ def _ensure_profile(
             f"{profile.name}，所属行业：{profile.industry}。",
             source=profile.source,
             data_time=profile.fetched_at.isoformat(),
+            observed_at=profile.fetched_at.isoformat(),
+            quality_status=profile_quality,
             missing=["概念板块自动映射", "完整产业链节点"] if not profile.raw_data else [],
         )
     try:
         profile_result = provider.company_profile(symbol)
-        raw = profile_result.value
+        raw = profile_result.require_value()
         now = datetime.now()
         values = {
             "name": str(_pick(raw, "A股简称", "公司名称") or symbol),
@@ -376,6 +401,12 @@ def _ensure_profile(
             f"识别为 {profile.name}；行业：{profile.industry or '暂无可靠数据'}。",
             source=profile.source,
             data_time=now.isoformat(),
+            observed_at=profile_result.observed_at.isoformat()
+            if profile_result.observed_at
+            else None,
+            fetched_at=profile_result.fetched_at.isoformat(),
+            quality_status=profile_result.quality_status.value,
+            provider_observations=profile_result.provider_observations,
             missing=[] if profile.industry else ["所属行业", "概念板块", "产业链节点"],
         )
     except Exception as exc:
@@ -459,7 +490,7 @@ def _sector_assessment(
         history_result = provider.get_sector_history(
             board_name, date.today() - timedelta(days=240), date.today()
         )
-        history = history_result.value
+        history = history_result.require_value()
         assessment = _series_assessment(history["rows"])
         market_return = market.get("return_20d")
         relative = (
@@ -492,6 +523,11 @@ def _sector_assessment(
             source=history["source"],
             data_time=history["fetched_at"].isoformat(),
             quality_status=history_result.quality_status.value,
+            observed_at=history_result.observed_at.isoformat()
+            if history_result.observed_at
+            else None,
+            fetched_at=history_result.fetched_at.isoformat(),
+            provider_observations=history_result.provider_observations,
         )
     except Exception as exc:
         result = {"state": "无法判断", "relative_20d": None, "is_mainline": None}
@@ -554,6 +590,33 @@ def _research_inventory(db: Session, symbol: str) -> tuple[dict, dict]:
         missing=missing,
         source="本地公司研究中心（原始来源保留在证据记录）",
         data_time=datetime.now().isoformat(),
+        observed_at=max(
+            (item.published_date for item in announcements),
+            default=None,
+        ).isoformat()
+        if announcements
+        else None,
+        quality_status=(
+            "STALE"
+            if announcements
+            and observation_is_stale(
+                max(item.fetched_at for item in announcements),
+                policy_for("announcement.catalog"),
+            )
+            else "SINGLE_SOURCE"
+            if announcements
+            else "MISSING"
+        ),
+        required_missing=[] if announcements else ["announcements"],
+        optional_missing=[
+            item
+            for item, available in (
+                ("financials", bool(financials)),
+                ("valuation", valuation is not None),
+                ("industry_evidence", bool(evidence)),
+            )
+            if not available
+        ],
     )
 
 
@@ -601,7 +664,7 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
     db.add(run)
     db.commit()
     db.refresh(run)
-    provider = DataHubRouter(db)
+    provider = build_data_hub(db)
     research_orchestrator = ExistingAIResearchOrchestrator(
         lambda request: run_ai_analysis(db, request)
     )
@@ -705,6 +768,9 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
         preview["market_assessment"] = market
         preview["industry_assessment"] = sector
         preview["research_inventory"] = research
+        preview["required_research_capabilities"] = (
+            payload.required_research_capabilities
+        )
         steps.extend(
             [
                 _step(
@@ -739,7 +805,8 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
             ai_request = TradePlanAIRequest(
                 **generator_request.model_dump(), preview_hash=preview["preview_hash"]
             )
-            ai_result = research_orchestrator.run(ai_request)
+            research_execution = research_orchestrator.run(ai_request)
+            ai_result = research_execution.legacy_payload
             ai_id = ai_result.get("id")
             steps.append(
                 _step(
@@ -843,14 +910,22 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
 
 
 def confirm_one_click_plan(db: Session, run_id: int) -> dict:
-    run = db.get(PlanAnalysisRun, run_id)
+    run = db.scalar(
+        select(PlanAnalysisRun).where(PlanAnalysisRun.id == run_id).with_for_update()
+    )
     if run is None:
         raise AppError(404, "ANALYSIS_RUN_NOT_FOUND", "一键分析记录不存在")
     if run.confirmed_plan_id:
         raise AppError(409, "ANALYSIS_ALREADY_CONFIRMED", "该分析已经保存为正式计划")
     result = run.result_snapshot or {}
     plan = result.get("plan") or {}
-    decision_package = result.get("decision_package") or {}
+    decision_package = result.get("decision_package")
+    if not decision_package:
+        raise AppError(
+            422,
+            "DECISION_PACKAGE_REQUIRED",
+            "Legacy analysis cannot be confirmed; run a new analysis.",
+        )
     if not decision_package.get("freeze_allowed"):
         reasons = "；".join(decision_package.get("blocked_reasons") or [])
         raise AppError(
@@ -866,16 +941,27 @@ def confirm_one_click_plan(db: Session, run_id: int) -> dict:
         preview_hash=plan["preview_hash"],
         ai_analysis_id=run.ai_analysis_id,
     )
-    saved = save_generated_plan(db, save_request)
+    saved = freeze_trade_plan(
+        db,
+        request=save_request,
+        decision_package=decision_package,
+        analysis_created_at=run.created_at,
+    )
     frozen_plan = db.get(TradePlan, saved["id"])
     if frozen_plan:
-        frozen_plan.engine_snapshot = plan
+        frozen_plan.engine_snapshot = {
+            **plan,
+            "decision_package": decision_package,
+            "freeze_hash": decision_package["package_hash"],
+        }
         frozen_plan.market_snapshot = {
             "market_assessment": plan.get("market_assessment"),
             "industry_assessment": plan.get("industry_assessment"),
+            "quality_snapshot": decision_package["quality_snapshot"],
         }
         frozen_plan.source_snapshot = (
             (result.get("ai") or {}).get("sources")
+            or decision_package.get("evidence")
             or plan.get("sources")
             or []
         )

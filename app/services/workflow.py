@@ -224,6 +224,10 @@ def create_trade_plan(db: Session, payload: TradePlanCreate) -> TradePlan:
     else:
         status = "READY"
         next_action = "计划条件完整；仅在买入触发条件出现时按计划执行，不代表建议买入。"
+    status = "DRAFT"
+    next_action = (
+        "Manual draft only; 不要执行买入，需先运行受管分析并冻结正式计划。"
+    )
     plan = TradePlan(
         **payload.model_dump(),
         rule_version_id=rule.id,
@@ -233,7 +237,7 @@ def create_trade_plan(db: Session, payload: TradePlanCreate) -> TradePlan:
         planned_position_value=entry * quantity,
         planned_risk_amount=per_share_risk * quantity,
         next_action=next_action,
-        data_status="user_entered",
+        data_status="manual_draft",
         source="用户事前计划 + 规则化仓位计算",
     )
     db.add(plan)

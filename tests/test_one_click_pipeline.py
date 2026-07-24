@@ -3,7 +3,14 @@ from decimal import Decimal
 
 import pytest
 
-from app.models import CompanyProfile, MarketDailyBar, MarketQuote, TradePlan
+from app.models import (
+    CompanyAnnouncement,
+    CompanyProfile,
+    MarketDailyBar,
+    MarketQuote,
+    PlanAnalysisRun,
+    TradePlan,
+)
 from app.schemas_workflow import TradePlanPreviewRequest
 from app.services.trade_plan_generator import generate_trade_plan_preview
 
@@ -84,6 +91,21 @@ def seed_profile(session):
             fetched_at=datetime.now(),
         )
     )
+    session.add(
+        CompanyAnnouncement(
+            symbol="300502",
+            title="测试公司最新公告",
+            announcement_category="其他公告",
+            risk_level="无",
+            published_date=date.today(),
+            catalog_source="exchange_test",
+            exchange="SZSE",
+            url="https://example.test/announcement",
+            source_document_url=None,
+            raw_data={},
+            fetched_at=datetime.now(),
+        )
+    )
     session.commit()
 
 
@@ -141,7 +163,7 @@ def test_one_click_empty_position_generates_and_confirms_plan(client, session, m
     ][-7:]
     assert data["plan"]["account"]["max_position_pct"] == 30
     assert data["plan"]["position_calculation"]["trial_quantity"] % 100 == 0
-    assert data["decision_package"]["schema_version"] == "1.0"
+    assert data["decision_package"]["schema_version"] == "1.1"
     assert data["decision_package"]["quality_status"] == "SINGLE_SOURCE"
     assert data["decision_package"]["strategy_decision"]["rule_status"] == "READY"
     assert data["decision_package"]["risk_decision"]["hard_stop"] == str(
@@ -297,3 +319,318 @@ def test_untrusted_execution_data_blocks_ready_and_plan_freeze(
     assert confirm.status_code == 422
     assert confirm.json()["error"]["code"] == "ANALYSIS_QUALITY_BLOCKED"
     assert session.query(TradePlan).count() == 0
+
+
+def test_direct_save_cannot_bypass_blocked_decision_package(
+    client, session, monkeypatch
+):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    patch_benchmarks(monkeypatch)
+
+    def missing_stock(db, symbol, provider, refresh):
+        return (
+            {
+                "code": "market_data",
+                "name": "market data",
+                "status": "failed",
+                "detail": "required market data missing",
+                "fallback_used": False,
+                "missing": ["stock_daily_bars"],
+                "quality_status": "MISSING",
+                "source": "test",
+                "data_time": datetime.now().isoformat(),
+            },
+            {"data_date": date.today().isoformat(), "source": "test"},
+        )
+
+    monkeypatch.setattr("app.services.one_click_pipeline._sync_stock", missing_stock)
+    analyzed = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    ).json()
+    assert analyzed["can_save"] is False
+    direct = client.post(
+        "/api/v1/trade-plan-generator/save",
+        json={
+            **analyzed["generator_request"],
+            "preview_hash": analyzed["plan"]["preview_hash"],
+        },
+    )
+    assert direct.status_code == 422
+    assert direct.json()["error"]["code"] == "DECISION_PACKAGE_REQUIRED"
+    assert session.query(TradePlan).count() == 0
+
+
+def test_confirm_rechecks_quality_after_analysis_age(
+    client, session, monkeypatch
+):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    patch_benchmarks(monkeypatch)
+    analyzed = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    ).json()
+    run = session.get(PlanAnalysisRun, analyzed["run_id"])
+    run.created_at = datetime.now() - timedelta(days=2)
+    session.commit()
+    confirmed = client.post(
+        f"/api/v1/trade-plan-generator/analyze/{analyzed['run_id']}/confirm"
+    )
+    assert confirmed.status_code == 422
+    assert confirmed.json()["error"]["code"] == "DECISION_PACKAGE_EXPIRED"
+
+
+def test_confirm_rejects_changed_quality_snapshot(client, session, monkeypatch):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    patch_benchmarks(monkeypatch)
+    analyzed = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    ).json()
+    run = session.get(PlanAnalysisRun, analyzed["run_id"])
+    snapshot = dict(run.result_snapshot)
+    package = dict(snapshot["decision_package"])
+    package["quality_snapshot"] = {
+        **package.get("quality_snapshot", {}),
+        "market_data": {"quality_status": "CONFLICTED"},
+    }
+    snapshot["decision_package"] = package
+    run.result_snapshot = snapshot
+    session.commit()
+    confirmed = client.post(
+        f"/api/v1/trade-plan-generator/analyze/{analyzed['run_id']}/confirm"
+    )
+    assert confirmed.status_code == 422
+    assert confirmed.json()["error"]["code"] == "DECISION_PACKAGE_CHANGED"
+
+
+def test_confirm_rejects_required_source_change(client, session, monkeypatch):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    patch_benchmarks(monkeypatch)
+    analyzed = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    ).json()
+    announcement = session.query(CompanyAnnouncement).one()
+    announcement.fetched_at = datetime.now() + timedelta(seconds=1)
+    session.commit()
+    confirmed = client.post(
+        f"/api/v1/trade-plan-generator/analyze/{analyzed['run_id']}/confirm"
+    )
+    assert confirmed.status_code == 422
+    assert confirmed.json()["error"]["code"] == "DECISION_PACKAGE_CHANGED"
+
+
+def test_same_analysis_run_cannot_create_two_formal_plans(
+    client, session, monkeypatch
+):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    patch_benchmarks(monkeypatch)
+    analyzed = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    ).json()
+    endpoint = (
+        f"/api/v1/trade-plan-generator/analyze/{analyzed['run_id']}/confirm"
+    )
+    assert client.post(endpoint).status_code == 201
+    duplicate = client.post(endpoint)
+    assert duplicate.status_code == 409
+    assert duplicate.json()["error"]["code"] == "ANALYSIS_ALREADY_CONFIRMED"
+    assert session.query(TradePlan).count() == 1
+
+
+def test_legacy_analysis_without_decision_package_cannot_confirm(client, session):
+    account = create_account(client, assets="300000", cash="300000")
+    run = PlanAnalysisRun(
+        symbol="300502",
+        account_id=account["id"],
+        position_mode="空仓",
+        status="success",
+        request_snapshot={},
+        pipeline_steps=[],
+        result_snapshot={"plan": {"preview_hash": "a" * 64}},
+    )
+    session.add(run)
+    session.commit()
+    response = client.post(f"/api/v1/trade-plan-generator/analyze/{run.id}/confirm")
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "DECISION_PACKAGE_REQUIRED"
+
+
+def test_required_announcements_missing_blocks_freeze(client, session, monkeypatch):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    session.query(CompanyAnnouncement).delete()
+    session.commit()
+    patch_benchmarks(monkeypatch)
+    data = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    ).json()
+    assert data["decision_package"]["strategy_decision"]["rule_status"] == "READY"
+    assert data["decision_package"]["strategy_decision"]["executable_status"] == "WAIT"
+    assert data["decision_package"]["freeze_allowed"] is False
+    assert data["decision_package"]["quality_status"] == "MISSING"
+
+
+def test_optional_financials_missing_does_not_change_rule_status(
+    client, session, monkeypatch
+):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    patch_benchmarks(monkeypatch)
+    data = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    ).json()
+    package = data["decision_package"]
+    assert package["strategy_decision"]["rule_status"] == "READY"
+    assert package["freeze_allowed"] is True
+    assert "financials" in package["research_decision"]["missing_optional_evidence"]
+
+
+def test_optional_financials_missing_reduces_research_completeness(
+    client, session, monkeypatch
+):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    patch_benchmarks(monkeypatch)
+    package = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    ).json()["decision_package"]
+    assert package["research_decision"]["research_completeness"] < 100
+
+
+def test_strategy_can_promote_financials_to_required(client, session, monkeypatch):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    patch_benchmarks(monkeypatch)
+    package = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+            "required_research_capabilities": ["financials"],
+        },
+    ).json()["decision_package"]
+    assert "financials" in package["required_capabilities"]
+    assert package["quality_status"] == "MISSING"
+    assert package["freeze_allowed"] is False
+
+
+def test_stale_required_evidence_blocks_freeze(client, session, monkeypatch):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    announcement = session.query(CompanyAnnouncement).one()
+    announcement.fetched_at = datetime.now() - timedelta(days=2)
+    session.commit()
+    patch_benchmarks(monkeypatch)
+    package = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    ).json()["decision_package"]
+    assert package["quality_status"] == "STALE"
+    assert package["freeze_allowed"] is False
+
+
+def test_stale_optional_evidence_is_reported_but_not_blocking(
+    client, session, monkeypatch
+):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    patch_benchmarks(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.one_click_pipeline.run_ai_analysis",
+        lambda db, request: {
+            "status": "success",
+            "id": None,
+            "sources": [
+                {
+                    "source_id": "financial:test",
+                    "symbol": "300502",
+                    "category": "financial",
+                    "source_name": "test",
+                    "stale": True,
+                    "content": {"revenue": 100},
+                }
+            ],
+            "result": {"missing_data": []},
+        },
+    )
+    package = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": True,
+        },
+    ).json()["decision_package"]
+    assert package["quality_status"] == "SINGLE_SOURCE"
+    assert package["freeze_allowed"] is True
+    assert "financials" in package["research_decision"]["missing_optional_evidence"]

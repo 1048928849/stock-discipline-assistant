@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from decimal import Decimal, ROUND_FLOOR
 from types import SimpleNamespace
 
@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.errors import AppError
+from app.data_hub.trading_calendar import get_trading_calendar
 from app.models import (
     Account,
     CompanyProfile,
@@ -304,9 +305,9 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
     now = datetime.now()
     data_time = latest_bar.fetched_at.isoformat() if latest_bar else "数据不足"
     data_date = latest_bar.trade_date.isoformat() if latest_bar else None
-    stale = not latest_bar or latest_bar.trade_date < date.today() - timedelta(
-        days=int(parameters["freshness_days"])
-    )
+    stale = not latest_bar or get_trading_calendar().session_lag(
+        latest_bar.trade_date
+    ) > int(parameters["freshness_days"])
     source = latest_bar.source if latest_bar else "数据不足"
     gates = []
     market_status = (
@@ -821,9 +822,11 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
     return preview
 
 
-def save_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
+def _persist_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
     preview_request = TradePlanPreviewRequest(
-        **request.model_dump(exclude={"preview_hash", "ai_analysis_id"})
+        **request.model_dump(
+            exclude={"preview_hash", "ai_analysis_id", "decision_package"}
+        )
     )
     preview = generate_trade_plan_preview(db, preview_request)
     if preview["preview_hash"] != request.preview_hash:
@@ -923,7 +926,6 @@ def save_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
         plan,
         request.position_mode or ("持仓" if preview["existing_position"]["exists"] else "空仓"),
     )
-    db.commit()
     return {
         "id": plan.id,
         "account_id": plan.account_id,
@@ -933,6 +935,14 @@ def save_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
         "execution_status": plan.execution_status,
         "preview": preview,
     }
+
+
+def save_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
+    raise AppError(
+        422,
+        "DECISION_PACKAGE_REQUIRED",
+        "Formal plans can only be frozen through the governed analysis confirmation endpoint.",
+    )
 
 
 def plan_history(db: Session, account_id: int, symbol: str) -> list[dict]:

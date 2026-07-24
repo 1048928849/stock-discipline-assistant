@@ -60,12 +60,22 @@ def ready_plan(account_id: int):
     }
 
 
+def test_manual_plan_is_explicitly_marked_manual_draft(client):
+    account = client.post("/api/v1/accounts", json=account_payload()).json()
+    response = client.post("/api/v1/trade-plans", json=ready_plan(account["id"]))
+    assert response.status_code == 201
+    plan = response.json()
+    assert plan["status"] == "DRAFT"
+    assert plan["data_status"] == "manual_draft"
+    assert plan["execution_status"] == "draft"
+
+
 def test_trade_plan_calculates_a_share_lots_and_seven_gates(client):
     account = client.post("/api/v1/accounts", json=account_payload()).json()
     response = client.post("/api/v1/trade-plans", json=ready_plan(account["id"]))
     assert response.status_code == 201
     plan = response.json()
-    assert plan["status"] == "READY"
+    assert plan["status"] == "DRAFT"
     assert plan["planned_quantity"] == 800
     assert plan["planned_risk_amount"] == 960
     assert len(plan["checks"]) == 7
@@ -82,7 +92,7 @@ def test_failed_gate_blocks_plan_and_missing_fields_stay_explicit(client):
     response = client.post("/api/v1/trade-plans", json=payload)
     assert response.status_code == 201
     plan = response.json()
-    assert plan["status"] == "BLOCKED"
+    assert plan["status"] == "DRAFT"
     assert "不要执行买入" in plan["next_action"]
     logic = next(item for item in plan["checks"] if item["name"] == "行业与公司逻辑")
     assert logic["status"] == "无法判断"

@@ -4,7 +4,7 @@ from decimal import Decimal
 import pytest
 
 from app.config import Settings
-from app.models import CompanyProfile, MarketDailyBar, MarketQuote
+from app.models import CompanyAnnouncement, CompanyProfile, MarketDailyBar, MarketQuote
 from app.providers.llm_provider import OpenAICompatibleProvider
 from app.services.trade_plan_ai import validate_ai_output
 from app.services.trade_plan_generator import _floor_lot, ensure_generator_rule_version
@@ -90,6 +90,92 @@ def payload(account_id, symbol="300502", **changes):
     return result
 
 
+def seed_governed_analysis(session, monkeypatch):
+    session.add(
+        CompanyProfile(
+            symbol="300502",
+            name="测试公司",
+            industry="测试行业",
+            market="创业板",
+            main_business="测试业务",
+            business_scope=None,
+            website=None,
+            source="test",
+            source_url="https://example.test/profile",
+            raw_data={},
+            fetched_at=datetime.now(),
+        )
+    )
+    session.add(
+        CompanyAnnouncement(
+            symbol="300502",
+            title="最新公告",
+            announcement_category="其他公告",
+            risk_level="无",
+            published_date=date.today(),
+            catalog_source="exchange_test",
+            exchange="SZSE",
+            url="https://example.test/announcement",
+            source_document_url=None,
+            raw_data={},
+            fetched_at=datetime.now(),
+        )
+    )
+    session.commit()
+    rows = {
+        "rows": [
+            {
+                "date": date.today() - timedelta(days=39 - index),
+                "close": 100 + index,
+                "volume": 1000 + index,
+            }
+            for index in range(40)
+        ],
+        "source": "test",
+        "fetched_at": datetime.now(),
+    }
+    monkeypatch.setattr(
+        "app.providers.akshare_provider.AKShareProvider.get_index_history",
+        lambda *_: rows,
+    )
+    monkeypatch.setattr(
+        "app.providers.akshare_provider.AKShareProvider.get_sector_history",
+        lambda *_: rows,
+    )
+    monkeypatch.setattr(
+        "app.services.one_click_pipeline.refresh_company_research_if_needed",
+        lambda db, symbol, **kwargs: {
+            "symbol": symbol,
+            "status": "fresh",
+            "sections": {},
+            "updated_at": datetime.now().isoformat(),
+            "checked_at": datetime.now().isoformat(),
+            "refreshed_sections": [],
+            "missing_data": ["financials", "valuation"],
+            "freshness": [],
+        },
+    )
+
+
+def analyze_and_confirm(client, account_id, **changes):
+    request = {
+        "symbol": "300502",
+        "position_mode": "空仓",
+        "account_id": account_id,
+        "enable_ai": False,
+        **changes,
+    }
+    analyzed = client.post(
+        "/api/v1/trade-plan-generator/analyze", json=request
+    ).json()
+    assert analyzed["can_save"] is True, analyzed
+    saved = client.post(
+        f"/api/v1/trade-plan-generator/analyze/{analyzed['run_id']}/confirm"
+    )
+    assert saved.status_code == 201, saved.text
+    return analyzed, saved.json()
+
+
 @pytest.mark.parametrize(
     ("pattern_state", "expected"),
     [("flat", "WAIT"), ("pullback", "WAIT"), ("ready", "READY"), ("broken", "NO_TRADE")],
@@ -158,20 +244,28 @@ def test_position_limits_and_risk_setting_change_quantity(client, session):
     assert next(x for x in limited.json()["gates"] if x["code"] == "position")["status"] == "不通过"
 
 
-def test_save_freezes_versions_and_history(client, session):
+def test_generator_golden_rule_numbers_match_main(client, session):
     account = create_account(client)
     seed_pattern(session)
-    request = payload(account["id"])
-    preview = client.post("/api/v1/trade-plan-generator/preview", json=request).json()
-    saved = client.post(
-        "/api/v1/trade-plan-generator/save",
-        json={**request, "preview_hash": preview["preview_hash"]},
-    )
-    assert saved.status_code == 201, saved.text
-    second = client.post(
-        "/api/v1/trade-plan-generator/save",
-        json={**request, "preview_hash": preview["preview_hash"]},
+    preview = client.post(
+        "/api/v1/trade-plan-generator/preview",
+        json=payload(account["id"]),
     ).json()
+    assert preview["status"] == "READY"
+    assert preview["buy_plan"]["buy_zone"] == [10.4209, 10.5391]
+    assert preview["buy_plan"]["hard_stop"] == 9.7023
+    assert preview["position_calculation"]["final_allowed_quantity"] == 600
+    assert preview["position_calculation"]["trial_quantity"] == 100
+    assert preview["position_calculation"]["per_share_risk"] == 0.7777
+    assert preview["position_calculation"]["maximum_loss"] == 77.77
+
+
+def test_save_freezes_versions_and_history(client, session, monkeypatch):
+    account = create_account(client)
+    seed_pattern(session)
+    seed_governed_analysis(session, monkeypatch)
+    _, saved = analyze_and_confirm(client, account["id"], max_position_pct=20)
+    _, second = analyze_and_confirm(client, account["id"], max_position_pct=20)
     history = client.get(
         f"/api/v1/trade-plan-generator/history?account_id={account['id']}&symbol=300502"
     ).json()
@@ -488,15 +582,14 @@ def test_ai_timeout_is_audited_without_breaking_rule_plan(client, session, monke
     assert preview["status"] == "READY"
 
 
-def test_confirmed_plan_manual_fills_and_execution_deviations(client, session):
+def test_confirmed_plan_manual_fills_and_execution_deviations(
+    client, session, monkeypatch
+):
     account = create_account(client)
     seed_pattern(session)
-    request = payload(account["id"])
-    preview = client.post("/api/v1/trade-plan-generator/preview", json=request).json()
-    saved = client.post(
-        "/api/v1/trade-plan-generator/save",
-        json={**request, "preview_hash": preview["preview_hash"]},
-    ).json()
+    seed_governed_analysis(session, monkeypatch)
+    analyzed, saved = analyze_and_confirm(client, account["id"])
+    preview = analyzed["plan"]
     plan_id = saved["id"]
     assert saved["execution_status"] in {"entry_triggered", "waiting_entry"}
     buy_price = preview["buy_plan"]["buy_zone"][0]

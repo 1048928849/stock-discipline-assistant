@@ -207,6 +207,9 @@ class OneClickPlanRequest(BaseModel):
     max_total_position_pct: Decimal = Field(default=Decimal("80"), gt=0, le=100)
     max_industry_position_pct: Decimal = Field(default=Decimal("40"), gt=0, le=100)
     logic_invalidation: str | None = Field(default=None, max_length=3000)
+    required_research_capabilities: list[
+        Literal["financials", "valuation", "news", "social_clues"]
+    ] = Field(default_factory=list, max_length=10)
 
     @model_validator(mode="after")
     def validate_one_click_input(self):
