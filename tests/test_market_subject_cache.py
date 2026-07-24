@@ -544,6 +544,28 @@ def test_verified_refresh_supersedes_same_scope_conflict(session):
     assert refresh.supersedes_record_id == conflict.id
 
 
+def test_verified_provider_fallback_supersedes_same_scope_conflict(session):
+    now = datetime.now()
+    conflict, _ = _conflict_then_refresh(
+        session,
+        conflict_time=now - timedelta(minutes=3),
+        refresh_time=now - timedelta(minutes=2),
+        refresh_sources=1,
+    )
+    refresh_router = _router(
+        session,
+        MarketStub("offline", priority=5, failures={"get_quote"}),
+        MarketStub("refresh-a", priority=10, observed_at=now - timedelta(minutes=1)),
+        MarketStub("refresh-b", priority=20, observed_at=now - timedelta(minutes=1)),
+    )
+    refresh = refresh_router.get_quote("300502")
+    record = _quality_record(session, refresh)
+    assert refresh.quality_status == DataQualityStatus.VERIFIED
+    assert refresh.fallback_used is True
+    assert refresh.cache_used is False
+    assert record.supersedes_record_id == conflict.id
+
+
 def test_single_source_refresh_does_not_supersede_conflict(session):
     now = datetime.now()
     _, refresh = _conflict_then_refresh(
