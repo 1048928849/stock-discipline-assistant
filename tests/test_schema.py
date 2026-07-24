@@ -33,6 +33,7 @@ def test_initial_schema_contains_required_tables(session):
         "plan_analysis_runs",
         "data_provider_call_logs",
         "data_quality_records",
+        "data_quality_subject_heads",
         "company_research_refreshes",
         "plan_execution_events",
         "plan_execution_fills",

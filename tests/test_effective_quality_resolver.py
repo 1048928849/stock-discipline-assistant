@@ -272,6 +272,27 @@ def test_cache_reread_does_not_resolve_conflict(session):
     assert second.effective_quality == DataQualityStatus.CONFLICTED
 
 
+def test_rewritten_cache_does_not_resolve_conflict(session):
+    cached = _record(session, persisted=True)
+    conflict = _record(
+        session,
+        quality_status="CONFLICTED",
+        normalized_digest="b" * 64,
+    )
+    rewritten = _record(
+        session,
+        observed_at=cached.observed_at,
+        normalized_digest=cached.normalized_digest,
+        persisted=True,
+    )
+
+    result = _resolve(session, rewritten)
+
+    assert result.effective_quality == DataQualityStatus.CONFLICTED
+    assert result.blocking_record_id == conflict.id
+    assert result.blocking_reason == "newer_conflict"
+
+
 def test_later_single_source_does_not_resolve_conflict(session):
     cached = _record(session, persisted=True)
     conflict = _record(
@@ -308,6 +329,60 @@ def test_verified_explicit_supersession_resolves_conflict(session):
     assert result.blocking_record_id is None
     assert result.requires_refresh is False
     assert resolution.id in result.source_quality_record_ids
+
+
+def test_resolved_conflict_does_not_pin_later_business_value(session):
+    cached = _record(
+        session,
+        observed_at=EVALUATED_AT - timedelta(minutes=10),
+        persisted=True,
+    )
+    conflict = _record(
+        session,
+        observed_at=EVALUATED_AT - timedelta(minutes=9),
+        quality_status="CONFLICTED",
+        normalized_digest="b" * 64,
+    )
+    _record(
+        session,
+        observed_at=EVALUATED_AT - timedelta(minutes=8),
+        quality_status="VERIFIED",
+        supersedes_record_id=conflict.id,
+        normalized_digest=cached.normalized_digest,
+    )
+    later = _record(
+        session,
+        observed_at=EVALUATED_AT - timedelta(minutes=1),
+        normalized_digest="c" * 64,
+        persisted=True,
+    )
+
+    result = _resolve(session, later)
+
+    assert result.effective_quality == DataQualityStatus.SINGLE_SOURCE
+    assert result.executable is True
+    assert result.requires_refresh is False
+
+
+def test_verified_resolution_without_observed_at_does_not_resolve_conflict(session):
+    cached = _record(session, persisted=True)
+    conflict = _record(
+        session,
+        quality_status="CONFLICTED",
+        normalized_digest="b" * 64,
+    )
+    _record(
+        session,
+        quality_status="VERIFIED",
+        observed_at=None,
+        supersedes_record_id=conflict.id,
+        normalized_digest=cached.normalized_digest,
+    )
+
+    result = _resolve(session, cached)
+
+    assert result.effective_quality == DataQualityStatus.CONFLICTED
+    assert result.blocking_record_id == conflict.id
 
 
 def test_unlinked_verified_record_does_not_resolve_conflict(session):
