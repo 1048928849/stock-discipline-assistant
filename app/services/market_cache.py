@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.data_hub.effective_quality import resolve_effective_quality
 from app.data_hub.market_subjects import stock_quote_subject
-from app.domain.quality_subject import EffectiveQualityResult, SubjectRef
-from app.models import MarketDailyBar, MarketQuote
+from app.domain.quality_subject import (
+    EffectiveQualityResult,
+    SubjectRef,
+    canonical_semantic_key,
+)
+from app.models import DataQualityRecord, MarketDailyBar, MarketQuote
 
 
 _QUOTE_TYPES = {
@@ -41,14 +47,158 @@ class CachedSeriesSelection:
     observed_at: datetime | date | None
     executable: bool
     blocking_reason: str | None
+    structure_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _SeriesCandidate:
+    bars: list[MarketDailyBar]
+    quality_record_id: int
+    effective_quality: EffectiveQualityResult
+    observed_at: datetime | date | None
+    source: str | None
+    structure_reason: str | None
 
 
 def _as_datetime(value: datetime | date | None) -> datetime:
     if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
         return value
     if isinstance(value, date):
         return datetime.combine(value, time.min)
     return datetime.min
+
+
+def _series_semantics(subject: SubjectRef) -> tuple[str, str, str]:
+    parts = canonical_semantic_key(subject.semantic_key).split("/")
+    if len(parts) != 3 or not all(parts):
+        raise ValueError("invalid_series_subject_semantic_key")
+    return parts[0], parts[1], parts[2]
+
+
+def validate_series_for_persistence(
+    bars: Iterable[Any],
+    *,
+    subject: SubjectRef,
+    min_rows: int,
+) -> list[Any]:
+    if min_rows < 1:
+        raise ValueError("min_rows_must_be_positive")
+    rows = list(bars)
+    if not rows:
+        raise ValueError("empty_series")
+    if len(rows) < min_rows:
+        raise ValueError("insufficient_rows")
+
+    dates = [getattr(item, "trade_date", None) for item in rows]
+    if any(item is None for item in dates):
+        raise ValueError("missing_trade_date")
+    if len(set(dates)) != len(dates):
+        raise ValueError("duplicate_trade_dates")
+    if dates != sorted(dates):
+        raise ValueError("non_monotonic_trade_dates")
+
+    if len({getattr(item, "source", None) for item in rows}) != 1:
+        raise ValueError("mixed_sources")
+
+    expected_adjustment, expected_price_unit, expected_volume_unit = _series_semantics(
+        subject
+    )
+    dimensions = {
+        (
+            getattr(item, "adjustment", None),
+            getattr(item, "price_unit", None),
+            getattr(item, "volume_unit", None),
+        )
+        for item in rows
+    }
+    if dimensions != {
+        (expected_adjustment, expected_price_unit, expected_volume_unit)
+    }:
+        raise ValueError("mixed_dimensions")
+    if {getattr(item, "symbol", None) for item in rows} != {subject.subject_id}:
+        raise ValueError("subject_mismatch")
+    if any(getattr(item, "observed_at", None) is None for item in rows):
+        raise ValueError("missing_observed_at")
+
+    for item in rows:
+        low = getattr(item, "low", None)
+        high = getattr(item, "high", None)
+        open_price = getattr(item, "open", None)
+        close = getattr(item, "close", None)
+        if (
+            None in {low, high, open_price, close}
+            or low > high
+            or not low <= open_price <= high
+            or not low <= close <= high
+        ):
+            raise ValueError("invalid_ohlc")
+    return rows
+
+
+def _scope_matches(
+    record: DataQualityRecord,
+    *,
+    capability: str,
+    subject: SubjectRef,
+) -> bool:
+    return (
+        record.capability == capability
+        and record.subject_type == subject.subject_type
+        and record.subject_id == subject.subject_id
+        and canonical_semantic_key(record.semantic_key)
+        == canonical_semantic_key(subject.semantic_key)
+    )
+
+
+def _series_structure_reason(
+    record: DataQualityRecord | None,
+    group: list[MarketDailyBar],
+    *,
+    quality_record_id: int,
+    capability: str,
+    subject: SubjectRef,
+    adjustment: str,
+    price_unit: str,
+    volume_unit: str,
+    min_rows: int,
+) -> str | None:
+    if record is None:
+        return "incomplete_lineage"
+    if not record.persisted:
+        return "lineage_not_persisted"
+    if not _scope_matches(record, capability=capability, subject=subject):
+        return "lineage_scope_mismatch"
+    if record.row_count < min_rows or len(group) < min_rows:
+        return "incomplete_lineage"
+    if len(group) != record.row_count:
+        return "row_count_mismatch"
+    if {item.quality_record_id for item in group} != {quality_record_id}:
+        return "incomplete_lineage"
+
+    dates = [item.trade_date for item in group]
+    if len(set(dates)) != len(dates):
+        return "duplicate_trade_dates"
+    if dates != sorted(dates):
+        return "non_monotonic_trade_dates"
+    if len({item.source for item in group}) != 1:
+        return "mixed_sources"
+
+    expected_dimensions = {(adjustment, price_unit, volume_unit)}
+    group_dimensions = {
+        (item.adjustment, item.price_unit, item.volume_unit) for item in group
+    }
+    record_dimensions = {
+        (record.adjustment, record.price_unit, record.volume_unit)
+    }
+    if group_dimensions != expected_dimensions or record_dimensions != expected_dimensions:
+        return "mixed_dimensions"
+
+    observed_at = max(item.observed_at for item in group)
+    if _as_datetime(observed_at) != _as_datetime(record.observed_at):
+        return "observed_at_mismatch"
+    return None
 
 
 def resolve_cached_quote(
@@ -108,7 +258,7 @@ def resolve_cached_series(
     if min_rows < 1:
         raise ValueError("min_rows must be positive")
     with db.no_autoflush:
-        rows = db.scalars(
+        seed_rows = db.scalars(
             select(MarketDailyBar)
             .where(
                 MarketDailyBar.symbol == cache_symbol,
@@ -122,27 +272,51 @@ def resolve_cached_series(
                 MarketDailyBar.id,
             )
         ).all()
+        quality_record_ids = {
+            row.quality_record_id
+            for row in seed_rows
+            if row.quality_record_id is not None
+        }
+        rows = (
+            db.scalars(
+                select(MarketDailyBar)
+                .where(
+                    MarketDailyBar.symbol == cache_symbol,
+                    MarketDailyBar.quality_record_id.in_(quality_record_ids),
+                )
+                .order_by(
+                    MarketDailyBar.quality_record_id,
+                    MarketDailyBar.trade_date,
+                    MarketDailyBar.id,
+                )
+            ).all()
+            if quality_record_ids
+            else []
+        )
+        records = (
+            {
+                record.id: record
+                for record in db.scalars(
+                    select(DataQualityRecord).where(
+                        DataQualityRecord.id.in_(quality_record_ids)
+                    )
+                ).all()
+            }
+            if quality_record_ids
+            else {}
+        )
 
     groups: dict[int, list[MarketDailyBar]] = defaultdict(list)
     for row in rows:
         if row.quality_record_id is not None:
             groups[row.quality_record_id].append(row)
 
-    candidates = []
+    candidates: list[_SeriesCandidate] = []
     for quality_record_id, group in groups.items():
-        dates = [item.trade_date for item in group]
-        if (
-            len(group) < min_rows
-            or len(set(dates)) != len(dates)
-            or dates != sorted(dates)
-            or len({item.source for item in group}) != 1
-            or len({item.adjustment for item in group}) != 1
-            or len({item.price_unit for item in group}) != 1
-            or len({item.volume_unit for item in group}) != 1
-            or {item.quality_record_id for item in group} != {quality_record_id}
-        ):
-            continue
-        observed_at = max(item.observed_at for item in group)
+        observed_at = max(
+            (item.observed_at for item in group),
+            default=None,
+        )
         effective = resolve_effective_quality(
             db,
             capability=capability,
@@ -151,46 +325,88 @@ def resolve_cached_series(
             observed_at=observed_at,
             evaluated_at=evaluated_at,
         )
+        structure_reason = _series_structure_reason(
+            records.get(quality_record_id),
+            group,
+            quality_record_id=quality_record_id,
+            capability=capability,
+            subject=subject,
+            adjustment=adjustment,
+            price_unit=price_unit,
+            volume_unit=volume_unit,
+            min_rows=min_rows,
+        )
         candidates.append(
-            (
-                observed_at,
-                quality_record_id,
-                group,
-                effective,
+            _SeriesCandidate(
+                bars=group,
+                quality_record_id=quality_record_id,
+                effective_quality=effective,
+                observed_at=observed_at,
+                source=group[0].source if group else None,
+                structure_reason=structure_reason,
             )
         )
 
-    executable = [item for item in candidates if item[3].executable]
+    complete = [item for item in candidates if item.structure_reason is None]
+    executable = [item for item in complete if item.effective_quality.executable]
     if executable:
-        observed_at, quality_record_id, group, effective = max(
+        selected = max(
             executable,
-            key=lambda item: (_as_datetime(item[0]), item[1]),
+            key=lambda item: (
+                _as_datetime(item.observed_at),
+                item.quality_record_id,
+            ),
         )
         return CachedSeriesSelection(
-            bars=group,
+            bars=selected.bars,
             subject=subject,
-            quality_record_id=quality_record_id,
-            effective_quality=effective,
-            source=group[0].source,
-            observed_at=observed_at,
+            quality_record_id=selected.quality_record_id,
+            effective_quality=selected.effective_quality,
+            source=selected.source,
+            observed_at=selected.observed_at,
             executable=True,
             blocking_reason=None,
+            structure_reason=None,
         )
 
-    if candidates:
-        observed_at, quality_record_id, group, effective = max(
-            candidates,
-            key=lambda item: (_as_datetime(item[0]), item[1]),
+    if complete:
+        selected = max(
+            complete,
+            key=lambda item: (
+                _as_datetime(item.observed_at),
+                item.quality_record_id,
+            ),
         )
         return CachedSeriesSelection(
             bars=[],
             subject=subject,
-            quality_record_id=quality_record_id,
-            effective_quality=effective,
-            source=group[0].source,
-            observed_at=observed_at,
+            quality_record_id=selected.quality_record_id,
+            effective_quality=selected.effective_quality,
+            source=selected.source,
+            observed_at=selected.observed_at,
             executable=False,
-            blocking_reason=effective.blocking_reason,
+            blocking_reason=selected.effective_quality.blocking_reason,
+            structure_reason=None,
+        )
+
+    if candidates:
+        selected = max(
+            candidates,
+            key=lambda item: (
+                _as_datetime(item.observed_at),
+                item.quality_record_id,
+            ),
+        )
+        return CachedSeriesSelection(
+            bars=[],
+            subject=subject,
+            quality_record_id=selected.quality_record_id,
+            effective_quality=selected.effective_quality,
+            source=selected.source,
+            observed_at=selected.observed_at,
+            executable=False,
+            blocking_reason=selected.structure_reason,
+            structure_reason=selected.structure_reason,
         )
 
     effective = resolve_effective_quality(
@@ -208,6 +424,7 @@ def resolve_cached_series(
         observed_at=None,
         executable=False,
         blocking_reason=effective.blocking_reason,
+        structure_reason="incomplete_lineage" if seed_rows else None,
     )
 
 
@@ -216,4 +433,5 @@ __all__ = [
     "CachedSeriesSelection",
     "resolve_cached_quote",
     "resolve_cached_series",
+    "validate_series_for_persistence",
 ]
