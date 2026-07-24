@@ -12,7 +12,11 @@ from app.data_hub.effective_quality import (
     resolve_effective_quality_batch,
 )
 from app.domain.quality import DataQualityStatus
-from app.domain.quality_subject import EffectiveQualityRequest, SubjectRef
+from app.domain.quality_subject import (
+    EffectiveQualityRequest,
+    SubjectRef,
+    canonical_semantic_key,
+)
 from app.models import DataQualityRecord, DataQualitySubjectHead
 
 
@@ -23,7 +27,10 @@ DAILY_SEMANTIC_KEY = "qfq/CNY/share"
 EVALUATED_AT = datetime(2026, 7, 24, 14, 0)
 
 
-def _stock(symbol: str = "300502", semantic_key: str = QUOTE_SEMANTIC_KEY) -> SubjectRef:
+def _stock(
+    symbol: str = "300502",
+    semantic_key: str | None = QUOTE_SEMANTIC_KEY,
+) -> SubjectRef:
     return SubjectRef(
         subject_type="stock",
         subject_id=symbol,
@@ -97,6 +104,33 @@ def _resolve(
     )
 
 
+def _attempt_resolution(
+    session,
+    *,
+    conflict_observed_at: datetime,
+    resolution_observed_at: datetime,
+):
+    cached = _record(
+        session,
+        observed_at=EVALUATED_AT - timedelta(minutes=10),
+        persisted=True,
+    )
+    conflict = _record(
+        session,
+        observed_at=conflict_observed_at,
+        quality_status="CONFLICTED",
+        normalized_digest="b" * 64,
+    )
+    resolution = _record(
+        session,
+        observed_at=resolution_observed_at,
+        quality_status="VERIFIED",
+        supersedes_record_id=conflict.id,
+        normalized_digest=cached.normalized_digest,
+    )
+    return conflict, resolution, _resolve(session, cached)
+
+
 def test_subject_ref_is_hashable_serializable_and_validated():
     subject = _stock()
     assert hash(subject) == hash(_stock())
@@ -113,6 +147,72 @@ def test_subject_ref_is_hashable_serializable_and_validated():
         SubjectRef(subject_type="stock", subject_id="30050")
     with pytest.raises(ValidationError):
         SubjectRef(subject_type="account", subject_id="1")
+
+
+def test_none_and_empty_semantic_key_share_canonical_scope(session):
+    cached = _record(session, semantic_key=None, persisted=True)
+    conflict = _record(
+        session,
+        semantic_key="",
+        quality_status="CONFLICTED",
+        normalized_digest="b" * 64,
+    )
+
+    result = _resolve(session, cached, subject=_stock(semantic_key=None))
+
+    assert canonical_semantic_key(None) == canonical_semantic_key("")
+    assert result.effective_quality == DataQualityStatus.CONFLICTED
+    assert result.blocking_record_id == conflict.id
+
+
+def test_subject_head_and_record_use_same_semantic_scope(session):
+    cached = _record(session, semantic_key=None, persisted=True)
+    head = DataQualitySubjectHead(
+        capability=QUOTE_CAPABILITY,
+        subject_type="stock",
+        subject_id="300502",
+        semantic_key="",
+        current_record_id=cached.id,
+        generation=1,
+    )
+    session.add(head)
+    session.commit()
+
+    assert canonical_semantic_key(cached.semantic_key) == canonical_semantic_key(
+        head.semantic_key
+    )
+    result = _resolve(session, cached, subject=_stock(semantic_key=None))
+    assert result.effective_quality == DataQualityStatus.SINGLE_SOURCE
+
+
+def test_semantic_key_whitespace_is_canonicalized(session):
+    cached = _record(session, semantic_key=" \t ", persisted=True)
+    subject = _stock(semantic_key="  ")
+
+    result = _resolve(session, cached, subject=subject)
+
+    assert subject.semantic_key is None
+    assert canonical_semantic_key(cached.semantic_key) == ""
+    assert result.effective_quality == DataQualityStatus.SINGLE_SOURCE
+
+
+def test_nonempty_semantic_keys_remain_isolated(session):
+    cached = _record(session, semantic_key=" realtime/CNY ", persisted=True)
+    _record(
+        session,
+        semantic_key="latest_close/CNY",
+        quality_status="CONFLICTED",
+        normalized_digest="b" * 64,
+    )
+
+    result = _resolve(
+        session,
+        cached,
+        subject=_stock(semantic_key="realtime/CNY"),
+    )
+
+    assert result.effective_quality == DataQualityStatus.SINGLE_SOURCE
+    assert result.executable is True
 
 
 def test_legacy_unlinked_cache_is_missing(session):
@@ -331,6 +431,89 @@ def test_verified_explicit_supersession_resolves_conflict(session):
     assert resolution.id in result.source_quality_record_ids
 
 
+def test_stale_verified_supersession_does_not_resolve_conflict(session):
+    conflict, _, result = _attempt_resolution(
+        session,
+        conflict_observed_at=EVALUATED_AT - timedelta(minutes=40),
+        resolution_observed_at=EVALUATED_AT - timedelta(minutes=31),
+    )
+
+    assert result.effective_quality == DataQualityStatus.CONFLICTED
+    assert result.blocking_record_id == conflict.id
+    assert result.executable is False
+
+
+def test_future_verified_supersession_does_not_resolve_conflict(session):
+    conflict, _, result = _attempt_resolution(
+        session,
+        conflict_observed_at=EVALUATED_AT - timedelta(minutes=2),
+        resolution_observed_at=EVALUATED_AT + timedelta(minutes=1),
+    )
+
+    assert result.effective_quality == DataQualityStatus.CONFLICTED
+    assert result.blocking_record_id == conflict.id
+    assert result.executable is False
+
+
+def test_fresh_verified_supersession_can_resolve_conflict(session):
+    _, resolution, result = _attempt_resolution(
+        session,
+        conflict_observed_at=EVALUATED_AT - timedelta(minutes=2),
+        resolution_observed_at=EVALUATED_AT - timedelta(minutes=1),
+    )
+
+    assert result.effective_quality == DataQualityStatus.SINGLE_SOURCE
+    assert result.blocking_record_id is None
+    assert result.executable is True
+    assert resolution.id in result.source_quality_record_ids
+
+
+def test_resolution_observed_before_conflict_does_not_resolve(session):
+    conflict, _, result = _attempt_resolution(
+        session,
+        conflict_observed_at=EVALUATED_AT - timedelta(minutes=2),
+        resolution_observed_at=EVALUATED_AT - timedelta(minutes=3),
+    )
+
+    assert result.effective_quality == DataQualityStatus.CONFLICTED
+    assert result.blocking_record_id == conflict.id
+
+
+def test_resolution_observed_equal_to_conflict_can_resolve(session):
+    observed_at = EVALUATED_AT - timedelta(minutes=2)
+    _, _, result = _attempt_resolution(
+        session,
+        conflict_observed_at=observed_at,
+        resolution_observed_at=observed_at,
+    )
+
+    assert result.effective_quality == DataQualityStatus.SINGLE_SOURCE
+    assert result.executable is True
+
+
+def test_resolution_observed_after_conflict_can_resolve(session):
+    _, _, result = _attempt_resolution(
+        session,
+        conflict_observed_at=EVALUATED_AT - timedelta(minutes=2),
+        resolution_observed_at=EVALUATED_AT - timedelta(minutes=1),
+    )
+
+    assert result.effective_quality == DataQualityStatus.SINGLE_SOURCE
+    assert result.executable is True
+
+
+def test_later_record_id_with_older_business_time_does_not_resolve(session):
+    conflict, resolution, result = _attempt_resolution(
+        session,
+        conflict_observed_at=EVALUATED_AT - timedelta(minutes=5),
+        resolution_observed_at=EVALUATED_AT - timedelta(minutes=6),
+    )
+
+    assert resolution.id > conflict.id
+    assert result.effective_quality == DataQualityStatus.CONFLICTED
+    assert result.blocking_record_id == conflict.id
+
+
 def test_resolved_conflict_does_not_pin_later_business_value(session):
     cached = _record(
         session,
@@ -441,7 +624,78 @@ def test_resolution_with_different_digest_requires_refresh(session):
     assert result.requires_refresh is True
 
 
-def test_batch_and_single_resolver_are_identical(session):
+def test_batch_exact_duplicate_request_is_deterministic(session):
+    record = _record(session, persisted=True)
+    request = EffectiveQualityRequest(
+        capability=QUOTE_CAPABILITY,
+        subject=_stock(),
+        persisted_quality_record_id=record.id,
+        observed_at=record.observed_at,
+        cached_at=record.cached_at,
+    )
+
+    batch = resolve_effective_quality_batch(
+        session,
+        [request, request],
+        evaluated_at=EVALUATED_AT,
+    )
+    single = EffectiveQualityResolver(session).resolve(
+        request,
+        evaluated_at=EVALUATED_AT,
+    )
+
+    assert batch == {request.key: single}
+
+
+def test_batch_duplicate_key_with_different_observed_at_is_rejected(session):
+    record = _record(session, persisted=True)
+    request = EffectiveQualityRequest(
+        capability=QUOTE_CAPABILITY,
+        subject=_stock(),
+        persisted_quality_record_id=record.id,
+        observed_at=record.observed_at,
+        cached_at=record.cached_at,
+    )
+    conflicting = request.model_copy(
+        update={"observed_at": record.observed_at - timedelta(seconds=1)}
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="duplicate_quality_key_with_conflicting_context",
+    ):
+        resolve_effective_quality_batch(
+            session,
+            [request, conflicting],
+            evaluated_at=EVALUATED_AT,
+        )
+
+
+def test_batch_duplicate_key_with_different_cached_context_is_rejected(session):
+    record = _record(session, persisted=True)
+    request = EffectiveQualityRequest(
+        capability=QUOTE_CAPABILITY,
+        subject=_stock(),
+        persisted_quality_record_id=record.id,
+        observed_at=record.observed_at,
+        cached_at=record.cached_at,
+    )
+    conflicting = request.model_copy(
+        update={"cached_at": record.cached_at + timedelta(seconds=1)}
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="duplicate_quality_key_with_conflicting_context",
+    ):
+        resolve_effective_quality_batch(
+            session,
+            [request, conflicting],
+            evaluated_at=EVALUATED_AT,
+        )
+
+
+def test_batch_unique_requests_match_single_resolver(session):
     first = _record(session, persisted=True)
     second = _record(
         session,

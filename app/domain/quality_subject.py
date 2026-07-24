@@ -9,7 +9,11 @@ from app.domain.quality import DataQualityStatus
 
 
 SubjectType = Literal["stock", "index", "sector"]
-QualityKey = tuple[str, SubjectType, str, str | None, int | None]
+QualityKey = tuple[str, SubjectType, str, str, int | None]
+
+
+def canonical_semantic_key(value: str | None) -> str:
+    return "" if value is None else value.strip()
 
 
 class SubjectRef(BaseModel):
@@ -31,7 +35,7 @@ class SubjectRef(BaseModel):
     def normalize_semantic_key(cls, value):
         if value is None or not isinstance(value, str):
             return value
-        normalized = value.strip()
+        normalized = canonical_semantic_key(value)
         return normalized or None
 
     @model_validator(mode="after")
@@ -68,7 +72,7 @@ class EffectiveQualityRequest(BaseModel):
             self.capability,
             self.subject.subject_type,
             self.subject.subject_id,
-            self.subject.semantic_key,
+            canonical_semantic_key(self.subject.semantic_key),
             self.persisted_quality_record_id,
         )
 
@@ -99,4 +103,5 @@ __all__ = [
     "QualityKey",
     "SubjectRef",
     "SubjectType",
+    "canonical_semantic_key",
 ]

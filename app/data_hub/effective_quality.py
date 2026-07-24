@@ -4,7 +4,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from datetime import date, datetime, time, timedelta, timezone
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.data_hub.quality import observation_is_stale, policy_for
@@ -15,6 +15,7 @@ from app.domain.quality_subject import (
     EffectiveQualityResult,
     QualityKey,
     SubjectRef,
+    canonical_semantic_key,
 )
 from app.models import DataQualityRecord
 
@@ -22,7 +23,7 @@ from app.models import DataQualityRecord
 MAX_FUTURE_CLOCK_SKEW = timedelta(minutes=5)
 _TRUSTED = {DataQualityStatus.VERIFIED, DataQualityStatus.SINGLE_SOURCE}
 _QUERY_SCOPE_CHUNK = 100
-_ScopeKey = tuple[str, str, str, str | None]
+_ScopeKey = tuple[str, str, str, str]
 
 
 def _quality(value: str | None) -> DataQualityStatus | None:
@@ -37,7 +38,7 @@ def _scope_key(capability: str, subject: SubjectRef) -> _ScopeKey:
         capability,
         subject.subject_type,
         subject.subject_id,
-        subject.semantic_key,
+        canonical_semantic_key(subject.semantic_key),
     )
 
 
@@ -46,7 +47,7 @@ def _record_scope(record: DataQualityRecord) -> _ScopeKey:
         record.capability,
         record.subject_type or "",
         record.subject_id or "",
-        record.semantic_key,
+        canonical_semantic_key(record.semantic_key),
     )
 
 
@@ -94,6 +95,19 @@ def _resolution_applies_to_observation(
         resolution_observed_at,
         evaluated_at,
     ) >= _comparable_datetime(cached_observed_at, evaluated_at)
+
+
+def _resolution_business_time_is_valid(
+    resolution_observed_at: datetime | date | None,
+    conflict_observed_at: datetime | date | None,
+    evaluated_at: datetime,
+) -> bool:
+    if resolution_observed_at is None or conflict_observed_at is None:
+        return False
+    resolution_dt = _comparable_datetime(resolution_observed_at, evaluated_at)
+    conflict_dt = _comparable_datetime(conflict_observed_at, evaluated_at)
+    evaluated_dt = _comparable_datetime(evaluated_at, evaluated_at)
+    return conflict_dt <= resolution_dt <= evaluated_dt
 
 
 def _freshness_quality(
@@ -180,9 +194,17 @@ class EffectiveQualityResolver:
         if not requests:
             return {}
 
+        unique_requests: dict[QualityKey, EffectiveQualityRequest] = {}
+        for request in requests:
+            existing = unique_requests.get(request.key)
+            if existing is not None and existing != request:
+                raise ValueError("duplicate_quality_key_with_conflicting_context")
+            unique_requests[request.key] = request
+        resolved_requests = list(unique_requests.values())
+
         record_ids = {
             request.persisted_quality_record_id
-            for request in requests
+            for request in resolved_requests
             if request.persisted_quality_record_id is not None
         }
         with self.db.no_autoflush:
@@ -194,7 +216,7 @@ class EffectiveQualityResolver:
             } if record_ids else {}
 
             scopes: set[_ScopeKey] = set()
-            for request in requests:
+            for request in resolved_requests:
                 record = base_records.get(request.persisted_quality_record_id)
                 if record is None or not _scope_matches(
                     record,
@@ -210,10 +232,16 @@ class EffectiveQualityResolver:
                 conditions = []
                 for scope in scope_items[offset : offset + _QUERY_SCOPE_CHUNK]:
                     capability, subject_type, subject_id, semantic_key = scope
+                    trimmed_semantic_key = func.trim(
+                        DataQualityRecord.semantic_key
+                    )
                     semantic_condition = (
-                        DataQualityRecord.semantic_key.is_(None)
-                        if semantic_key is None
-                        else DataQualityRecord.semantic_key == semantic_key
+                        or_(
+                            DataQualityRecord.semantic_key.is_(None),
+                            trimmed_semantic_key == "",
+                        )
+                        if semantic_key == ""
+                        else trimmed_semantic_key == semantic_key
                     )
                     conditions.append(
                         and_(
@@ -234,7 +262,7 @@ class EffectiveQualityResolver:
                     scoped_records[_record_scope(record)].append(record)
 
         results = {}
-        for request in requests:
+        for request in resolved_requests:
             record = base_records.get(request.persisted_quality_record_id)
             scope = _scope_key(request.capability, request.subject)
             results[request.key] = self._resolve_loaded(
@@ -357,7 +385,12 @@ class EffectiveQualityResolver:
                 if (
                     candidate.id > conflict.id
                     and candidate_quality in allowed
-                    and candidate_freshness != DataQualityStatus.MISSING
+                    and candidate_freshness == DataQualityStatus.VERIFIED
+                    and _resolution_business_time_is_valid(
+                        candidate.observed_at,
+                        conflict.observed_at,
+                        evaluated_at,
+                    )
                     and candidate.trusted
                 ):
                     accepted.append(candidate)
