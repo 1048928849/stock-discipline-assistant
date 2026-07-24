@@ -70,6 +70,20 @@ def test_manual_plan_is_explicitly_marked_manual_draft(client):
     assert plan["execution_status"] == "draft"
 
 
+def test_manual_plan_exposes_calculated_gate_status(client):
+    account = client.post("/api/v1/accounts", json=account_payload()).json()
+    plan = client.post("/api/v1/trade-plans", json=ready_plan(account["id"])).json()
+    assert plan["calculated_gate_status"] == "READY"
+    assert plan["execution_summary"]["calculated_gate_status"] == "READY"
+
+
+def test_manual_plan_formal_status_always_draft(client):
+    account = client.post("/api/v1/accounts", json=account_payload()).json()
+    plan = client.post("/api/v1/trade-plans", json=ready_plan(account["id"])).json()
+    assert plan["formal_plan_status"] == "DRAFT"
+    assert plan["status"] == "DRAFT"
+
+
 def test_trade_plan_calculates_a_share_lots_and_seven_gates(client):
     account = client.post("/api/v1/accounts", json=account_payload()).json()
     response = client.post("/api/v1/trade-plans", json=ready_plan(account["id"]))
@@ -180,8 +194,6 @@ def test_market_sync_explicitly_returns_last_successful_cache(client, session, m
 
     monkeypatch.setattr(AKShareProvider, "get_quote", unavailable)
     monkeypatch.setattr(AKShareProvider, "get_history", unavailable)
-    result = client.post("/api/v1/market/sync?symbol=300502&days=365").json()
-    assert result["status"] == "stale_fallback"
-    assert result["quote"]["status"] == "stale"
-    assert result["quote"]["price"] == "99.5000"
-    assert "请勿视为当前成交价" in result["message"]
+    response = client.post("/api/v1/market/sync?symbol=300502&days=365")
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MARKET_DATA_MISSING"

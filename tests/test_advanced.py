@@ -243,11 +243,8 @@ def test_market_sync_uses_latest_history_when_all_quotes_fail(client, monkeypatc
         ],
     )
     response = client.post("/api/v1/market/sync?symbol=300502&days=365")
-    assert response.status_code == 200, response.text
-    result = response.json()
-    assert result["fallback_used"] is True
-    assert result["quote"]["price"] == "551.77"
-    assert result["history_source"] == "akshare_tencent_qfq"
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "MARKET_DATA_MISSING"
 
 
 def test_x_cookie_missing_is_safe():

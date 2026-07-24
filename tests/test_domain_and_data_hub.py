@@ -130,10 +130,10 @@ def _decision_package(**overrides) -> DecisionPackage:
         "package_hash": "0" * 64,
     }
     values.update(overrides)
-    package = DecisionPackage(**values)
-    payload = package.model_dump(mode="json")
-    payload["evidence_digest"] = package.evidence_digest_value()
-    package = DecisionPackage.model_validate(payload)
+    package = DecisionPackage.model_construct(**values)
+    package = package.model_copy(
+        update={"evidence_digest": package.evidence_digest_value()}
+    )
     payload = package.model_dump(mode="json")
     payload["package_hash"] = package.package_hash_value()
     return DecisionPackage.model_validate(payload)
@@ -254,7 +254,6 @@ def test_decision_package_recomputes_quality_from_evidence():
     payload = package.model_dump(mode="json")
     payload["quality_status"] = "VERIFIED"
     payload["market_snapshot"]["quality_status"] = "VERIFIED"
-    payload["package_hash"] = "0" * 64
     with pytest.raises(ValidationError, match="required Evidence"):
         DecisionPackage.model_validate(payload)
 

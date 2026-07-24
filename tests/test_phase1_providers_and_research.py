@@ -18,12 +18,15 @@ from app.services.data_sources import UnifiedDataService
 
 def _statements():
     balance, income, cash = [], [], []
+    current_quarter = (date.today().month - 1) // 3 + 1
+    completed = date.today().year * 4 + current_quarter - 2
     for index in range(12):
-        year = 2023 + index // 4
-        month = (3, 6, 9, 12)[index % 4]
+        quarter_number = completed - 11 + index
+        year, quarter_index = divmod(quarter_number, 4)
+        month = (3, 6, 9, 12)[quarter_index]
         day = 31 if month in (3, 12) else 30
         report = date(year, month, day).strftime("%Y%m%d")
-        quarter = index % 4 + 1
+        quarter = quarter_index + 1
         balance.append(
             {
                 "报告日": report,
@@ -131,7 +134,8 @@ def test_tushare_unconfigured_is_registered_and_safely_skipped():
     assert provider.health_check()["status"] == "not_configured"
     registry = ProviderRegistry()
     registry.register(provider)
-    assert registry.providers_for("market.daily")[0].provider_id == "tushare"
+    assert registry.providers_for("market.daily.unadjusted")[0].provider_id == "tushare"
+    assert registry.providers_for("market.daily.qfq") == []
 
 
 def test_optional_paid_provider_credentials_are_detected_without_network_calls():

@@ -32,6 +32,7 @@ def test_initial_schema_contains_required_tables(session):
         "trade_plan_ai_analyses",
         "plan_analysis_runs",
         "data_provider_call_logs",
+        "data_quality_records",
         "company_research_refreshes",
         "plan_execution_events",
         "plan_execution_fills",

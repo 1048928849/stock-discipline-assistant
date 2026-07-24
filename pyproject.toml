@@ -42,6 +42,9 @@ include = ["app*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+  "mysql_integration: requires MYSQL_TEST_DATABASE_URL and an isolated MySQL 8 database",
+]
 
 [tool.ruff]
 line-length = 100

@@ -1,17 +1,28 @@
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from threading import Barrier, Lock, Thread
 
 import pytest
+from sqlalchemy import create_engine, insert, inspect
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import sessionmaker
 
+from app.database import Base
+from app.errors import AppError
 from app.models import (
     CompanyAnnouncement,
     CompanyProfile,
+    CompanyResearchRefresh,
     MarketDailyBar,
     MarketQuote,
     PlanAnalysisRun,
     TradePlan,
 )
-from app.schemas_workflow import TradePlanPreviewRequest
+from app.schemas_workflow import OneClickPlanRequest, TradePlanPreviewRequest
+from app.services.one_click_pipeline import (
+    confirm_one_click_plan,
+    run_one_click_analysis,
+)
 from app.services.trade_plan_generator import generate_trade_plan_preview
 
 
@@ -104,6 +115,31 @@ def seed_profile(session):
             source_document_url=None,
             raw_data={},
             fetched_at=datetime.now(),
+        )
+    )
+    now = datetime.now()
+    session.add(
+        CompanyResearchRefresh(
+            symbol="300502",
+            section="announcements",
+            status="success",
+            provider_id="exchange_test",
+            source_name="exchange_test",
+            row_count=1,
+            cache_used=False,
+            last_attempt_at=now,
+            last_success_at=now,
+            data_date=date.today(),
+            stale_after=now + timedelta(hours=24),
+            quality_status="SINGLE_SOURCE",
+            observed_at=now,
+            fetched_at=now,
+            checked_at=now,
+            scan_start=now,
+            scan_end=now,
+            normalized_digest="a" * 64,
+            provider_observations=[],
+            conflict_fields=[],
         )
     )
     session.commit()
@@ -439,8 +475,10 @@ def test_confirm_rejects_required_source_change(client, session, monkeypatch):
             "enable_ai": False,
         },
     ).json()
-    announcement = session.query(CompanyAnnouncement).one()
-    announcement.fetched_at = datetime.now() + timedelta(seconds=1)
+    announcement_scan = session.query(CompanyResearchRefresh).filter_by(
+        section="announcements"
+    ).one()
+    announcement_scan.checked_at = datetime.now() + timedelta(seconds=1)
     session.commit()
     confirmed = client.post(
         f"/api/v1/trade-plan-generator/analyze/{analyzed['run_id']}/confirm"
@@ -498,6 +536,7 @@ def test_required_announcements_missing_blocks_freeze(client, session, monkeypat
     seed_pattern(session)
     seed_profile(session)
     session.query(CompanyAnnouncement).delete()
+    session.query(CompanyResearchRefresh).filter_by(section="announcements").delete()
     session.commit()
     patch_benchmarks(monkeypatch)
     data = client.post(
@@ -535,6 +574,269 @@ def test_optional_financials_missing_does_not_change_rule_status(
     assert package["strategy_decision"]["rule_status"] == "READY"
     assert package["freeze_allowed"] is True
     assert "financials" in package["research_decision"]["missing_optional_evidence"]
+
+
+def _holding_analysis_with_quote_quality(
+    client, session, monkeypatch, quality_status: str | None, quote_type="realtime"
+):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    patch_benchmarks(monkeypatch)
+    quote = session.query(MarketQuote).one()
+    if quality_status is None:
+        session.delete(quote)
+    else:
+        quote.quality_status = quality_status
+        quote.quote_type = quote_type
+    session.commit()
+    return client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "持仓",
+            "account_id": account["id"],
+            "holding_quantity": 1000,
+            "holding_cost_price": "9.8",
+            "enable_ai": False,
+        },
+    ).json()
+
+
+def test_stale_quote_blocks_holding_decision(client, session, monkeypatch):
+    data = _holding_analysis_with_quote_quality(
+        client, session, monkeypatch, "STALE"
+    )
+    assert data["decision"]["status"] == "WAIT"
+    assert data["decision_package"]["freeze_allowed"] is False
+
+
+def test_conflicted_quote_blocks_holding_decision(client, session, monkeypatch):
+    data = _holding_analysis_with_quote_quality(
+        client, session, monkeypatch, "CONFLICTED"
+    )
+    assert data["decision"]["status"] == "WAIT"
+
+
+def test_missing_quote_blocks_price_triggered_decision(client, session, monkeypatch):
+    data = _holding_analysis_with_quote_quality(client, session, monkeypatch, None)
+    assert data["decision"]["status"] == "WAIT"
+
+
+def test_quote_fallback_close_is_not_treated_as_realtime(
+    client, session, monkeypatch
+):
+    data = _holding_analysis_with_quote_quality(
+        client, session, monkeypatch, "SINGLE_SOURCE", quote_type="latest_close"
+    )
+    evidence = next(
+        item
+        for item in data["decision_package"]["evidence"]
+        if item["capability"] == "market_quote"
+    )
+    assert evidence["payload"]["quote_type"] == "latest_close"
+    assert evidence["payload"]["fallback_used"] is True
+
+
+def test_fresh_daily_bar_does_not_hide_stale_quote(client, session, monkeypatch):
+    data = _holding_analysis_with_quote_quality(
+        client, session, monkeypatch, "STALE"
+    )
+    qualities = {
+        item["capability"]: item["quality_status"]
+        for item in data["decision_package"]["evidence"]
+    }
+    assert qualities["stock_daily_bars"] == "SINGLE_SOURCE"
+    assert qualities["market_quote"] == "STALE"
+
+
+def test_market_quote_is_required_evidence(client, session, monkeypatch):
+    data = _holding_analysis_with_quote_quality(
+        client, session, monkeypatch, "SINGLE_SOURCE"
+    )
+    package = data["decision_package"]
+    assert "market_quote" in package["required_capabilities"]
+    assert any(
+        item["capability"] == "market_quote" and item["required"]
+        for item in package["evidence"]
+    )
+
+
+def test_old_latest_announcement_with_fresh_catalog_scan_can_confirm(
+    client, session, monkeypatch
+):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    patch_benchmarks(monkeypatch)
+    session.query(CompanyAnnouncement).one().published_date = date.today() - timedelta(
+        days=30
+    )
+    session.commit()
+    analyzed = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    ).json()
+    confirmed = client.post(
+        f"/api/v1/trade-plan-generator/analyze/{analyzed['run_id']}/confirm"
+    )
+    assert confirmed.status_code == 201, confirmed.text
+
+
+def test_stale_announcement_catalog_blocks_confirm(client, session, monkeypatch):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    patch_benchmarks(monkeypatch)
+    scan = session.query(CompanyResearchRefresh).filter_by(
+        section="announcements"
+    ).one()
+    scan.checked_at = datetime.now() - timedelta(days=2)
+    scan.quality_status = "STALE"
+    session.commit()
+    analyzed = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    ).json()
+    confirmed = client.post(
+        f"/api/v1/trade-plan-generator/analyze/{analyzed['run_id']}/confirm"
+    )
+    assert confirmed.status_code == 422
+
+
+def test_announcement_published_date_does_not_control_catalog_freshness(
+    client, session, monkeypatch
+):
+    test_old_latest_announcement_with_fresh_catalog_scan_can_confirm(
+        client, session, monkeypatch
+    )
+
+
+def _concurrent_database(tmp_path, monkeypatch, run_count=1):
+    database = tmp_path / f"confirm-{run_count}.db"
+    engine = create_engine(
+        f"sqlite:///{database}",
+        connect_args={"check_same_thread": False, "timeout": 15},
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+    patch_benchmarks(monkeypatch)
+    with SessionLocal() as db:
+        seed_pattern(db)
+        seed_profile(db)
+        first = run_one_click_analysis(
+            db,
+            OneClickPlanRequest(
+                symbol="300502",
+                position_mode="空仓",
+                enable_ai=False,
+            ),
+        )
+        run_ids = [first["run_id"]]
+        for _ in range(run_count - 1):
+            run_ids.append(
+                run_one_click_analysis(
+                    db,
+                    OneClickPlanRequest(
+                        symbol="300502",
+                        position_mode="空仓",
+                        account_id=first["account"]["id"],
+                        enable_ai=False,
+                    ),
+                )["run_id"]
+            )
+    return engine, SessionLocal, run_ids
+
+
+def _confirm_concurrently(SessionLocal, run_ids):
+    barrier = Barrier(len(run_ids))
+    lock = Lock()
+    results = []
+
+    def worker(run_id):
+        with SessionLocal() as db:
+            try:
+                barrier.wait()
+                saved = confirm_one_click_plan(db, run_id)
+                outcome = ("ok", saved["id"], saved["plan_version"])
+            except AppError as exc:
+                outcome = ("error", exc.code)
+            with lock:
+                results.append(outcome)
+
+    threads = [Thread(target=worker, args=(run_id,)) for run_id in run_ids]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+        assert not thread.is_alive()
+    return results
+
+
+def test_concurrent_confirm_sqlite_creates_exactly_one_plan(tmp_path, monkeypatch):
+    _, SessionLocal, run_ids = _concurrent_database(tmp_path, monkeypatch)
+    results = _confirm_concurrently(SessionLocal, [run_ids[0], run_ids[0]])
+    assert [item[0] for item in results].count("ok") == 1
+    assert ("error", "ANALYSIS_ALREADY_CONFIRMED") in results
+    with SessionLocal() as db:
+        assert db.query(TradePlan).count() == 1
+
+
+def test_concurrent_confirm_two_sessions_is_idempotent(tmp_path, monkeypatch):
+    test_concurrent_confirm_sqlite_creates_exactly_one_plan(tmp_path, monkeypatch)
+
+
+def test_concurrent_plan_version_allocation_is_unique(tmp_path, monkeypatch):
+    _, SessionLocal, run_ids = _concurrent_database(tmp_path, monkeypatch, run_count=2)
+    results = _confirm_concurrently(SessionLocal, run_ids)
+    assert all(item[0] == "ok" for item in results)
+    assert {item[2] for item in results} == {1, 2}
+
+
+def test_analysis_run_id_database_uniqueness(tmp_path, monkeypatch):
+    engine, SessionLocal, run_ids = _concurrent_database(tmp_path, monkeypatch)
+    with SessionLocal() as db:
+        confirm_one_click_plan(db, run_ids[0])
+        plan = db.query(TradePlan).one()
+        values = {
+            column.name: getattr(plan, column.name)
+            for column in TradePlan.__table__.columns
+            if column.name not in {"id", "created_at", "updated_at"}
+        }
+        values["plan_version"] += 1
+        with pytest.raises(IntegrityError):
+            db.execute(insert(TradePlan).values(**values))
+            db.commit()
+    names = {item["name"] for item in inspect(engine).get_unique_constraints("trade_plans")}
+    assert "uq_trade_plan_analysis_run" in names
+
+
+def test_plan_version_database_uniqueness(tmp_path, monkeypatch):
+    engine, SessionLocal, run_ids = _concurrent_database(tmp_path, monkeypatch)
+    with SessionLocal() as db:
+        confirm_one_click_plan(db, run_ids[0])
+        plan = db.query(TradePlan).one()
+        values = {
+            column.name: getattr(plan, column.name)
+            for column in TradePlan.__table__.columns
+            if column.name not in {"id", "created_at", "updated_at"}
+        }
+        values["analysis_run_id"] = None
+        with pytest.raises(IntegrityError):
+            db.execute(insert(TradePlan).values(**values))
+            db.commit()
+    names = {item["name"] for item in inspect(engine).get_unique_constraints("trade_plans")}
+    assert "uq_trade_plan_account_symbol_version" in names
 
 
 def test_optional_financials_missing_reduces_research_completeness(
@@ -580,8 +882,11 @@ def test_stale_required_evidence_blocks_freeze(client, session, monkeypatch):
     account = create_account(client, assets="300000", cash="300000")
     seed_pattern(session)
     seed_profile(session)
-    announcement = session.query(CompanyAnnouncement).one()
-    announcement.fetched_at = datetime.now() - timedelta(days=2)
+    announcement_scan = session.query(CompanyResearchRefresh).filter_by(
+        section="announcements"
+    ).one()
+    announcement_scan.checked_at = datetime.now() - timedelta(days=2)
+    announcement_scan.quality_status = "STALE"
     session.commit()
     patch_benchmarks(monkeypatch)
     package = client.post(

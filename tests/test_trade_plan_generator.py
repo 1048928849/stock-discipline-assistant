@@ -4,7 +4,13 @@ from decimal import Decimal
 import pytest
 
 from app.config import Settings
-from app.models import CompanyAnnouncement, CompanyProfile, MarketDailyBar, MarketQuote
+from app.models import (
+    CompanyAnnouncement,
+    CompanyProfile,
+    CompanyResearchRefresh,
+    MarketDailyBar,
+    MarketQuote,
+)
 from app.providers.llm_provider import OpenAICompatibleProvider
 from app.services.trade_plan_ai import validate_ai_output
 from app.services.trade_plan_generator import _floor_lot, ensure_generator_rule_version
@@ -91,6 +97,7 @@ def payload(account_id, symbol="300502", **changes):
 
 
 def seed_governed_analysis(session, monkeypatch):
+    now = datetime.now()
     session.add(
         CompanyProfile(
             symbol="300502",
@@ -119,6 +126,30 @@ def seed_governed_analysis(session, monkeypatch):
             source_document_url=None,
             raw_data={},
             fetched_at=datetime.now(),
+        )
+    )
+    session.add(
+        CompanyResearchRefresh(
+            symbol="300502",
+            section="announcements",
+            status="success",
+            provider_id="exchange_test",
+            source_name="exchange_test",
+            row_count=1,
+            cache_used=False,
+            last_attempt_at=now,
+            last_success_at=now,
+            data_date=date.today(),
+            stale_after=now + timedelta(hours=24),
+            quality_status="SINGLE_SOURCE",
+            observed_at=now,
+            fetched_at=now,
+            checked_at=now,
+            scan_start=now,
+            scan_end=now,
+            normalized_digest="a" * 64,
+            provider_observations=[],
+            conflict_fields=[],
         )
     )
     session.commit()
