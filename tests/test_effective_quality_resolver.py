@@ -4,7 +4,8 @@ from datetime import datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 
 from app.data_hub.effective_quality import (
     EffectiveQualityResolver,
@@ -83,6 +84,22 @@ def _record(
     session.add(record)
     session.commit()
     return record
+
+
+def _set_raw_semantic_key(
+    session,
+    record: DataQualityRecord,
+    semantic_key: str | None,
+) -> None:
+    record_id = record.id
+    session.execute(
+        update(DataQualityRecord)
+        .where(DataQualityRecord.id == record_id)
+        .values(semantic_key=semantic_key)
+        .execution_options(synchronize_session=False)
+    )
+    session.commit()
+    session.expire_all()
 
 
 def _resolve(
@@ -213,6 +230,246 @@ def test_nonempty_semantic_keys_remain_isolated(session):
 
     assert result.effective_quality == DataQualityStatus.SINGLE_SOURCE
     assert result.executable is True
+
+
+def test_tab_only_conflict_blocks_none_semantic_cache(session):
+    cached = _record(session, semantic_key=None, persisted=True)
+    _set_raw_semantic_key(session, cached, None)
+    conflict = _record(
+        session,
+        semantic_key="placeholder",
+        quality_status="CONFLICTED",
+        normalized_digest="b" * 64,
+    )
+    _set_raw_semantic_key(session, conflict, "\t")
+
+    result = _resolve(session, cached, subject=_stock(semantic_key=None))
+
+    assert result.effective_quality == DataQualityStatus.CONFLICTED
+    assert result.blocking_record_id == conflict.id
+    assert result.executable is False
+
+
+def test_newline_only_conflict_blocks_empty_semantic_cache(session):
+    cached = _record(session, semantic_key="", persisted=True)
+    _set_raw_semantic_key(session, cached, "")
+    conflict = _record(
+        session,
+        semantic_key="placeholder",
+        quality_status="CONFLICTED",
+        normalized_digest="b" * 64,
+    )
+    _set_raw_semantic_key(session, conflict, "\n")
+
+    result = _resolve(session, cached, subject=_stock(semantic_key=""))
+
+    assert result.effective_quality == DataQualityStatus.CONFLICTED
+    assert result.blocking_record_id == conflict.id
+    assert result.executable is False
+
+
+def test_mixed_whitespace_conflict_blocks_canonical_scope(session):
+    cached = _record(session, semantic_key=None, persisted=True)
+    _set_raw_semantic_key(session, cached, None)
+    conflict = _record(
+        session,
+        semantic_key="placeholder",
+        quality_status="CONFLICTED",
+        normalized_digest="b" * 64,
+    )
+    _set_raw_semantic_key(session, conflict, " \t\r\n ")
+
+    result = _resolve(session, cached, subject=_stock(semantic_key=" "))
+
+    assert result.effective_quality == DataQualityStatus.CONFLICTED
+    assert result.blocking_record_id == conflict.id
+    assert result.executable is False
+
+
+def test_nonempty_semantic_key_with_tab_padding_matches(session):
+    cached = _record(
+        session,
+        semantic_key="realtime/CNY",
+        persisted=True,
+    )
+    conflict = _record(
+        session,
+        semantic_key="placeholder",
+        quality_status="CONFLICTED",
+        normalized_digest="b" * 64,
+    )
+    _set_raw_semantic_key(session, conflict, "\trealtime/CNY\n")
+
+    result = _resolve(
+        session,
+        cached,
+        subject=_stock(semantic_key="  realtime/CNY  "),
+    )
+
+    assert result.effective_quality == DataQualityStatus.CONFLICTED
+    assert result.blocking_record_id == conflict.id
+    assert result.executable is False
+
+
+def test_different_nonempty_semantic_key_remains_isolated(session):
+    cached = _record(
+        session,
+        semantic_key="realtime/CNY",
+        persisted=True,
+    )
+    conflict = _record(
+        session,
+        semantic_key="placeholder",
+        quality_status="CONFLICTED",
+        normalized_digest="b" * 64,
+    )
+    _set_raw_semantic_key(session, conflict, "\tlatest_close/CNY\n")
+
+    result = _resolve(
+        session,
+        cached,
+        subject=_stock(semantic_key="realtime/CNY"),
+    )
+
+    assert result.effective_quality == DataQualityStatus.SINGLE_SOURCE
+    assert result.blocking_record_id is None
+    assert result.executable is True
+
+
+def test_subject_head_write_normalizes_none_to_empty(session):
+    record = _record(session, persisted=True)
+    head = DataQualitySubjectHead(
+        capability=QUOTE_CAPABILITY,
+        subject_type="stock",
+        subject_id="300502",
+        semantic_key=None,
+        current_record_id=record.id,
+        generation=1,
+    )
+    session.add(head)
+    session.flush()
+
+    assert head.semantic_key == ""
+    assert session.scalar(
+        select(DataQualitySubjectHead.semantic_key).where(
+            DataQualitySubjectHead.id == head.id
+        )
+    ) == ""
+
+
+def test_subject_head_write_normalizes_whitespace_to_empty(session):
+    record = _record(session, persisted=True)
+    head = DataQualitySubjectHead(
+        capability=QUOTE_CAPABILITY,
+        subject_type="stock",
+        subject_id="300502",
+        semantic_key=" \t\r\n ",
+        current_record_id=record.id,
+        generation=1,
+    )
+    session.add(head)
+    session.flush()
+
+    assert head.semantic_key == ""
+
+
+def test_subject_head_write_trims_nonempty_key(session):
+    record = _record(session, persisted=True)
+    head = DataQualitySubjectHead(
+        capability=QUOTE_CAPABILITY,
+        subject_type="stock",
+        subject_id="300502",
+        semantic_key="\trealtime/CNY\n",
+        current_record_id=record.id,
+        generation=1,
+    )
+    session.add(head)
+    session.flush()
+
+    assert head.semantic_key == "realtime/CNY"
+    head.semantic_key = "\tlatest_close/CNY\n"
+    session.flush()
+    assert head.semantic_key == "latest_close/CNY"
+    assert session.scalar(
+        select(DataQualitySubjectHead.semantic_key).where(
+            DataQualitySubjectHead.id == head.id
+        )
+    ) == "latest_close/CNY"
+
+
+def test_quality_record_write_uses_same_semantic_normalizer(session):
+    empty = _record(session, semantic_key="\t\r\n")
+    nonempty = _record(
+        session,
+        subject_id="600000",
+        semantic_key="  realtime/CNY  ",
+    )
+
+    assert empty.semantic_key == ""
+    assert nonempty.semantic_key == "realtime/CNY"
+    assert canonical_semantic_key(empty.semantic_key) == canonical_semantic_key(
+        DataQualitySubjectHead(semantic_key=None).semantic_key
+    )
+
+
+def test_subject_head_canonical_scope_is_unique(session):
+    record = _record(session, persisted=True)
+    first = DataQualitySubjectHead(
+        capability=QUOTE_CAPABILITY,
+        subject_type="stock",
+        subject_id="300502",
+        semantic_key=None,
+        current_record_id=record.id,
+        generation=1,
+    )
+    session.add(first)
+    session.commit()
+    assert first.semantic_key == ""
+
+    duplicate = DataQualitySubjectHead(
+        capability=QUOTE_CAPABILITY,
+        subject_type="stock",
+        subject_id="300502",
+        semantic_key="\t",
+        current_record_id=record.id,
+        generation=2,
+    )
+    session.add(duplicate)
+    with pytest.raises(IntegrityError):
+        session.flush()
+    session.rollback()
+
+
+def test_distinct_nonempty_subject_heads_can_coexist(session):
+    record = _record(session, persisted=True)
+    session.add_all(
+        [
+            DataQualitySubjectHead(
+                capability=QUOTE_CAPABILITY,
+                subject_type="stock",
+                subject_id="300502",
+                semantic_key=" realtime/CNY ",
+                current_record_id=record.id,
+                generation=1,
+            ),
+            DataQualitySubjectHead(
+                capability=QUOTE_CAPABILITY,
+                subject_type="stock",
+                subject_id="300502",
+                semantic_key="\tlatest_close/CNY\n",
+                current_record_id=record.id,
+                generation=1,
+            ),
+        ]
+    )
+    session.flush()
+
+    keys = session.scalars(
+        select(DataQualitySubjectHead.semantic_key).order_by(
+            DataQualitySubjectHead.semantic_key
+        )
+    ).all()
+    assert keys == ["latest_close/CNY", "realtime/CNY"]
 
 
 def test_legacy_unlinked_cache_is_missing(session):

@@ -4,7 +4,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from datetime import date, datetime, time, timedelta, timezone
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app.data_hub.quality import observation_is_stale, policy_for
@@ -24,6 +24,7 @@ MAX_FUTURE_CLOCK_SKEW = timedelta(minutes=5)
 _TRUSTED = {DataQualityStatus.VERIFIED, DataQualityStatus.SINGLE_SOURCE}
 _QUERY_SCOPE_CHUNK = 100
 _ScopeKey = tuple[str, str, str, str]
+_SubjectScopeKey = tuple[str, str, str]
 
 
 def _quality(value: str | None) -> DataQualityStatus | None:
@@ -48,6 +49,14 @@ def _record_scope(record: DataQualityRecord) -> _ScopeKey:
         record.subject_type or "",
         record.subject_id or "",
         canonical_semantic_key(record.semantic_key),
+    )
+
+
+def _subject_scope_key(capability: str, subject: SubjectRef) -> _SubjectScopeKey:
+    return (
+        capability,
+        subject.subject_type,
+        subject.subject_id,
     )
 
 
@@ -215,7 +224,7 @@ class EffectiveQualityResolver:
                 ).all()
             } if record_ids else {}
 
-            scopes: set[_ScopeKey] = set()
+            subject_scopes: set[_SubjectScopeKey] = set()
             for request in resolved_requests:
                 record = base_records.get(request.persisted_quality_record_id)
                 if record is None or not _scope_matches(
@@ -224,31 +233,21 @@ class EffectiveQualityResolver:
                     request.subject,
                 ):
                     continue
-                scopes.add(_scope_key(request.capability, request.subject))
+                subject_scopes.add(
+                    _subject_scope_key(request.capability, request.subject)
+                )
 
             scoped_records: dict[_ScopeKey, list[DataQualityRecord]] = defaultdict(list)
-            scope_items = list(scopes)
+            scope_items = list(subject_scopes)
             for offset in range(0, len(scope_items), _QUERY_SCOPE_CHUNK):
                 conditions = []
                 for scope in scope_items[offset : offset + _QUERY_SCOPE_CHUNK]:
-                    capability, subject_type, subject_id, semantic_key = scope
-                    trimmed_semantic_key = func.trim(
-                        DataQualityRecord.semantic_key
-                    )
-                    semantic_condition = (
-                        or_(
-                            DataQualityRecord.semantic_key.is_(None),
-                            trimmed_semantic_key == "",
-                        )
-                        if semantic_key == ""
-                        else trimmed_semantic_key == semantic_key
-                    )
+                    capability, subject_type, subject_id = scope
                     conditions.append(
                         and_(
                             DataQualityRecord.capability == capability,
                             DataQualityRecord.subject_type == subject_type,
                             DataQualityRecord.subject_id == subject_id,
-                            semantic_condition,
                         )
                     )
                 if not conditions:

@@ -15,9 +15,10 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.database import Base
+from app.domain.quality_subject import canonical_semantic_key
 
 
 MONEY = Numeric(20, 4)
@@ -192,7 +193,7 @@ class DataQualityRecord(Base):
     capability: Mapped[str] = mapped_column(String(80), index=True)
     subject_type: Mapped[str | None] = mapped_column(String(20))
     subject_id: Mapped[str | None] = mapped_column(String(160))
-    semantic_key: Mapped[str | None] = mapped_column(String(200))
+    semantic_key: Mapped[str | None] = mapped_column(String(200), default="")
     supersedes_record_id: Mapped[int | None] = mapped_column(
         ForeignKey(
             "data_quality_records.id",
@@ -221,6 +222,10 @@ class DataQualityRecord(Base):
     checked_at: Mapped[datetime | None] = mapped_column(DateTime)
     latest_content_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    @validates("semantic_key")
+    def normalize_semantic_key(self, _key: str, value: str | None) -> str:
+        return canonical_semantic_key(value)
 
 
 class DataQualitySubjectHead(Base):
@@ -259,6 +264,10 @@ class DataQualitySubjectHead(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+    @validates("semantic_key")
+    def normalize_semantic_key(self, _key: str, value: str | None) -> str:
+        return canonical_semantic_key(value)
 
 
 class DataProviderCallLog(Base):
