@@ -40,6 +40,8 @@ from app.services.one_click_pipeline import (
     _sector_assessment,
 )
 from app.services.market_cache import (
+    mapping_series_bars,
+    replace_market_series,
     resolve_cached_quote,
     resolve_cached_series,
     validate_series_for_persistence,
@@ -1737,3 +1739,155 @@ def test_market_sync_rolls_back_replacement_when_lineage_mark_fails(
     assert len(bars) == len(old_bars)
     assert {bar.quality_record_id for bar in bars} == {old_quality_record_id}
     assert {bar.close for bar in bars} == {Decimal("10.0000")}
+
+
+def _index_refresh_fixture(session, *, close: str, provider_id: str = "index"):
+    router = _router(
+        session,
+        MarketStub(provider_id, series_row_count=100, daily_close=close),
+    )
+    result = router.get_index_history(
+        "csi000300", date.today() - timedelta(days=365), date.today()
+    )
+    subject = index_daily_subject("csi000300", "unadjusted", "CNY", "share")
+    bars = mapping_series_bars(
+        result.require_value(),
+        cache_symbol=subject.subject_id,
+        adjustment="unadjusted",
+    )
+    return router, result, subject, bars
+
+
+def test_mapping_series_subset_is_rejected_before_delete(session):
+    old_router, old, subject, old_bars = _index_refresh_fixture(
+        session, close="10"
+    )
+    replace_market_series(
+        session,
+        old_router,
+        old,
+        old_bars,
+        subject=subject,
+        min_rows=60,
+    )
+    session.commit()
+    new_router, new, _, new_bars = _index_refresh_fixture(session, close="12")
+
+    with pytest.raises(ProviderUnavailableError, match="row count"):
+        replace_market_series(
+            session,
+            new_router,
+            new,
+            new_bars[:60],
+            subject=subject,
+            min_rows=60,
+        )
+
+    stored = session.scalars(
+        select(MarketDailyBar).where(MarketDailyBar.symbol == subject.subject_id)
+    ).all()
+    assert len(stored) == 100
+    assert {item.quality_record_id for item in stored} == {old.quality_record_id}
+    assert _quality_record(session, new).persisted is False
+
+
+def test_mapping_series_row_count_matches_provider_payload(session):
+    router, result, subject, bars = _index_refresh_fixture(session, close="10")
+    assert len(result.require_value()["rows"]) == 100
+    assert len(bars) == 100
+    stored = replace_market_series(
+        session,
+        router,
+        result,
+        bars,
+        subject=subject,
+        min_rows=60,
+    )
+    assert len(stored) == 100
+
+
+def test_mapping_series_row_count_matches_quality_record(session):
+    router, result, subject, bars = _index_refresh_fixture(session, close="10")
+    _quality_record(session, result).row_count = 99
+    session.flush()
+
+    with pytest.raises(ProviderUnavailableError, match="quality record row count"):
+        replace_market_series(
+            session,
+            router,
+            result,
+            bars,
+            subject=subject,
+            min_rows=60,
+        )
+
+    assert session.scalar(
+        select(func.count(MarketDailyBar.id)).where(
+            MarketDailyBar.symbol == subject.subject_id
+        )
+    ) == 0
+    assert _quality_record(session, result).persisted is False
+
+
+def test_invalid_mapping_refresh_preserves_existing_cache(session):
+    old_router, old, subject, old_bars = _index_refresh_fixture(
+        session, close="10"
+    )
+    replace_market_series(
+        session,
+        old_router,
+        old,
+        old_bars,
+        subject=subject,
+        min_rows=60,
+    )
+    session.commit()
+    new_router, new, _, new_bars = _index_refresh_fixture(session, close="12")
+
+    with pytest.raises(ProviderUnavailableError):
+        replace_market_series(
+            session,
+            new_router,
+            new,
+            new_bars[:-1],
+            subject=subject,
+            min_rows=60,
+        )
+
+    stored = session.scalars(
+        select(MarketDailyBar).where(MarketDailyBar.symbol == subject.subject_id)
+    ).all()
+    assert len(stored) == 100
+    assert {item.close for item in stored} == {Decimal("10.0000")}
+    assert {item.quality_record_id for item in stored} == {old.quality_record_id}
+
+
+def test_complete_mapping_refresh_replaces_existing_cache(session):
+    old_router, old, subject, old_bars = _index_refresh_fixture(
+        session, close="10"
+    )
+    replace_market_series(
+        session,
+        old_router,
+        old,
+        old_bars,
+        subject=subject,
+        min_rows=60,
+    )
+    session.commit()
+    new_router, new, _, new_bars = _index_refresh_fixture(session, close="12")
+    replace_market_series(
+        session,
+        new_router,
+        new,
+        new_bars,
+        subject=subject,
+        min_rows=60,
+    )
+
+    stored = session.scalars(
+        select(MarketDailyBar).where(MarketDailyBar.symbol == subject.subject_id)
+    ).all()
+    assert len(stored) == 100
+    assert {item.close for item in stored} == {Decimal("12.0000")}
+    assert {item.quality_record_id for item in stored} == {new.quality_record_id}
