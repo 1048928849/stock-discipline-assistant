@@ -5,14 +5,16 @@ from decimal import Decimal
 from typing import Any
 
 from app.config import Settings
-from app.providers.base import (
+from app.data_hub.contracts import (
     AnnouncementProvider,
+    DailyBar,
     FundamentalDataProvider,
     IndustryConceptProvider,
     MarketDataProvider,
     ProviderMetadata,
+    ProviderUnavailableError,
+    Quote,
 )
-from app.providers.market import DailyBar, ProviderUnavailableError, Quote
 
 
 class TushareProvider(

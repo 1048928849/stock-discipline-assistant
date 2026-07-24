@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from app.config import Settings
-from app.providers.base import ProviderMetadata, SocialClueProvider
+from app.data_hub.contracts import ProviderMetadata, SocialClueProvider
 from app.providers.x_provider import TWScrapeProvider
 
 

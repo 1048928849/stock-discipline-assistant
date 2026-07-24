@@ -6,8 +6,14 @@ from decimal import Decimal
 import httpx
 
 from app.config import Settings
-from app.providers.base import MarketDataProvider, NewsProvider, ProviderMetadata
-from app.providers.market import DailyBar, ProviderUnavailableError, Quote
+from app.data_hub.contracts import (
+    DailyBar,
+    MarketDataProvider,
+    NewsProvider,
+    ProviderMetadata,
+    ProviderUnavailableError,
+    Quote,
+)
 
 
 class ProfessionalMarketApiProvider(MarketDataProvider):

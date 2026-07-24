@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
@@ -8,6 +9,9 @@ import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.data_hub.contracts import ProviderUnavailableError
+from app.data_hub.router import DataHubRouter
+from app.domain.package_builder import build_decision_package
 from app.errors import AppError
 from app.models import (
     Account,
@@ -21,7 +25,7 @@ from app.models import (
     PlanAnalysisRun,
     TradePlan,
 )
-from app.providers.market import ProviderUnavailableError
+from app.research.orchestrator import ExistingAIResearchOrchestrator
 from app.schemas_workflow import (
     OneClickPlanRequest,
     TradePlanAIRequest,
@@ -30,7 +34,6 @@ from app.schemas_workflow import (
 )
 from app.services.trade_plan_ai import run_ai_analysis
 from app.services.company_research import refresh_company_research_if_needed
-from app.services.data_sources import UnifiedDataService
 from app.services.trade_plan_generator import (
     GENERATOR_PARAMETERS,
     generate_trade_plan_preview,
@@ -85,7 +88,7 @@ def _latest_bar(db: Session, symbol: str) -> MarketDailyBar | None:
 
 
 def _sync_stock(
-    db: Session, symbol: str, provider: UnifiedDataService, refresh: bool
+    db: Session, symbol: str, provider: DataHubRouter, refresh: bool
 ) -> tuple[dict, dict]:
     cached = _latest_bar(db, symbol)
     stale = cached is None or cached.trade_date < date.today() - timedelta(days=5)
@@ -115,7 +118,7 @@ def _sync_stock(
             quote_error = str(exc)
             latest = bars[-1]
             old_quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
-            from app.providers.market import Quote
+            from app.data_hub.contracts import Quote
 
             quote = Quote(
                 symbol=symbol,
@@ -164,6 +167,7 @@ def _sync_stock(
                 f"已自动同步 {len(bars)} 根前复权日线，截止 {bars[-1].trade_date.isoformat()}。"
                 + (f" 实时行情失败，使用最新收盘：{quote_error}" if quote_error else ""),
                 fallback_used=bool(quote_error) or history_result.fallback_used,
+                quality_status=history_result.quality_status.value,
                 source=bars[-1].source,
                 data_time=bars[-1].fetched_at.isoformat(),
             ),
@@ -227,7 +231,7 @@ def _series_assessment(rows: list[dict]) -> dict:
     }
 
 
-def _market_assessment(db: Session, provider: UnifiedDataService) -> tuple[dict, dict]:
+def _market_assessment(db: Session, provider: DataHubRouter) -> tuple[dict, dict]:
     cache_symbol = "CSI000300"
     cached = db.scalars(
         select(MarketDailyBar)
@@ -294,6 +298,7 @@ def _market_assessment(db: Session, provider: UnifiedDataService) -> tuple[dict,
             detail,
             source=history["source"],
             data_time=history["fetched_at"].isoformat(),
+            quality_status=history_result.quality_status.value,
         )
     except Exception as exc:
         db.rollback()
@@ -328,7 +333,7 @@ def _pick(raw: dict, *keys):
 
 
 def _ensure_profile(
-    db: Session, symbol: str, provider: UnifiedDataService
+    db: Session, symbol: str, provider: DataHubRouter
 ) -> tuple[CompanyProfile | None, dict]:
     profile = db.scalar(select(CompanyProfile).where(CompanyProfile.symbol == symbol))
     if profile and profile.industry:
@@ -404,7 +409,7 @@ def _sector_board_name(profile: CompanyProfile) -> str:
 
 def _sector_assessment(
     db: Session,
-    provider: UnifiedDataService,
+    provider: DataHubRouter,
     profile: CompanyProfile | None,
     market: dict,
     refresh: bool = False,
@@ -486,6 +491,7 @@ def _sector_assessment(
             f"相对沪深300 {result['relative_20d']}个百分点，判定为{state}。",
             source=history["source"],
             data_time=history["fetched_at"].isoformat(),
+            quality_status=history_result.quality_status.value,
         )
     except Exception as exc:
         result = {"state": "无法判断", "relative_20d": None, "is_mainline": None}
@@ -595,7 +601,10 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
     db.add(run)
     db.commit()
     db.refresh(run)
-    provider = UnifiedDataService(db)
+    provider = DataHubRouter(db)
+    research_orchestrator = ExistingAIResearchOrchestrator(
+        lambda request: run_ai_analysis(db, request)
+    )
     steps = [
         _step(
             "account",
@@ -730,7 +739,7 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
             ai_request = TradePlanAIRequest(
                 **generator_request.model_dump(), preview_hash=preview["preview_hash"]
             )
-            ai_result = run_ai_analysis(db, ai_request)
+            ai_result = research_orchestrator.run(ai_request)
             ai_id = ai_result.get("id")
             steps.append(
                 _step(
@@ -763,6 +772,27 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
                     missing=["AI辅助解释"],
                 )
             )
+        decision_package = build_decision_package(
+            preview=preview,
+            decision=decision,
+            steps=steps,
+            ai_result=ai_result,
+            orchestrator_id=research_orchestrator.orchestrator_id,
+        )
+        if decision_package.quality_status.blocks_execution and preview["status"] == "READY":
+            preview = deepcopy(preview)
+            preview["deterministic_rule_status"] = "READY"
+            preview["status"] = "WAIT"
+            preview["current_buy_allowed"] = False
+            preview["buy_plan"]["allowed"] = False
+            preview["confirmation_add"]["allowed"] = False
+            decision = {
+                **decision,
+                "status": decision_package.strategy_decision.decision_code,
+                "label": decision_package.strategy_decision.label,
+                "next_action": decision_package.strategy_decision.next_action,
+            }
+            preview["decision"] = decision
         steps.append(
             _step(
                 "plan_output",
@@ -785,11 +815,14 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
             "decision": decision,
             "plan": preview,
             "ai": ai_result,
+            "decision_package": decision_package.model_dump(mode="json"),
             "generator_request": generator_request.model_dump(mode="json"),
-            "can_save": bool(preview["buy_plan"]["hard_stop"] and preview["data_date"]),
-            "save_disabled_reason": None
-            if preview["buy_plan"]["hard_stop"] and preview["data_date"]
-            else "缺少可靠买入区、硬止损或行情日期，不能冻结为正式计划。",
+            "can_save": decision_package.freeze_allowed,
+            "save_disabled_reason": (
+                None
+                if decision_package.freeze_allowed
+                else "；".join(decision_package.blocked_reasons)
+            ),
         }
         run.status = "success"
         run.pipeline_steps = steps
@@ -817,6 +850,14 @@ def confirm_one_click_plan(db: Session, run_id: int) -> dict:
         raise AppError(409, "ANALYSIS_ALREADY_CONFIRMED", "该分析已经保存为正式计划")
     result = run.result_snapshot or {}
     plan = result.get("plan") or {}
+    decision_package = result.get("decision_package") or {}
+    if not decision_package.get("freeze_allowed"):
+        reasons = "；".join(decision_package.get("blocked_reasons") or [])
+        raise AppError(
+            422,
+            "ANALYSIS_QUALITY_BLOCKED",
+            reasons or "数据质量不允许冻结正式计划",
+        )
     generator_payload = result.get("generator_request")
     if not generator_payload or not plan.get("preview_hash"):
         raise AppError(422, "ANALYSIS_NOT_SAVABLE", "分析没有形成可保存的规则快照")

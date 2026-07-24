@@ -293,7 +293,9 @@ def valid_ai_result(package=None):
 def test_ai_schema_and_source_validation():
     output, validation = validate_ai_output(valid_ai_result(), evidence_package())
     assert output["ai_summaries"]
+    assert output["ai_summaries"][0]["evidence_ids"] == ["financial:1"]
     assert validation["valid"] is True
+    assert validation["cited_evidence_ids"] == ["financial:1"]
     bad = valid_ai_result()
     bad["supporting_evidence"][0]["source_ids"] = ["missing:9"]
     with pytest.raises(ValueError, match="不存在"):

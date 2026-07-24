@@ -1,7 +1,11 @@
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
-from app.models import CompanyProfile, MarketDailyBar, MarketQuote
+import pytest
+
+from app.models import CompanyProfile, MarketDailyBar, MarketQuote, TradePlan
+from app.schemas_workflow import TradePlanPreviewRequest
+from app.services.trade_plan_generator import generate_trade_plan_preview
 
 
 def create_account(client, assets="100000", cash="80000"):
@@ -137,6 +141,12 @@ def test_one_click_empty_position_generates_and_confirms_plan(client, session, m
     ][-7:]
     assert data["plan"]["account"]["max_position_pct"] == 30
     assert data["plan"]["position_calculation"]["trial_quantity"] % 100 == 0
+    assert data["decision_package"]["schema_version"] == "1.0"
+    assert data["decision_package"]["quality_status"] == "SINGLE_SOURCE"
+    assert data["decision_package"]["strategy_decision"]["rule_status"] == "READY"
+    assert data["decision_package"]["risk_decision"]["hard_stop"] == str(
+        data["plan"]["buy_plan"]["hard_stop"]
+    )
     saved = client.post(
         f"/api/v1/trade-plan-generator/analyze/{data['run_id']}/confirm"
     )
@@ -204,3 +214,86 @@ def test_one_click_creates_default_research_account(client, session, monkeypatch
     assert data["account"]["auto_created"] is True
     account = client.get(f"/api/v1/accounts/{data['account']['id']}").json()
     assert float(account["total_assets"]) == 300000
+
+
+def test_one_click_wrapper_preserves_rule_numbers_for_same_generator_input(
+    client, session, monkeypatch
+):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    patch_benchmarks(monkeypatch)
+    data = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    ).json()
+    direct = generate_trade_plan_preview(
+        session, TradePlanPreviewRequest(**data["generator_request"])
+    )
+    assert data["plan"]["status"] == direct["status"]
+    assert data["plan"]["buy_plan"]["hard_stop"] == direct["buy_plan"]["hard_stop"]
+    assert (
+        data["plan"]["position_calculation"]["final_allowed_quantity"]
+        == direct["position_calculation"]["final_allowed_quantity"]
+    )
+    assert (
+        data["plan"]["position_calculation"]["trial_quantity"]
+        == direct["position_calculation"]["trial_quantity"]
+    )
+
+
+@pytest.mark.parametrize("quality_status", ["STALE", "CONFLICTED", "MISSING"])
+def test_untrusted_execution_data_blocks_ready_and_plan_freeze(
+    quality_status, client, session, monkeypatch
+):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    patch_benchmarks(monkeypatch)
+
+    def degraded_stock(db, symbol, provider, refresh):
+        return (
+            {
+                "code": "market_data",
+                "name": "行情数据",
+                "status": "success",
+                "detail": "测试质量门禁",
+                "fallback_used": quality_status == "STALE",
+                "missing": [],
+                "quality_status": quality_status,
+                "source": "test",
+                "data_time": datetime.now().isoformat(),
+            },
+            {"data_date": date.today().isoformat(), "source": "test"},
+        )
+
+    monkeypatch.setattr("app.services.one_click_pipeline._sync_stock", degraded_stock)
+    response = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["plan"]["deterministic_rule_status"] == "READY"
+    assert data["plan"]["status"] == "WAIT"
+    assert data["plan"]["current_buy_allowed"] is False
+    assert data["decision_package"]["quality_status"] == quality_status
+    assert data["decision_package"]["ready_allowed"] is False
+    assert data["decision_package"]["freeze_allowed"] is False
+    assert data["can_save"] is False
+    confirm = client.post(
+        f"/api/v1/trade-plan-generator/analyze/{data['run_id']}/confirm"
+    )
+    assert confirm.status_code == 422
+    assert confirm.json()["error"]["code"] == "ANALYSIS_QUALITY_BLOCKED"
+    assert session.query(TradePlan).count() == 0

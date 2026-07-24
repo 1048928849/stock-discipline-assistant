@@ -9,10 +9,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.data_hub.contracts import ProviderUnavailableError, Quote
 from app.database import get_db
 from app.errors import AppError
 from app.models import (
-    AIAnalysis,
     Account,
     BacktestRun,
     DisciplineRule,
@@ -26,8 +26,6 @@ from app.models import (
     XWatchAccount,
     XWatchQuery,
 )
-from app.providers.llm_provider import LLMUnavailableError, OpenAICompatibleProvider
-from app.providers.market import ProviderUnavailableError, Quote
 from app.schemas_advanced import (
     BacktestCreate,
     DisciplineAlert,
@@ -40,8 +38,9 @@ from app.schemas_advanced import (
     WatchQueryCreate,
 )
 from app.services.backtests import run_backtest
+from app.services.ai_content import analyze_x_post, test_llm_provider_connection
+from app.services.data_sources import build_data_hub
 from app.services.discipline import check_discipline
-from app.services.data_sources import UnifiedDataService
 from app.services.reviews import review_metrics
 
 
@@ -208,7 +207,7 @@ def _live_market_call(callback):
 
 @router.get("/market/symbols")
 def market_symbols(db: Session = Depends(get_db)):
-    return _live_market_call(lambda: UnifiedDataService(db).list_symbols().value)
+    return _live_market_call(lambda: build_data_hub(db).list_symbols().value)
 
 
 @router.get("/market/indices")
@@ -216,12 +215,12 @@ def market_indices(
     family: str = Query(default="上证系列指数", max_length=30),
     db: Session = Depends(get_db),
 ):
-    return _live_market_call(lambda: UnifiedDataService(db).list_indices(family).value)
+    return _live_market_call(lambda: build_data_hub(db).list_indices(family).value)
 
 
 @router.get("/market/sectors")
 def market_sectors(db: Session = Depends(get_db)):
-    return _live_market_call(lambda: UnifiedDataService(db).list_sectors().value)
+    return _live_market_call(lambda: build_data_hub(db).list_sectors().value)
 
 
 @router.get("/market/announcements/{symbol}")
@@ -231,7 +230,7 @@ def market_announcements(
     db: Session = Depends(get_db),
 ):
     return _live_market_call(
-        lambda: UnifiedDataService(db).daily_announcements(symbol, day).value
+        lambda: build_data_hub(db).daily_announcements(symbol, day).value
     )
 
 
@@ -274,7 +273,7 @@ def market_sync(
     job.status = "running"
     job.started_at = datetime.now()
     db.commit()
-    provider = UnifiedDataService(db)
+    provider = build_data_hub(db)
     try:
         quote_error = None
         try:
@@ -487,7 +486,7 @@ def x_sync(limit: int = Query(default=20, ge=1, le=100), db: Session = Depends(g
         db.commit()
         raise AppError(422, "X_QUERY_REQUIRED", "请先添加关注账号或查询表达式")
     try:
-        posts = UnifiedDataService(db).collect_social_queries(expressions, limit).value
+        posts = build_data_hub(db).collect_social_queries(expressions, limit).value
     except ProviderUnavailableError as exc:
         job.status = "paused"
         job.finished_at = datetime.now()
@@ -513,35 +512,7 @@ def ai_analyze(content_id: int, db: Session = Depends(get_db)):
     post = db.get(XPost, content_id)
     if not post:
         raise AppError(404, "CONTENT_NOT_FOUND", "待分析的 X 内容不存在")
-    provider = OpenAICompatibleProvider(get_settings())
-    try:
-        result = provider.analyze(post.content)
-        analysis = AIAnalysis(
-            content_type="x_post",
-            content_id=post.id,
-            source_url=post.url,
-            source_time=post.published_at,
-            model=get_settings().llm_model,
-            status="success",
-            result=result.model_dump(),
-        )
-        db.add(analysis)
-        db.commit()
-        db.refresh(analysis)
-        return analysis
-    except LLMUnavailableError as exc:
-        analysis = AIAnalysis(
-            content_type="x_post",
-            content_id=post.id,
-            source_url=post.url,
-            source_time=post.published_at,
-            model=get_settings().llm_model or "not-configured",
-            status="failed",
-            error=str(exc),
-        )
-        db.add(analysis)
-        db.commit()
-        raise AppError(503, "LLM_UNAVAILABLE", str(exc)) from exc
+    return analyze_x_post(db, post)
 
 
 @router.post("/backtests", status_code=201)
@@ -653,7 +624,4 @@ def settings_status():
 
 @router.post("/settings/llm/test")
 def test_llm_connection():
-    try:
-        return OpenAICompatibleProvider(get_settings()).test_connection()
-    except LLMUnavailableError as exc:
-        raise AppError(503, "LLM_CONNECTION_FAILED", str(exc)) from exc
+    return test_llm_provider_connection()
