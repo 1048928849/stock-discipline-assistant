@@ -25,16 +25,26 @@ from app.data_hub.router import DataHubRouter, request_fingerprint
 from app.domain.quality import DataQualityStatus
 from app.domain.quality_subject import SubjectRef, canonical_semantic_key
 from app.models import (
+    Account,
+    CompanyProfile,
     DataQualityRecord,
     DataQualitySubjectHead,
+    Holding,
     MarketDailyBar,
     MarketQuote,
+    TechnicalSnapshot,
+)
+from app.services.one_click_pipeline import (
+    _cached_quote_step,
+    _market_assessment,
+    _sector_assessment,
 )
 from app.services.market_cache import (
     resolve_cached_quote,
     resolve_cached_series,
     validate_series_for_persistence,
 )
+from app.services.technical_snapshots import load_qfq_frame, snapshot_all_holdings
 
 
 class MarketStub(DataProvider):
@@ -48,6 +58,7 @@ class MarketStub(DataProvider):
         daily_close: str = "10.00",
         adjustment: str = "qfq",
         row_count: int = 3,
+        series_row_count: int = 20,
         observed_at: datetime | None = None,
         failures: set[str] | None = None,
     ):
@@ -69,6 +80,7 @@ class MarketStub(DataProvider):
         self.daily_close = Decimal(daily_close)
         self.adjustment = adjustment
         self.row_count = row_count
+        self.series_row_count = series_row_count
         self.observed_at = observed_at
         self.failures = failures or set()
 
@@ -134,11 +146,13 @@ class MarketStub(DataProvider):
         return {
             "rows": [
                 {
-                    "date": end - timedelta(days=19 - offset),
+                    "date": end - timedelta(
+                        days=self.series_row_count - 1 - offset
+                    ),
                     "close": self.daily_close,
                     "volume": Decimal("10000"),
                 }
-                for offset in range(20)
+                for offset in range(self.series_row_count)
             ],
             "source": self.provider_id,
             "fetched_at": datetime.now(),
@@ -1282,3 +1296,286 @@ def test_preflight_rejects_invalid_ohlc(session):
     bars[1] = replace(bars[1], high=bars[1].low - Decimal("1"))
     with pytest.raises(ValueError, match="invalid_ohlc"):
         validate_series_for_persistence(bars, subject=result.subject, min_rows=3)
+
+
+def _company_profile(session, *, industry: str = "通信设备") -> CompanyProfile:
+    profile = CompanyProfile(
+        symbol="300502",
+        name="测试公司",
+        industry=industry,
+        market="创业板",
+        main_business=industry,
+        source="fixture",
+        source_url="https://example.test/profile",
+        raw_data={},
+        fetched_at=datetime.now(),
+    )
+    session.add(profile)
+    session.commit()
+    return profile
+
+
+def test_cached_quote_step_recomputes_natural_staleness(session):
+    router = _router(session, MarketStub("cached"))
+    result = router.get_quote("300502")
+    quote = _persist_quote(session, router, result)
+    stale_at = datetime.now() - timedelta(minutes=31)
+    quote.observed_at = stale_at
+    _quality_record(session, result).observed_at = stale_at
+    session.commit()
+
+    step = _cached_quote_step(session, "300502")
+    assert step["status"] == "partial"
+    assert step["effective_quality"] == "STALE"
+    assert step["executable"] is False
+
+
+def test_cached_quote_step_new_conflict_blocks_old_quote(session):
+    router = _router(session, MarketStub("cached"))
+    cached = router.get_quote("300502")
+    _persist_quote(session, router, cached)
+    _router(
+        session,
+        MarketStub("a", quote_price="10"),
+        MarketStub("b", priority=20, quote_price="11"),
+    ).get_quote("300502")
+    session.commit()
+
+    step = _cached_quote_step(session, "300502")
+    assert step["effective_quality"] == "CONFLICTED"
+    assert step["executable"] is False
+    assert step["blocking_record_id"] is not None
+
+
+def test_quote_api_reports_effective_quality_and_dynamic_staleness(
+    client, session
+):
+    router = _router(session, MarketStub("cached"))
+    result = router.get_quote("300502")
+    quote = _persist_quote(session, router, result)
+    stale_at = datetime.now() - timedelta(minutes=31)
+    quote.observed_at = stale_at
+    _quality_record(session, result).observed_at = stale_at
+    session.commit()
+
+    response = client.get("/api/v1/market/quote/300502")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["quote_type"] == "realtime"
+    assert body["effective_quality"] == "STALE"
+    assert body["executable"] is False
+    assert body["quality_record_id"] == result.quality_record_id
+
+
+def test_quote_api_new_conflict_is_not_executable(client, session):
+    router = _router(session, MarketStub("cached"))
+    cached = router.get_quote("300502")
+    _persist_quote(session, router, cached)
+    _router(
+        session,
+        MarketStub("a", quote_price="10"),
+        MarketStub("b", priority=20, quote_price="11"),
+    ).get_quote("300502")
+    session.commit()
+
+    body = client.get("/api/v1/market/quote/300502").json()
+    assert body["effective_quality"] == "CONFLICTED"
+    assert body["executable"] is False
+    assert body["blocking_reason"] == "newer_conflict"
+
+
+def test_quote_api_does_not_return_latest_close_as_realtime(client, session):
+    router = _router(session, MarketStub("close", quote_type="latest_close"))
+    result = router.get_latest_close("300502")
+    _persist_quote(session, router, result)
+    response = client.get("/api/v1/market/quote/300502")
+    assert response.status_code == 404
+
+
+def test_load_qfq_frame_uses_exactly_one_lineage(session):
+    first_router = _router(session, MarketStub("older", row_count=260))
+    first = first_router.get_history(
+        "300502", date(2026, 1, 1), date(2026, 7, 24)
+    )
+    _persist_daily(session, first_router, first)
+    second_router = _router(
+        session,
+        MarketStub("newer", row_count=260, daily_close="12"),
+    )
+    second = second_router.get_history(
+        "300502", date(2026, 1, 1), date(2026, 7, 24)
+    )
+    _persist_daily(session, second_router, second)
+
+    frame = load_qfq_frame(session, "300502")
+    assert len(frame) == 260
+    assert frame.attrs["quality_record_id"] == second.quality_record_id
+    assert frame.attrs["data_source"] == "newer"
+
+
+def test_new_daily_conflict_blocks_technical_frame(session):
+    router = _router(session, MarketStub("cached", row_count=260))
+    result = router.get_history("300502", date(2026, 1, 1), date(2026, 7, 24))
+    _persist_daily(session, router, result)
+    _router(
+        session,
+        MarketStub("a", row_count=260, daily_close="10"),
+        MarketStub("b", priority=20, row_count=260, daily_close="11"),
+    ).get_history("300502", date(2026, 1, 1), date(2026, 7, 24))
+    session.commit()
+    with pytest.raises(ValueError, match="CONFLICTED"):
+        load_qfq_frame(session, "300502")
+
+
+def test_unrelated_stock_conflict_does_not_block_technical_frame(session):
+    router = _router(session, MarketStub("cached", row_count=260))
+    result = router.get_history("300502", date(2026, 1, 1), date(2026, 7, 24))
+    _persist_daily(session, router, result)
+    _router(
+        session,
+        MarketStub("a", row_count=260, daily_close="10"),
+        MarketStub("b", priority=20, row_count=260, daily_close="11"),
+    ).get_history("600000", date(2026, 1, 1), date(2026, 7, 24))
+    session.commit()
+    assert len(load_qfq_frame(session, "300502")) == 260
+
+
+def test_new_daily_conflict_blocks_holding_snapshot_and_price_update(session):
+    router = _router(session, MarketStub("cached", row_count=260))
+    cached = router.get_history("300502", date(2026, 1, 1), date(2026, 7, 24))
+    _persist_daily(session, router, cached)
+    account = Account(
+        name="snapshot-account",
+        total_assets=Decimal("100000"),
+        cash=Decimal("50000"),
+        available_cash=Decimal("50000"),
+    )
+    session.add(account)
+    session.flush()
+    holding = Holding(
+        account_id=account.id,
+        symbol="300502",
+        name="test-stock",
+        quantity=100,
+        cost_price=Decimal("9"),
+        current_price=Decimal("9"),
+        price_source="manual",
+    )
+    session.add(holding)
+    session.commit()
+    _router(
+        session,
+        MarketStub("a", row_count=260, daily_close="10"),
+        MarketStub("b", priority=20, row_count=260, daily_close="11"),
+    ).get_history("300502", date(2026, 1, 1), date(2026, 7, 24))
+    session.commit()
+
+    result = snapshot_all_holdings(session, refresh_market=False)
+
+    session.refresh(holding)
+    assert result["processed"] == 0
+    assert result["errors"]
+    assert holding.current_price == Decimal("9.0000")
+    assert holding.price_source == "manual"
+    assert session.scalar(select(TechnicalSnapshot)) is None
+
+
+def test_new_index_conflict_blocks_old_market_assessment(session):
+    cached_router = _router(
+        session,
+        MarketStub("cached", series_row_count=80),
+    )
+    cached = cached_router.get_index_history(
+        "csi000300", date(2026, 1, 1), date(2026, 7, 24)
+    )
+    subject = index_daily_subject("csi000300", "unadjusted", "CNY", "share")
+    _persist_mapping_series(
+        session,
+        cached_router,
+        cached,
+        cache_symbol=subject.subject_id,
+        adjustment="unadjusted",
+    )
+    _router(
+        session,
+        MarketStub("a", series_row_count=80, daily_close="10"),
+        MarketStub("b", priority=20, series_row_count=80, daily_close="11"),
+    ).get_index_history("csi000300", date(2026, 1, 1), date(2026, 7, 24))
+    session.commit()
+
+    assessment, step = _market_assessment(
+        session,
+        _router(session, MarketStub("offline", failures={"get_index_history"})),
+    )
+    assert assessment["state"] == "无法判断"
+    assert step["effective_quality"] == "CONFLICTED"
+    assert step["executable"] is False
+
+
+def test_new_sector_conflict_blocks_old_sector_assessment(session):
+    profile = _company_profile(session)
+    subject = sector_daily_subject("通信设备", "unadjusted", "CNY", "share")
+    cached_router = _router(
+        session,
+        MarketStub("cached", series_row_count=80),
+    )
+    cached = cached_router.get_sector_history(
+        "通信设备", date(2026, 1, 1), date(2026, 7, 24)
+    )
+    _persist_mapping_series(
+        session,
+        cached_router,
+        cached,
+        cache_symbol=subject.subject_id,
+        adjustment="unadjusted",
+    )
+    _router(
+        session,
+        MarketStub("a", series_row_count=80, daily_close="10"),
+        MarketStub("b", priority=20, series_row_count=80, daily_close="11"),
+    ).get_sector_history("通信设备", date(2026, 1, 1), date(2026, 7, 24))
+    session.commit()
+
+    assessment, step = _sector_assessment(
+        session,
+        _router(session, MarketStub("offline", failures={"get_sector_history"})),
+        profile,
+        {"return_20d": 1},
+    )
+    assert assessment["state"] == "无法判断"
+    assert step["effective_quality"] == "CONFLICTED"
+    assert step["executable"] is False
+
+
+def test_unrelated_sector_conflict_does_not_block_current_sector(session):
+    profile = _company_profile(session)
+    subject = sector_daily_subject("通信设备", "unadjusted", "CNY", "share")
+    cached_router = _router(
+        session,
+        MarketStub("cached", series_row_count=80),
+    )
+    cached = cached_router.get_sector_history(
+        "通信设备", date(2026, 1, 1), date(2026, 7, 24)
+    )
+    _persist_mapping_series(
+        session,
+        cached_router,
+        cached,
+        cache_symbol=subject.subject_id,
+        adjustment="unadjusted",
+    )
+    _router(
+        session,
+        MarketStub("a", series_row_count=80, daily_close="10"),
+        MarketStub("b", priority=20, series_row_count=80, daily_close="11"),
+    ).get_sector_history("半导体", date(2026, 1, 1), date(2026, 7, 24))
+    session.commit()
+
+    assessment, step = _sector_assessment(
+        session,
+        _router(session, MarketStub("offline", failures={"get_sector_history"})),
+        profile,
+        {"return_20d": 1},
+    )
+    assert assessment["state"] != "无法判断"
+    assert step["executable"] is True
