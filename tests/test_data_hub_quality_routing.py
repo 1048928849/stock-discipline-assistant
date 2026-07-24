@@ -2,6 +2,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from app.data_hub.contracts import DataProvider, ProviderMetadata
+from app.data_hub.market_subjects import index_daily_subject, sector_daily_subject
 from app.data_hub.quality import (
     DataQualityStatus,
     QualityObservation,
@@ -99,7 +100,11 @@ def test_data_hub_only_stale_sources(session):
         StubProvider("a", "market.index_daily", old_rows),
         StubProvider("b", "market.index_daily", old_rows, priority=20),
     )
-    result = router.invoke(capability, "fetch")
+    result = router.invoke(
+        capability,
+        "fetch",
+        subject=index_daily_subject("000300", "unadjusted", "CNY", "share"),
+    )
     assert result.quality_status == DataQualityStatus.STALE
 
 
@@ -152,7 +157,14 @@ def test_stale_index_rows_rejected_by_trading_calendar(session):
         "market.index_daily",
         StubProvider("a", "market.index_daily", rows),
     )
-    assert router.invoke(capability, "fetch").quality_status == DataQualityStatus.STALE
+    assert (
+        router.invoke(
+            capability,
+            "fetch",
+            subject=index_daily_subject("000300", "unadjusted", "CNY", "share"),
+        ).quality_status
+        == DataQualityStatus.STALE
+    )
 
 
 def test_stale_sector_rows_rejected_by_trading_calendar(session):
@@ -167,7 +179,14 @@ def test_stale_sector_rows_rejected_by_trading_calendar(session):
         "market.sector_daily",
         StubProvider("a", "market.sector_daily", rows),
     )
-    assert router.invoke(capability, "fetch").quality_status == DataQualityStatus.STALE
+    assert (
+        router.invoke(
+            capability,
+            "fetch",
+            subject=sector_daily_subject("bank", "unadjusted", "CNY", "share"),
+        ).quality_status
+        == DataQualityStatus.STALE
+    )
 
 
 def test_weekend_does_not_make_friday_bar_stale():

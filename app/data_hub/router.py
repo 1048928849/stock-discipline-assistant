@@ -5,9 +5,16 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time as datetime_time
 from typing import Any, Callable
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.data_hub.contracts import ProviderUnavailableError
+from app.data_hub.market_subjects import (
+    index_daily_subject,
+    sector_daily_subject,
+    stock_daily_subject,
+    stock_quote_subject,
+)
 from app.data_hub.quality import (
     DataQualityStatus,
     QualityObservation,
@@ -18,12 +25,28 @@ from app.data_hub.quality import (
 )
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.trading_calendar import TradingCalendar, get_trading_calendar
-from app.models import DataProviderCallLog, DataQualityRecord
+from app.domain.quality_subject import SubjectRef, canonical_semantic_key
+from app.models import (
+    DataProviderCallLog,
+    DataQualityRecord,
+    DataQualitySubjectHead,
+)
 
 
 TRUSTED_QUALITY_STATUSES = frozenset(
     {DataQualityStatus.VERIFIED, DataQualityStatus.SINGLE_SOURCE}
 )
+MARKET_SUBJECT_CAPABILITIES = frozenset(
+    {
+        "market.quote.realtime",
+        "market.quote.latest_close",
+        "market.daily.qfq",
+        "market.daily.unadjusted",
+        "market.index_daily",
+        "market.sector_daily",
+    }
+)
+CallResultKey = tuple[str, str, str, str, str]
 
 
 @dataclass
@@ -44,6 +67,8 @@ class ProviderResult:
     price_unit: str | None = None
     volume_unit: str | None = None
     quality_record_id: int | None = None
+    subject: SubjectRef | None = None
+    operation: str = ""
 
     def require_value(
         self,
@@ -88,6 +113,10 @@ class ProviderResult:
             "price_unit": self.price_unit,
             "volume_unit": self.volume_unit,
             "quality_record_id": self.quality_record_id,
+            "subject_type": self.subject.subject_type if self.subject else None,
+            "subject_id": self.subject.subject_id if self.subject else None,
+            "semantic_key": self.subject.semantic_key if self.subject else None,
+            "operation": self.operation,
         }
 
 
@@ -104,6 +133,43 @@ class DataHubRouter:
         self.registry = registry
         self.calendar = calendar or get_trading_calendar()
         self.calls: dict[str, ProviderResult] = {}
+        self.call_results: dict[CallResultKey, ProviderResult] = {}
+
+    @staticmethod
+    def _call_result_key(
+        capability: str,
+        operation: str,
+        subject: SubjectRef,
+    ) -> CallResultKey:
+        return (
+            capability,
+            operation,
+            subject.subject_type,
+            subject.subject_id,
+            canonical_semantic_key(subject.semantic_key),
+        )
+
+    def result_for(
+        self,
+        capability: str,
+        operation: str,
+        subject: SubjectRef,
+    ) -> ProviderResult | None:
+        return self.call_results.get(
+            self._call_result_key(capability, operation, subject)
+        )
+
+    def _remember_result(self, result: ProviderResult) -> ProviderResult:
+        self.calls[result.capability] = result
+        if result.subject is not None:
+            self.call_results[
+                self._call_result_key(
+                    result.capability,
+                    result.operation,
+                    result.subject,
+                )
+            ] = result
+        return result
 
     @staticmethod
     def _row_count(value: Any) -> int:
@@ -198,7 +264,167 @@ class DataHubRouter:
             return datetime.combine(value, datetime_time.min)
         return None
 
+    @staticmethod
+    def _result_dimensions(
+        value: Any,
+        subject: SubjectRef | None,
+    ) -> tuple[str | None, str | None, str | None]:
+        sample = value[0] if isinstance(value, list) and value else value
+        adjustment = getattr(sample, "adjustment", None)
+        price_unit = getattr(sample, "price_unit", None)
+        volume_unit = getattr(sample, "volume_unit", None)
+        semantic_parts = (
+            canonical_semantic_key(subject.semantic_key).split("/")
+            if subject is not None
+            else []
+        )
+        if len(semantic_parts) == 2:
+            price_unit = price_unit or semantic_parts[1]
+        elif len(semantic_parts) == 3:
+            adjustment = adjustment or semantic_parts[0]
+            price_unit = price_unit or semantic_parts[1]
+            volume_unit = volume_unit or semantic_parts[2]
+        return adjustment, price_unit, volume_unit
+
+    @staticmethod
+    def _scope_matches_result(
+        record: DataQualityRecord,
+        result: ProviderResult,
+    ) -> bool:
+        if result.subject is None:
+            return (
+                record.subject_type is None
+                and record.subject_id is None
+                and canonical_semantic_key(record.semantic_key) == ""
+            )
+        return (
+            record.subject_type == result.subject.subject_type
+            and record.subject_id == result.subject.subject_id
+            and canonical_semantic_key(record.semantic_key)
+            == canonical_semantic_key(result.subject.semantic_key)
+        )
+
+    def _superseded_conflict_id(
+        self,
+        result: ProviderResult,
+        *,
+        evaluated_at: datetime,
+    ) -> int | None:
+        subject = result.subject
+        policy = policy_for(result.capability)
+        if (
+            subject is None
+            or result.quality_status != DataQualityStatus.VERIFIED
+            or not policy.verify_multiple_sources
+            or result.cache_used
+            or result.normalized_digest is None
+        ):
+            return None
+        observed_at = self._as_datetime(result.observed_at)
+        if observed_at is None or observed_at > evaluated_at:
+            return None
+
+        records = self.db.scalars(
+            select(DataQualityRecord)
+            .where(
+                DataQualityRecord.capability == result.capability,
+                DataQualityRecord.subject_type == subject.subject_type,
+                DataQualityRecord.subject_id == subject.subject_id,
+            )
+            .order_by(DataQualityRecord.id.desc())
+        ).all()
+        semantic_key = canonical_semantic_key(subject.semantic_key)
+        scoped_records = [
+            record
+            for record in records
+            if canonical_semantic_key(record.semantic_key) == semantic_key
+        ]
+        conflicts_by_id = {
+            record.id: record
+            for record in scoped_records
+            if record.quality_status == DataQualityStatus.CONFLICTED.value
+        }
+        superseded_ids = set()
+        for candidate in scoped_records:
+            conflict = conflicts_by_id.get(candidate.supersedes_record_id)
+            candidate_observed_at = self._as_datetime(candidate.observed_at)
+            conflict_observed_at = (
+                self._as_datetime(conflict.observed_at) if conflict is not None else None
+            )
+            if (
+                conflict is not None
+                and candidate.id > conflict.id
+                and candidate.quality_status == DataQualityStatus.VERIFIED.value
+                and candidate.trusted
+                and candidate_observed_at is not None
+                and conflict_observed_at is not None
+                and conflict_observed_at <= candidate_observed_at <= evaluated_at
+                and not observation_is_stale(
+                    candidate.observed_at,
+                    policy,
+                    now=evaluated_at,
+                    calendar=self.calendar,
+                )
+            ):
+                superseded_ids.add(conflict.id)
+        conflict = next(
+            (
+                record
+                for record in scoped_records
+                if record.quality_status == DataQualityStatus.CONFLICTED.value
+                and record.id not in superseded_ids
+            ),
+            None,
+        )
+        if (
+            conflict is None
+            or conflict.observed_at is None
+            or observed_at < conflict.observed_at
+        ):
+            return None
+        return conflict.id
+
+    def _advance_subject_head(
+        self,
+        result: ProviderResult,
+        record: DataQualityRecord,
+        *,
+        updated_at: datetime,
+    ) -> None:
+        subject = result.subject
+        if subject is None:
+            return
+        semantic_key = canonical_semantic_key(subject.semantic_key)
+        head = self.db.scalar(
+            select(DataQualitySubjectHead)
+            .where(
+                DataQualitySubjectHead.capability == result.capability,
+                DataQualitySubjectHead.subject_type == subject.subject_type,
+                DataQualitySubjectHead.subject_id == subject.subject_id,
+                DataQualitySubjectHead.semantic_key == semantic_key,
+            )
+            .with_for_update()
+        )
+        if head is None:
+            self.db.add(
+                DataQualitySubjectHead(
+                    capability=result.capability,
+                    subject_type=subject.subject_type,
+                    subject_id=subject.subject_id,
+                    semantic_key=semantic_key,
+                    current_record_id=record.id,
+                    generation=1,
+                    updated_at=updated_at,
+                )
+            )
+        else:
+            head.current_record_id = record.id
+            head.generation += 1
+            head.updated_at = updated_at
+        self.db.flush()
+
     def _record_quality(self, result: ProviderResult, symbol: str | None) -> ProviderResult:
+        now = datetime.now()
         latest_content_at = None
         if result.capability == "announcement.catalog" and isinstance(result.value, list):
             candidates = []
@@ -211,9 +437,19 @@ class DataHubRouter:
                         candidates.append(self._as_datetime(parsed))
                         break
             latest_content_at = max((item for item in candidates if item), default=None)
+        subject = result.subject
         record = DataQualityRecord(
             symbol=symbol,
             capability=result.capability,
+            subject_type=subject.subject_type if subject else None,
+            subject_id=subject.subject_id if subject else None,
+            semantic_key=canonical_semantic_key(subject.semantic_key)
+            if subject
+            else "",
+            supersedes_record_id=self._superseded_conflict_id(
+                result,
+                evaluated_at=now,
+            ),
             quality_status=result.quality_status.value,
             observed_at=self._as_datetime(result.observed_at),
             fetched_at=result.fetched_at.replace(tzinfo=None)
@@ -238,10 +474,13 @@ class DataHubRouter:
         )
         self.db.add(record)
         self.db.flush()
+        self._advance_subject_head(result, record, updated_at=now)
         result.quality_record_id = record.id
         return result
 
     def mark_persisted(self, result: ProviderResult, cached_at: datetime | None = None) -> None:
+        if result.quality_record_id is None:
+            raise ProviderUnavailableError("Provider result has no quality audit lineage")
         if result.quality_status not in TRUSTED_QUALITY_STATUSES:
             raise ProviderUnavailableError(
                 f"Cannot persist untrusted {result.capability} result "
@@ -250,6 +489,12 @@ class DataHubRouter:
         record = self.db.get(DataQualityRecord, result.quality_record_id)
         if record is None:
             raise ProviderUnavailableError("Provider result has no persisted quality audit")
+        if record.capability != result.capability:
+            raise ProviderUnavailableError("Provider result capability does not match lineage")
+        if not self._scope_matches_result(record, result):
+            raise ProviderUnavailableError("Provider result subject does not match lineage")
+        if record.quality_status != result.quality_status.value:
+            raise ProviderUnavailableError("Provider result quality does not match lineage")
         record.persisted = True
         record.cached_at = cached_at or datetime.now()
         self.db.flush()
@@ -293,10 +538,15 @@ class DataHubRouter:
         operation: str,
         *args,
         symbol: str | None = None,
+        subject: SubjectRef | None = None,
         cache_loader: Callable[[], Any] | None = None,
         validator: Callable[[Any], bool] | None = None,
         **kwargs,
     ) -> ProviderResult:
+        if capability in MARKET_SUBJECT_CAPABILITIES and subject is None:
+            raise ProviderUnavailableError(
+                f"{capability} requires an explicit market subject"
+            )
         policy = policy_for(capability)
         errors: list[str] = []
         observations: list[QualityObservation] = []
@@ -397,10 +647,16 @@ class DataHubRouter:
             quality = assess_quality(observations, policy)
             fresh = [item for item in observations if not item.stale]
             selected = (fresh or observations)[0]
+            adjustment, price_unit, volume_unit = self._result_dimensions(
+                selected.value,
+                subject,
+            )
             result = ProviderResult(
                 value=selected.value,
                 provider_id=selected.provider_id,
                 capability=capability,
+                subject=subject,
+                operation=operation,
                 observed_at=selected.observed_at,
                 fetched_at=selected.fetched_at or datetime.now(),
                 fallback_used=bool(errors) or selected.provider_id != observations[0].provider_id,
@@ -414,19 +670,12 @@ class DataHubRouter:
                     else []
                 ),
                 normalized_digest=selected.normalized_digest,
-                adjustment=getattr(selected.value[0], "adjustment", None)
-                if isinstance(selected.value, list) and selected.value
-                else getattr(selected.value, "adjustment", None),
-                price_unit=getattr(selected.value[0], "price_unit", None)
-                if isinstance(selected.value, list) and selected.value
-                else getattr(selected.value, "price_unit", None),
-                volume_unit=getattr(selected.value[0], "volume_unit", None)
-                if isinstance(selected.value, list) and selected.value
-                else getattr(selected.value, "volume_unit", None),
+                adjustment=adjustment,
+                price_unit=price_unit,
+                volume_unit=volume_unit,
             )
             result = self._record_quality(result, symbol)
-            self.calls[capability] = result
-            return result
+            return self._remember_result(result)
 
         if cache_loader and policy.allow_cache_fallback:
             cached = cache_loader()
@@ -452,6 +701,8 @@ class DataHubRouter:
                     value=cached,
                     provider_id="local_cache",
                     capability=capability,
+                    subject=subject,
+                    operation=operation,
                     observed_at=observed_at,
                     fetched_at=now,
                     fallback_used=True,
@@ -461,6 +712,11 @@ class DataHubRouter:
                     provider_observations=audit,
                     normalized_digest=digest,
                 )
+                (
+                    result.adjustment,
+                    result.price_unit,
+                    result.volume_unit,
+                ) = self._result_dimensions(cached, subject)
                 result = self._record_quality(result, symbol)
                 self._log(
                     provider_id="local_cache",
@@ -475,14 +731,15 @@ class DataHubRouter:
                     cache_used=True,
                     error="; ".join(errors)[:2000] or None,
                 )
-                self.calls[capability] = result
-                return result
+                return self._remember_result(result)
 
         now = datetime.now()
         result = ProviderResult(
             value=None,
             provider_id="none",
             capability=capability,
+            subject=subject,
+            operation=operation,
             observed_at=None,
             fetched_at=now,
             fallback_used=bool(errors),
@@ -491,11 +748,16 @@ class DataHubRouter:
             quality_status=DataQualityStatus.MISSING,
             provider_observations=audit,
         )
+        (
+            result.adjustment,
+            result.price_unit,
+            result.volume_unit,
+        ) = self._result_dimensions(None, subject)
         result = self._record_quality(result, symbol)
-        self.calls[capability] = result
-        return result
+        return self._remember_result(result)
 
     def get_history(self, symbol: str, start: date, end: date, cache_loader=None):
+        subject = stock_daily_subject(symbol, "qfq", "CNY", "share")
         return self.invoke(
             "market.daily.qfq",
             "get_history",
@@ -503,27 +765,32 @@ class DataHubRouter:
             start,
             end,
             symbol=symbol,
+            subject=subject,
             cache_loader=cache_loader,
             validator=lambda value: isinstance(value, list) and len(value) >= 1,
         )
 
     def get_quote(self, symbol: str, cache_loader=None):
+        subject = stock_quote_subject(symbol, "realtime", "CNY")
         return self.invoke(
             "market.quote.realtime",
             "get_quote",
             symbol,
             symbol=symbol,
+            subject=subject,
             cache_loader=cache_loader,
             validator=lambda value: value is not None
             and getattr(value, "price", None) is not None,
         )
 
     def get_latest_close(self, symbol: str, cache_loader=None):
+        subject = stock_quote_subject(symbol, "latest_close", "CNY")
         return self.invoke(
             "market.quote.latest_close",
             "get_quote",
             symbol,
             symbol=symbol,
+            subject=subject,
             cache_loader=cache_loader,
             validator=lambda value: value is not None
             and getattr(value, "price", None) is not None
@@ -533,6 +800,12 @@ class DataHubRouter:
     def get_unadjusted_history(
         self, symbol: str, start: date, end: date, cache_loader=None
     ):
+        subject = stock_daily_subject(
+            symbol,
+            "unadjusted",
+            "CNY",
+            "share",
+        )
         return self.invoke(
             "market.daily.unadjusted",
             "get_history",
@@ -540,6 +813,7 @@ class DataHubRouter:
             start,
             end,
             symbol=symbol,
+            subject=subject,
             cache_loader=cache_loader,
             validator=lambda value: isinstance(value, list)
             and bool(value)
@@ -547,25 +821,39 @@ class DataHubRouter:
         )
 
     def get_index_history(self, symbol: str, start: date, end: date, cache_loader=None):
+        subject = index_daily_subject(
+            symbol,
+            "unadjusted",
+            "CNY",
+            "share",
+        )
         return self.invoke(
             "market.index_daily",
             "get_index_history",
             symbol,
             start,
             end,
-            symbol=symbol,
+            symbol=subject.subject_id,
+            subject=subject,
             cache_loader=cache_loader,
             validator=lambda value: bool(value and len(value.get("rows", [])) >= 20),
         )
 
     def get_sector_history(self, industry: str, start: date, end: date, cache_loader=None):
+        subject = sector_daily_subject(
+            industry,
+            "unadjusted",
+            "CNY",
+            "share",
+        )
         return self.invoke(
             "market.sector_daily",
             "get_sector_history",
             industry,
             start,
             end,
-            symbol=None,
+            symbol=subject.subject_id,
+            subject=subject,
             cache_loader=cache_loader,
             validator=lambda value: bool(value and len(value.get("rows", [])) >= 20),
         )
