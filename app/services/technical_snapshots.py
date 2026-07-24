@@ -5,29 +5,30 @@ import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Holding, MarketDailyBar, TechnicalSnapshot
-from app.services.data_sources import UnifiedDataService
+from app.data_hub.market_subjects import stock_daily_subject
+from app.models import Holding, TechnicalSnapshot
+from app.services.data_sources import build_data_hub
+from app.services.market_cache import replace_market_series, resolve_cached_series
 from app.services.technical import analyze_frame, compare_states
 
 
 def load_qfq_frame(db: Session, symbol: str) -> pd.DataFrame:
-    bars = db.scalars(
-        select(MarketDailyBar)
-        .where(
-            MarketDailyBar.symbol == symbol,
-            MarketDailyBar.adjustment == "qfq",
-            MarketDailyBar.quality_status.in_(("VERIFIED", "SINGLE_SOURCE")),
-        )
-        .order_by(MarketDailyBar.trade_date)
-    ).all()
-    if not bars:
-        raise ValueError("没有可信前复权历史数据，请先执行行情同步")
-    sources = {}
-    for item in bars:
-        sources.setdefault(item.source, []).append(item)
-    selected_source, bars = max(
-        sources.items(), key=lambda pair: max(item.fetched_at for item in pair[1])
+    subject = stock_daily_subject(symbol, "qfq", "CNY", "share")
+    selection = resolve_cached_series(
+        db,
+        cache_symbol=subject.subject_id,
+        capability="market.daily.qfq",
+        subject=subject,
+        adjustment="qfq",
+        price_unit="CNY",
+        volume_unit="share",
+        min_rows=250,
     )
+    if not selection.executable:
+        reason = selection.blocking_reason or selection.structure_reason or "missing"
+        quality = selection.effective_quality.effective_quality.value
+        raise ValueError(f"qfq market data is not executable: {quality} ({reason})")
+    bars = selection.bars
     frame = pd.DataFrame(
         [
             {
@@ -43,7 +44,11 @@ def load_qfq_frame(db: Session, symbol: str) -> pd.DataFrame:
     )
     frame["Date"] = pd.to_datetime(frame["Date"])
     frame = frame.set_index("Date")
-    frame.attrs["data_source"] = selected_source
+    frame.attrs["data_source"] = selection.source
+    frame.attrs["quality_record_id"] = selection.quality_record_id
+    frame.attrs["effective_quality"] = (
+        selection.effective_quality.effective_quality.value
+    )
     return frame
 
 
@@ -93,46 +98,23 @@ def snapshot_holding(db: Session, holding: Holding) -> TechnicalSnapshot:
 
 
 def refresh_qfq_history(db: Session, symbol: str, days: int = 550) -> int:
-    provider = UnifiedDataService(db)
+    provider = build_data_hub(db)
     result = provider.get_history(
         symbol, date.today() - timedelta(days=days), date.today()
     )
+    if result.quality_status.blocks_execution:
+        db.commit()
     bars = result.require_trusted_value()
-    source = bars[0].source if bars else "akshare_qfq"
-    existing = {
-        item.trade_date: item
-        for item in db.scalars(
-            select(MarketDailyBar).where(
-                MarketDailyBar.symbol == symbol,
-                MarketDailyBar.source == source,
-            )
-        ).all()
-    }
-    for bar in bars:
-        stored = existing.get(bar.trade_date)
-        if stored:
-            stored.open = bar.open
-            stored.high = bar.high
-            stored.low = bar.low
-            stored.close = bar.close
-            stored.volume = bar.volume
-            stored.adjustment = bar.adjustment
-            stored.price_unit = bar.price_unit
-            stored.volume_unit = bar.volume_unit
-            stored.observed_at = bar.observed_at
-            stored.quality_status = result.quality_status.value
-            stored.quality_record_id = result.quality_record_id
-            stored.fetched_at = bar.fetched_at
-        else:
-            db.add(
-                MarketDailyBar(
-                    **bar.__dict__,
-                    quality_status=result.quality_status.value,
-                    quality_record_id=result.quality_record_id,
-                )
-            )
-    provider.mark_persisted(result)
-    return len(bars)
+    subject = stock_daily_subject(symbol, "qfq", "CNY", "share")
+    stored = replace_market_series(
+        db,
+        provider,
+        result,
+        bars,
+        subject=subject,
+        min_rows=250,
+    )
+    return len(stored)
 
 
 def snapshot_all_holdings(db: Session, refresh_market: bool = False) -> dict:
@@ -143,8 +125,9 @@ def snapshot_all_holdings(db: Session, refresh_market: bool = False) -> dict:
         for symbol in sorted({item.symbol for item in holdings}):
             try:
                 refresh_qfq_history(db, symbol)
-                db.flush()
+                db.commit()
             except Exception as exc:
+                db.rollback()
                 refresh_errors[symbol] = str(exc)[:300]
     for holding in holdings:
         if holding.symbol in refresh_errors:
@@ -157,12 +140,13 @@ def snapshot_all_holdings(db: Session, refresh_market: bool = False) -> dict:
             )
             continue
         try:
-            snapshot = snapshot_holding(db, holding)
-            if refresh_market:
-                holding.current_price = Decimal(str(snapshot.indicators["close"]))
-                holding.price_source = "akshare_qfq_close"
-                holding.price_updated_at = datetime.now()
-            db.flush()
+            with db.begin_nested():
+                snapshot = snapshot_holding(db, holding)
+                if refresh_market:
+                    holding.current_price = Decimal(str(snapshot.indicators["close"]))
+                    holding.price_source = "akshare_qfq_close"
+                    holding.price_updated_at = datetime.now()
+                db.flush()
             created += 1
         except Exception as exc:
             errors.append(

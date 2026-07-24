@@ -4,7 +4,12 @@ from decimal import Decimal
 import numpy as np
 import pandas as pd
 
-from app.models import Account, Holding, MarketDailyBar
+from app.data_hub.contracts import DailyBar, DataProvider, ProviderMetadata
+from app.data_hub.market_subjects import stock_daily_subject
+from app.data_hub.registry import ProviderRegistry
+from app.data_hub.router import DataHubRouter
+from app.models import Account, Holding
+from app.services.market_cache import replace_market_series
 from app.services.technical import (
     _decayed_touch_weight,
     _touch_groups,
@@ -28,6 +33,41 @@ def price_frame(periods: int = 180) -> pd.DataFrame:
         },
         index=index,
     )
+
+
+class TechnicalHistoryProvider(DataProvider):
+    metadata = ProviderMetadata(
+        provider_id="technical-fixture",
+        supported_capabilities=("market.daily.qfq",),
+        priority=1,
+    )
+
+    def health_check(self, probe: bool = False):
+        return {"status": "healthy"}
+
+    def get_history(self, symbol, start, end):
+        rows = []
+        for index in range(260):
+            trade_date = end - timedelta(days=259 - index)
+            price = Decimal("10") + Decimal(index) / Decimal("50")
+            rows.append(
+                DailyBar(
+                    symbol=symbol,
+                    trade_date=trade_date,
+                    open=price,
+                    high=price + Decimal("0.2"),
+                    low=price - Decimal("0.2"),
+                    close=price,
+                    volume=Decimal(100000 + index * 100),
+                    adjustment="qfq",
+                    price_unit="CNY",
+                    volume_unit="share",
+                    observed_at=datetime.combine(trade_date, datetime.min.time()),
+                    source=self.provider_id,
+                    fetched_at=datetime.now(),
+                )
+            )
+        return rows
 
 
 def test_pandas_ta_analysis_produces_indicators_and_levels():
@@ -132,22 +172,20 @@ def test_holding_snapshot_api_persists_daily_state(client, session):
         price_source="manual",
     )
     session.add(holding)
-    start = date(2025, 1, 1)
-    for index in range(180):
-        price = Decimal("10") + Decimal(index) / Decimal("50")
-        session.add(
-            MarketDailyBar(
-                symbol="000001",
-                trade_date=start + timedelta(days=index),
-                open=price,
-                high=price + Decimal("0.2"),
-                low=price - Decimal("0.2"),
-                close=price,
-                volume=Decimal(100000 + index * 100),
-                source="akshare_qfq",
-                fetched_at=datetime.now(),
-            )
-        )
+    registry = ProviderRegistry()
+    registry.register(TechnicalHistoryProvider())
+    router = DataHubRouter(session, registry)
+    history = router.get_history(
+        "000001", date.today() - timedelta(days=365), date.today()
+    )
+    replace_market_series(
+        session,
+        router,
+        history,
+        history.require_value(),
+        subject=stock_daily_subject("000001", "qfq", "CNY", "share"),
+        min_rows=250,
+    )
     session.commit()
     analysis_response = client.get("/api/v1/technical/000001")
     assert analysis_response.status_code == 200

@@ -4,14 +4,17 @@ from decimal import Decimal
 import pytest
 
 from app.config import Settings
+from app.data_hub.contracts import DailyBar, DataProvider, ProviderMetadata, Quote
+from app.data_hub.market_subjects import stock_daily_subject
+from app.data_hub.registry import ProviderRegistry
+from app.data_hub.router import DataHubRouter
 from app.models import (
     CompanyAnnouncement,
     CompanyProfile,
     CompanyResearchRefresh,
-    MarketDailyBar,
-    MarketQuote,
 )
 from app.providers.llm_provider import OpenAICompatibleProvider
+from app.services.market_cache import persist_market_quote, replace_market_series
 from app.services.trade_plan_ai import validate_ai_output
 from app.services.trade_plan_generator import _floor_lot, ensure_generator_rule_version
 
@@ -26,6 +29,31 @@ def create_account(client, assets="100000", cash="80000"):
             "available_cash": cash,
         },
     ).json()
+
+
+class GeneratorMarketProvider(DataProvider):
+    metadata = ProviderMetadata(
+        provider_id="generator-fixture",
+        supported_capabilities=(
+            "market.daily.qfq",
+            "market.quote.realtime",
+        ),
+        priority=1,
+        realtime_supported=True,
+    )
+
+    def __init__(self, bars, quote):
+        self.bars = bars
+        self.quote = quote
+
+    def health_check(self, probe: bool = False):
+        return {"status": "healthy"}
+
+    def get_history(self, symbol, start, end):
+        return self.bars
+
+    def get_quote(self, symbol):
+        return self.quote
 
 
 def seed_pattern(session, symbol="300502", state="ready", price=None):
@@ -52,31 +80,52 @@ def seed_pattern(session, symbol="300502", state="ready", price=None):
         rows.extend([(10.02, 10.15, 9.9, 100.0)] * 3)
     # 让最后一根始终落在今天，满足新鲜度检查。
     start = date.today() - timedelta(days=len(rows) - 1)
-    for index, (close, high, low, volume) in enumerate(rows):
-        session.add(
-            MarketDailyBar(
-                symbol=symbol,
-                trade_date=start + timedelta(days=index),
-                open=Decimal(str(close - 0.03)),
-                high=Decimal(str(high)),
-                low=Decimal(str(low)),
-                close=Decimal(str(close)),
-                volume=Decimal(str(volume)),
-                source="akshare_tencent_qfq",
-                fetched_at=now,
-            )
-        )
-    latest = price if price is not None else rows[-1][0]
-    session.add(
-        MarketQuote(
+    bars = [
+        DailyBar(
             symbol=symbol,
-            name="测试公司",
-            price=Decimal(str(latest)),
-            source="akshare_sina",
-            source_api="stock_zh_a_spot",
+            trade_date=start + timedelta(days=index),
+            open=Decimal(str(close - 0.03)),
+            high=Decimal(str(high)),
+            low=Decimal(str(low)),
+            close=Decimal(str(close)),
+            volume=Decimal(str(volume)),
+            adjustment="qfq",
+            price_unit="CNY",
+            volume_unit="share",
+            observed_at=datetime.combine(
+                start + timedelta(days=index), datetime.min.time()
+            ),
+            source="akshare_tencent_qfq",
             fetched_at=now,
         )
+        for index, (close, high, low, volume) in enumerate(rows)
+    ]
+    latest = price if price is not None else rows[-1][0]
+    quote = Quote(
+        symbol=symbol,
+        name="测试公司",
+        price=Decimal(str(latest)),
+        quote_type="realtime",
+        observed_at=now,
+        price_unit="CNY",
+        source="akshare_sina",
+        source_api="stock_zh_a_spot",
+        fetched_at=now,
     )
+    registry = ProviderRegistry()
+    registry.register(GeneratorMarketProvider(bars, quote))
+    router = DataHubRouter(session, registry)
+    history_result = router.get_history(symbol, start, date.today())
+    replace_market_series(
+        session,
+        router,
+        history_result,
+        history_result.require_value(),
+        subject=stock_daily_subject(symbol, "qfq", "CNY", "share"),
+        min_rows=250,
+    )
+    quote_result = router.get_quote(symbol)
+    persist_market_quote(session, router, quote_result)
     session.commit()
 
 
@@ -156,11 +205,11 @@ def seed_governed_analysis(session, monkeypatch):
     rows = {
         "rows": [
             {
-                "date": date.today() - timedelta(days=39 - index),
+                "date": date.today() - timedelta(days=79 - index),
                 "close": 100 + index,
                 "volume": 1000 + index,
             }
-            for index in range(40)
+            for index in range(80)
         ],
         "source": "test",
         "fetched_at": datetime.now(),

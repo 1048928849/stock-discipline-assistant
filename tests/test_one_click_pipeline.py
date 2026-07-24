@@ -7,13 +7,17 @@ from sqlalchemy import create_engine, insert, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
+from app.data_hub.contracts import DailyBar, DataProvider, ProviderMetadata, Quote
+from app.data_hub.market_subjects import stock_daily_subject
+from app.data_hub.registry import ProviderRegistry
+from app.data_hub.router import DataHubRouter
 from app.database import Base
 from app.errors import AppError
 from app.models import (
     CompanyAnnouncement,
     CompanyProfile,
     CompanyResearchRefresh,
-    MarketDailyBar,
+    DataQualityRecord,
     MarketQuote,
     PlanAnalysisRun,
     TradePlan,
@@ -23,6 +27,7 @@ from app.services.one_click_pipeline import (
     confirm_one_click_plan,
     run_one_click_analysis,
 )
+from app.services.market_cache import persist_market_quote, replace_market_series
 from app.services.trade_plan_generator import generate_trade_plan_preview
 
 
@@ -50,30 +55,71 @@ def seed_pattern(session, symbol="300502"):
     rows.extend([(10.55, 10.65, 10.15, 220.0), (10.32, 10.48, 10.12, 55.0)])
     rows.append((10.82, 10.9, 10.3, 180.0))
     start = date.today() - timedelta(days=len(rows) - 1)
-    for index, (close, high, low, volume) in enumerate(rows):
-        session.add(
-            MarketDailyBar(
-                symbol=symbol,
-                trade_date=start + timedelta(days=index),
-                open=Decimal(str(close - 0.03)),
-                high=Decimal(str(high)),
-                low=Decimal(str(low)),
-                close=Decimal(str(close)),
-                volume=Decimal(str(volume)),
-                source="akshare_tencent_qfq",
-                fetched_at=now,
-            )
-        )
-    session.add(
-        MarketQuote(
+    bars = [
+        DailyBar(
             symbol=symbol,
-            name="测试公司",
-            price=Decimal("10.82"),
-            source="akshare_sina",
-            source_api="stock_zh_a_spot",
+            trade_date=start + timedelta(days=index),
+            open=Decimal(str(close - 0.03)),
+            high=Decimal(str(high)),
+            low=Decimal(str(low)),
+            close=Decimal(str(close)),
+            volume=Decimal(str(volume)),
+            adjustment="qfq",
+            price_unit="CNY",
+            volume_unit="share",
+            observed_at=datetime.combine(
+                start + timedelta(days=index), datetime.min.time()
+            ),
+            source="akshare_tencent_qfq",
             fetched_at=now,
         )
+        for index, (close, high, low, volume) in enumerate(rows)
+    ]
+
+    class PatternProvider(DataProvider):
+        metadata = ProviderMetadata(
+            provider_id="pattern-fixture",
+            supported_capabilities=(
+                "market.daily.qfq",
+                "market.quote.realtime",
+            ),
+            priority=1,
+            realtime_supported=True,
+        )
+
+        def health_check(self, probe: bool = False):
+            return {"status": "healthy"}
+
+        def get_history(self, requested_symbol, date_from, date_to):
+            return bars
+
+        def get_quote(self, requested_symbol):
+            return Quote(
+                symbol=requested_symbol,
+                name="测试公司",
+                price=Decimal("10.82"),
+                quote_type="realtime",
+                observed_at=now,
+                price_unit="CNY",
+                source="akshare_sina",
+                source_api="stock_zh_a_spot",
+                fetched_at=now,
+            )
+
+    registry = ProviderRegistry()
+    registry.register(PatternProvider())
+    router = DataHubRouter(session, registry)
+    history = router.get_history(symbol, start, date.today())
+    replace_market_series(
+        session,
+        router,
+        history,
+        history.require_value(),
+        subject=stock_daily_subject(symbol, "qfq", "CNY", "share"),
+        min_rows=250,
     )
+    quote = router.get_quote(symbol)
+    persist_market_quote(session, router, quote)
     session.commit()
 
 
@@ -84,6 +130,45 @@ def benchmark_rows(direction="up"):
         close = 100 + index if direction == "up" else 200 - index * 1.2
         rows.append({"date": start + timedelta(days=index), "close": close, "volume": 1000})
     return {"rows": rows, "source": "测试指数", "fetched_at": datetime.now()}
+
+
+class QuoteScenarioProvider(DataProvider):
+    def __init__(
+        self,
+        provider_id: str,
+        *,
+        price: str = "10.82",
+        quote_type: str = "realtime",
+        priority: int = 1,
+    ):
+        self.metadata = ProviderMetadata(
+            provider_id=provider_id,
+            supported_capabilities=(
+                "market.quote.realtime",
+                "market.quote.latest_close",
+            ),
+            priority=priority,
+            realtime_supported=True,
+        )
+        self.price = Decimal(price)
+        self.quote_type = quote_type
+
+    def health_check(self, probe: bool = False):
+        return {"status": "healthy"}
+
+    def get_quote(self, symbol):
+        now = datetime.now()
+        return Quote(
+            symbol=symbol,
+            name="测试公司",
+            price=self.price,
+            quote_type=self.quote_type,
+            observed_at=now,
+            price_unit="CNY",
+            source=self.provider_id,
+            source_api="quote-fixture",
+            fetched_at=now,
+        )
 
 
 def seed_profile(session):
@@ -586,9 +671,28 @@ def _holding_analysis_with_quote_quality(
     quote = session.query(MarketQuote).one()
     if quality_status is None:
         session.delete(quote)
-    else:
-        quote.quality_status = quality_status
-        quote.quote_type = quote_type
+    elif quality_status == "STALE":
+        stale_at = datetime.now() - timedelta(minutes=31)
+        quote.observed_at = stale_at
+        record = session.get(DataQualityRecord, quote.quality_record_id)
+        record.observed_at = stale_at
+    elif quality_status == "CONFLICTED":
+        registry = ProviderRegistry()
+        registry.register(QuoteScenarioProvider("quote-a", price="10.82"))
+        registry.register(
+            QuoteScenarioProvider("quote-b", price="11.82", priority=2)
+        )
+        DataHubRouter(session, registry).get_quote("300502")
+    elif quote_type == "latest_close":
+        session.delete(quote)
+        session.flush()
+        registry = ProviderRegistry()
+        registry.register(
+            QuoteScenarioProvider("latest-close", quote_type="latest_close")
+        )
+        router = DataHubRouter(session, registry)
+        result = router.get_latest_close("300502")
+        persist_market_quote(session, router, result)
     session.commit()
     return client.post(
         "/api/v1/trade-plan-generator/analyze",

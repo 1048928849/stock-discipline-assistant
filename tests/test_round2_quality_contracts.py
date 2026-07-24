@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from app.config import Settings
 from app.data_hub.contracts import DailyBar, ProviderMetadata, Quote
+from app.data_hub.market_subjects import stock_daily_subject
 from app.data_hub.quality import canonical_digest, policy_for
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
@@ -29,6 +30,7 @@ from app.providers.external_http_provider import ProfessionalMarketApiProvider
 from app.providers.tushare_provider import TushareProvider
 from app.services.company_research import sync_company_research
 from app.services.one_click_pipeline import _research_inventory, _sync_stock
+from app.services.market_cache import replace_market_series
 from app.services.technical_snapshots import load_qfq_frame
 
 
@@ -71,11 +73,10 @@ class ContractProvider:
 
     def get_history(self, symbol, start, end):
         close = Decimal(self.overrides.get("daily", "10.82"))
-        observed = datetime.combine(date.today(), datetime.min.time())
         return [
             DailyBar(
                 symbol=symbol,
-                trade_date=date.today(),
+                trade_date=date.today() - timedelta(days=259 - index),
                 open=close,
                 high=close + Decimal("0.1"),
                 low=close - Decimal("0.1"),
@@ -84,10 +85,14 @@ class ContractProvider:
                 adjustment="qfq",
                 price_unit="CNY",
                 volume_unit="share",
-                observed_at=observed,
+                observed_at=datetime.combine(
+                    date.today() - timedelta(days=259 - index),
+                    datetime.min.time(),
+                ),
                 source=self.provider_id,
                 fetched_at=datetime.now(),
             )
+            for index in range(260)
         ]
 
     def company_profile(self, symbol):
@@ -168,40 +173,26 @@ def test_conflicted_market_data_is_not_persisted_as_success(client, session, mon
 
 
 def test_conflicted_cached_market_data_cannot_become_single_source(session):
-    now = datetime.now()
-    session.add(
-        MarketDailyBar(
-            symbol="300502",
-            trade_date=date.today(),
-            open=10,
-            high=11,
-            low=9,
-            close=Decimal("10.82"),
-            volume=100,
-            adjustment="qfq",
-            price_unit="CNY",
-            volume_unit="share",
-            observed_at=now,
-            quality_status="VERIFIED",
-            source="trusted",
-            fetched_at=now,
-        )
+    subject = stock_daily_subject("300502", "qfq", "CNY", "share")
+    trusted_router = _router(session, ContractProvider("trusted"))
+    trusted = trusted_router.get_history(
+        "300502", date.today() - timedelta(days=365), date.today()
     )
-    session.add(
-        DataQualityRecord(
-            symbol="300502",
-            capability="market.daily.qfq",
-            quality_status="CONFLICTED",
-            observed_at=now,
-            fetched_at=now,
-            provider_id="multi",
-            provider_observations=[],
-            normalized_digest="a" * 64,
-            conflict_fields=["close"],
-            row_count=1,
-            trusted=False,
-            persisted=False,
-        )
+    replace_market_series(
+        session,
+        trusted_router,
+        trusted,
+        trusted.require_value(),
+        subject=subject,
+        min_rows=250,
+    )
+    conflict_router = _router(
+        session,
+        ContractProvider("a"),
+        ContractProvider("b", overrides={"daily": "12.00"}),
+    )
+    conflict_router.get_history(
+        "300502", date.today() - timedelta(days=365), date.today()
     )
     session.commit()
     step, _ = _sync_stock(session, "300502", _router(session), refresh=False)
@@ -408,28 +399,21 @@ def test_tushare_daily_close_is_excluded_from_realtime_quote():
 
 
 def test_professional_qfq_data_is_accepted_by_technical_engine(session):
-    now = datetime.now()
-    for index in range(3):
-        session.add(
-            MarketDailyBar(
-                symbol="300502",
-                trade_date=date.today() - timedelta(days=2 - index),
-                open=10,
-                high=11,
-                low=9,
-                close=10,
-                volume=100,
-                adjustment="qfq",
-                price_unit="CNY",
-                volume_unit="share",
-                observed_at=now,
-                quality_status="VERIFIED",
-                source="professional_market_api_qfq",
-                fetched_at=now,
-            )
-        )
+    subject = stock_daily_subject("300502", "qfq", "CNY", "share")
+    router = _router(session, ContractProvider("professional_market_api_qfq"))
+    result = router.get_history(
+        "300502", date.today() - timedelta(days=365), date.today()
+    )
+    replace_market_series(
+        session,
+        router,
+        result,
+        result.require_value(),
+        subject=subject,
+        min_rows=250,
+    )
     session.commit()
-    assert len(load_qfq_frame(session, "300502")) == 3
+    assert len(load_qfq_frame(session, "300502")) == 260
 
 
 def test_technical_engine_does_not_depend_on_provider_source_name(session):

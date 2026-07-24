@@ -4,13 +4,16 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
+from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from app.data_hub.contracts import DailyBar, ProviderUnavailableError
 from app.data_hub.effective_quality import resolve_effective_quality
 from app.data_hub.market_subjects import stock_quote_subject
+from app.data_hub.router import DataHubRouter, ProviderResult
 from app.domain.quality_subject import (
     EffectiveQualityResult,
     SubjectRef,
@@ -58,6 +61,145 @@ class _SeriesCandidate:
     observed_at: datetime | date | None
     source: str | None
     structure_reason: str | None
+
+
+def effective_quality_metadata(result: EffectiveQualityResult) -> dict[str, Any]:
+    return {
+        "stored_quality": result.stored_quality.value if result.stored_quality else None,
+        "freshness_quality": result.freshness_quality.value,
+        "newest_signal_quality": (
+            result.newest_signal_quality.value if result.newest_signal_quality else None
+        ),
+        "effective_quality": result.effective_quality.value,
+        "executable": result.executable,
+        "requires_refresh": result.requires_refresh,
+        "blocking_record_id": result.blocking_record_id,
+        "blocking_reason": result.blocking_reason,
+        "subject_type": result.subject_type,
+        "subject_id": result.subject_id,
+        "semantic_key": result.semantic_key,
+    }
+
+
+def persist_market_quote(
+    db: Session,
+    router: DataHubRouter,
+    result: ProviderResult,
+) -> MarketQuote:
+    quote = result.require_trusted_value()
+    if result.subject is None or result.quality_record_id is None:
+        raise ProviderUnavailableError("quote result has no complete lineage")
+    expected = stock_quote_subject(quote.symbol, quote.quote_type, quote.price_unit)
+    if result.subject != expected:
+        raise ProviderUnavailableError("quote result subject does not match value")
+
+    stored = db.scalar(select(MarketQuote).where(MarketQuote.symbol == quote.symbol))
+    values = {
+        "name": quote.name,
+        "price": quote.price,
+        "quote_type": quote.quote_type,
+        "observed_at": quote.observed_at,
+        "price_unit": quote.price_unit,
+        "quality_status": result.quality_status.value,
+        "quality_record_id": result.quality_record_id,
+        "source": quote.source,
+        "source_api": quote.source_api,
+        "fetched_at": quote.fetched_at,
+    }
+    if stored is None:
+        stored = MarketQuote(symbol=quote.symbol, **values)
+        db.add(stored)
+    else:
+        for key, value in values.items():
+            setattr(stored, key, value)
+    db.flush()
+    router.mark_persisted(result)
+    return stored
+
+
+def mapping_series_bars(
+    payload: dict[str, Any],
+    *,
+    cache_symbol: str,
+    adjustment: str,
+) -> list[DailyBar]:
+    source = str(payload["source"])
+    fetched_at = payload["fetched_at"]
+    bars = []
+    for row in payload["rows"]:
+        close = Decimal(str(row["close"]))
+        trade_date = row["date"]
+        bars.append(
+            DailyBar(
+                symbol=cache_symbol,
+                trade_date=trade_date,
+                open=close,
+                high=close,
+                low=close,
+                close=close,
+                volume=Decimal(str(row.get("volume") or 0)),
+                adjustment=adjustment,
+                price_unit="CNY",
+                volume_unit="share",
+                observed_at=datetime.combine(trade_date, time.min),
+                source=source,
+                fetched_at=fetched_at,
+            )
+        )
+    return bars
+
+
+def replace_market_series(
+    db: Session,
+    router: DataHubRouter,
+    result: ProviderResult,
+    bars: Iterable[Any],
+    *,
+    subject: SubjectRef,
+    min_rows: int,
+) -> list[MarketDailyBar]:
+    trusted = result.require_trusted_value()
+    rows = validate_series_for_persistence(bars, subject=subject, min_rows=min_rows)
+    if result.subject != subject or result.quality_record_id is None:
+        raise ProviderUnavailableError("series result has no matching complete lineage")
+    if len(rows) != len(trusted) and not isinstance(trusted, dict):
+        raise ProviderUnavailableError("series persistence row count does not match result")
+
+    first = rows[0]
+    db.execute(
+        delete(MarketDailyBar).where(
+            MarketDailyBar.symbol == subject.subject_id,
+            MarketDailyBar.source == first.source,
+            MarketDailyBar.adjustment == first.adjustment,
+            MarketDailyBar.price_unit == first.price_unit,
+            MarketDailyBar.volume_unit == first.volume_unit,
+        )
+    )
+    db.flush()
+    stored = [
+        MarketDailyBar(
+            symbol=row.symbol,
+            trade_date=row.trade_date,
+            open=row.open,
+            high=row.high,
+            low=row.low,
+            close=row.close,
+            volume=row.volume,
+            adjustment=row.adjustment,
+            price_unit=row.price_unit,
+            volume_unit=row.volume_unit,
+            observed_at=row.observed_at,
+            quality_status=result.quality_status.value,
+            quality_record_id=result.quality_record_id,
+            source=row.source,
+            fetched_at=row.fetched_at,
+        )
+        for row in rows
+    ]
+    db.add_all(stored)
+    db.flush()
+    router.mark_persisted(result)
+    return stored
 
 
 def _as_datetime(value: datetime | date | None) -> datetime:
@@ -431,6 +573,10 @@ def resolve_cached_series(
 __all__ = [
     "CachedQuoteSelection",
     "CachedSeriesSelection",
+    "effective_quality_metadata",
+    "mapping_series_bars",
+    "persist_market_quote",
+    "replace_market_series",
     "resolve_cached_quote",
     "resolve_cached_series",
     "validate_series_for_persistence",

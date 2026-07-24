@@ -1384,6 +1384,27 @@ def test_quote_api_new_conflict_is_not_executable(client, session):
     assert body["blocking_reason"] == "newer_conflict"
 
 
+def test_history_api_new_conflict_is_blocked(client, session):
+    router = _router(session, MarketStub("cached", row_count=260))
+    cached = router.get_history(
+        "300502", date.today() - timedelta(days=365), date.today()
+    )
+    _persist_daily(session, router, cached)
+    _router(
+        session,
+        MarketStub("a", row_count=260, daily_close="10"),
+        MarketStub("b", priority=20, row_count=260, daily_close="11"),
+    ).get_history("300502", date.today() - timedelta(days=365), date.today())
+    session.commit()
+
+    response = client.get("/api/v1/market/history/300502")
+
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "MARKET_DATA_CONFLICTED"
+    assert error["details"]["executable"] is False
+
+
 def test_quote_api_does_not_return_latest_close_as_realtime(client, session):
     router = _router(session, MarketStub("close", quote_type="latest_close"))
     result = router.get_latest_close("300502")
@@ -1475,6 +1496,63 @@ def test_new_daily_conflict_blocks_holding_snapshot_and_price_update(session):
     session.refresh(holding)
     assert result["processed"] == 0
     assert result["errors"]
+    assert holding.current_price == Decimal("9.0000")
+    assert holding.price_source == "manual"
+    assert session.scalar(select(TechnicalSnapshot)) is None
+
+
+def test_scheduler_refresh_persists_conflict_without_updating_holding(
+    session, monkeypatch
+):
+    router = _router(session, MarketStub("cached", row_count=260))
+    cached = router.get_history(
+        "300502", date.today() - timedelta(days=365), date.today()
+    )
+    _persist_daily(session, router, cached)
+    account = Account(
+        name="refresh-account",
+        total_assets=Decimal("100000"),
+        cash=Decimal("50000"),
+        available_cash=Decimal("50000"),
+    )
+    session.add(account)
+    session.flush()
+    holding = Holding(
+        account_id=account.id,
+        symbol="300502",
+        name="test-stock",
+        quantity=100,
+        cost_price=Decimal("9"),
+        current_price=Decimal("9"),
+        price_source="manual",
+    )
+    session.add(holding)
+    session.commit()
+    conflict_router = _router(
+        session,
+        MarketStub("a", row_count=260, daily_close="10"),
+        MarketStub("b", priority=20, row_count=260, daily_close="11"),
+    )
+    monkeypatch.setattr(
+        "app.services.technical_snapshots.build_data_hub",
+        lambda db: conflict_router,
+    )
+
+    result = snapshot_all_holdings(session, refresh_market=True)
+
+    session.refresh(holding)
+    latest = session.scalar(
+        select(DataQualityRecord)
+        .where(
+            DataQualityRecord.capability == "market.daily.qfq",
+            DataQualityRecord.subject_id == "300502",
+        )
+        .order_by(DataQualityRecord.id.desc())
+    )
+    assert result["processed"] == 0
+    assert result["errors"]
+    assert latest.quality_status == "CONFLICTED"
+    assert latest.persisted is False
     assert holding.current_price == Decimal("9.0000")
     assert holding.price_source == "manual"
     assert session.scalar(select(TechnicalSnapshot)) is None
@@ -1579,3 +1657,83 @@ def test_unrelated_sector_conflict_does_not_block_current_sector(session):
     )
     assert assessment["state"] != "无法判断"
     assert step["executable"] is True
+
+
+def test_market_sync_replaces_same_source_with_one_complete_lineage(
+    client, session, monkeypatch
+):
+    old_router = _router(session, MarketStub("same-source", row_count=270))
+    old = old_router.get_history(
+        "300502", date.today() - timedelta(days=365), date.today()
+    )
+    _persist_daily(session, old_router, old)
+    new_router = _router(
+        session,
+        MarketStub("same-source", row_count=260, daily_close="12"),
+    )
+    monkeypatch.setattr("app.api.advanced.build_data_hub", lambda db: new_router)
+
+    response = client.post("/api/v1/market/sync?symbol=300502&days=365")
+
+    assert response.status_code == 200, response.text
+    bars = session.scalars(
+        select(MarketDailyBar)
+        .where(MarketDailyBar.symbol == "300502")
+        .order_by(MarketDailyBar.trade_date)
+    ).all()
+    assert len(bars) == 260
+    assert {bar.quality_record_id for bar in bars} == {
+        new_router.result_for(
+            "market.daily.qfq",
+            "get_history",
+            stock_daily_subject("300502", "qfq", "CNY", "share"),
+            request_fingerprint(
+                capability="market.daily.qfq",
+                operation="get_history",
+                args=(
+                    "300502",
+                    date.today() - timedelta(days=365),
+                    date.today(),
+                ),
+                symbol="300502",
+            ),
+        ).quality_record_id
+    }
+    assert {bar.close for bar in bars} == {Decimal("12.0000")}
+
+
+def test_market_sync_rolls_back_replacement_when_lineage_mark_fails(
+    client, session, monkeypatch
+):
+    old_router = _router(session, MarketStub("same-source", row_count=260))
+    old = old_router.get_history(
+        "300502", date.today() - timedelta(days=365), date.today()
+    )
+    old_bars = _persist_daily(session, old_router, old)
+    old_quality_record_id = old.quality_record_id
+    old_quote = old_router.get_quote("300502")
+    _persist_quote(session, old_router, old_quote)
+    new_router = _router(
+        session,
+        MarketStub("same-source", row_count=260, daily_close="12"),
+    )
+    original_mark_persisted = new_router.mark_persisted
+
+    def fail_history_lineage(result, cached_at=None):
+        if result.capability == "market.daily.qfq":
+            raise ProviderUnavailableError("lineage mark failed")
+        return original_mark_persisted(result, cached_at=cached_at)
+
+    monkeypatch.setattr(new_router, "mark_persisted", fail_history_lineage)
+    monkeypatch.setattr("app.api.advanced.build_data_hub", lambda db: new_router)
+
+    response = client.post("/api/v1/market/sync?symbol=300502&days=365")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "stale_fallback"
+    bars = session.scalars(
+        select(MarketDailyBar).where(MarketDailyBar.symbol == "300502")
+    ).all()
+    assert len(bars) == len(old_bars)
+    assert {bar.quality_record_id for bar in bars} == {old_quality_record_id}
+    assert {bar.close for bar in bars} == {Decimal("10.0000")}
