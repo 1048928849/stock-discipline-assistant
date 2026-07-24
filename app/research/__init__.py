@@ -1,3 +1,11 @@
-from app.research.orchestrator import ExistingAIResearchOrchestrator, ResearchOrchestrator
+from app.research.orchestrator import (
+    ExistingAIResearchOrchestrator,
+    ResearchExecution,
+    ResearchOrchestrator,
+)
 
-__all__ = ["ExistingAIResearchOrchestrator", "ResearchOrchestrator"]
+__all__ = [
+    "ExistingAIResearchOrchestrator",
+    "ResearchExecution",
+    "ResearchOrchestrator",
+]
