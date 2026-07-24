@@ -822,7 +822,12 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
     return preview
 
 
-def _persist_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
+def _persist_generated_plan(
+    db: Session,
+    request: TradePlanSaveRequest,
+    *,
+    analysis_run_id: int | None = None,
+) -> dict:
     preview_request = TradePlanPreviewRequest(
         **request.model_dump(
             exclude={"preview_hash", "ai_analysis_id", "decision_package"}
@@ -835,6 +840,7 @@ def _persist_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
         select(TradePlan)
         .where(TradePlan.account_id == request.account_id, TradePlan.symbol == request.symbol)
         .order_by(TradePlan.plan_version.desc(), TradePlan.id.desc())
+        .with_for_update()
     )
     version = (latest.plan_version or 1) + 1 if latest else 1
     buy_zone = preview["buy_plan"]["buy_zone"]
@@ -885,6 +891,7 @@ def _persist_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
         data_date=date.fromisoformat(preview["data_date"]),
         source="确定性交易计划生成器",
         plan_version=version,
+        analysis_run_id=analysis_run_id,
         parent_plan_id=latest.id if latest else None,
         preview_hash=preview["preview_hash"],
         engine_snapshot=preview,

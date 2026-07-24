@@ -216,28 +216,29 @@ def create_trade_plan(db: Session, payload: TradePlanCreate) -> TradePlan:
     checks = _gate_values(payload, quantity, rule.version)
     statuses = {item["status"] for item in checks}
     if "不通过" in statuses:
-        status = "BLOCKED"
-        next_action = "存在不通过的交易闸门：不要执行买入，先处理对应风险。"
+        calculated_gate_status = "BLOCKED"
     elif "无法判断" in statuses:
-        status = "DRAFT"
-        next_action = "数据或计划尚未补齐：完善无法判断项后再评估。"
+        calculated_gate_status = "DRAFT"
     else:
-        status = "READY"
-        next_action = "计划条件完整；仅在买入触发条件出现时按计划执行，不代表建议买入。"
-    status = "DRAFT"
+        calculated_gate_status = "READY"
+    formal_plan_status = "DRAFT"
     next_action = (
         "Manual draft only; 不要执行买入，需先运行受管分析并冻结正式计划。"
     )
     plan = TradePlan(
         **payload.model_dump(),
         rule_version_id=rule.id,
-        status=status,
+        status=formal_plan_status,
         account_equity=account.total_assets,
         planned_quantity=quantity,
         planned_position_value=entry * quantity,
         planned_risk_amount=per_share_risk * quantity,
         next_action=next_action,
         data_status="manual_draft",
+        execution_summary={
+            "calculated_gate_status": calculated_gate_status,
+            "formal_plan_status": formal_plan_status,
+        },
         source="用户事前计划 + 规则化仓位计算",
     )
     db.add(plan)
@@ -264,6 +265,10 @@ def serialize_trade_plan(db: Session, plan: TradePlan) -> dict:
         "status": plan.status,
         "execution_status": plan.execution_status,
         "execution_summary": plan.execution_summary,
+        "calculated_gate_status": (plan.execution_summary or {}).get(
+            "calculated_gate_status"
+        ),
+        "formal_plan_status": plan.status,
         "trade_mode": plan.trade_mode,
         "decision_level": plan.decision_level,
         "market_state": plan.market_state,

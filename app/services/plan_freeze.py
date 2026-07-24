@@ -10,13 +10,19 @@ from sqlalchemy.orm import Session
 from app.data_hub.quality import observation_is_stale, policy_for
 from app.domain.models import DecisionPackage
 from app.errors import AppError
-from app.models import CompanyAnnouncement, CompanyProfile, MarketDailyBar
+from app.models import (
+    CompanyProfile,
+    CompanyResearchRefresh,
+    DataQualityRecord,
+    MarketDailyBar,
+)
 from app.schemas_workflow import TradePlanPreviewRequest, TradePlanSaveRequest
 
 
 MAX_ANALYSIS_AGE = timedelta(hours=24)
 CAPABILITY_POLICY = {
-    "stock_daily_bars": "market.daily",
+    "stock_daily_bars": "market.daily.qfq",
+    "market_quote": "market.quote.realtime",
     "benchmark_daily_bars": "market.index_daily",
     "sector_daily_bars": "market.sector_daily",
     "company_profile": "fundamental.profile",
@@ -61,6 +67,7 @@ def freeze_trade_plan(
     request: TradePlanSaveRequest,
     decision_package: dict[str, Any] | None,
     analysis_created_at: datetime | None = None,
+    analysis_run_id: int | None = None,
 ) -> dict:
     package = _validated_package(decision_package)
     if analysis_created_at and datetime.now() - analysis_created_at > MAX_ANALYSIS_AGE:
@@ -103,15 +110,23 @@ def freeze_trade_plan(
             )
         ),
         db.scalar(
-            select(CompanyAnnouncement).where(
-                CompanyAnnouncement.symbol == request.symbol,
-                CompanyAnnouncement.fetched_at > package.generated_at,
+            select(CompanyResearchRefresh).where(
+                CompanyResearchRefresh.symbol == request.symbol,
+                CompanyResearchRefresh.section == "announcements",
+                CompanyResearchRefresh.checked_at > package.generated_at,
             )
         ),
         db.scalar(
             select(MarketDailyBar).where(
                 MarketDailyBar.symbol.in_((request.symbol, "CSI000300")),
                 MarketDailyBar.fetched_at > package.generated_at,
+            )
+        ),
+        db.scalar(
+            select(DataQualityRecord).where(
+                DataQualityRecord.symbol == request.symbol,
+                DataQualityRecord.created_at > package.generated_at,
+                DataQualityRecord.quality_status.in_(("CONFLICTED", "STALE", "MISSING")),
             )
         ),
     ]
@@ -149,7 +164,11 @@ def freeze_trade_plan(
             "Rule or account snapshot no longer matches the analysis.",
         )
     try:
-        return _persist_generated_plan(db, request)
+        return _persist_generated_plan(
+            db,
+            request,
+            analysis_run_id=analysis_run_id,
+        )
     except Exception:
         db.rollback()
         raise
