@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -21,7 +21,7 @@ from app.data_hub.market_subjects import (
     stock_quote_subject,
 )
 from app.data_hub.registry import ProviderRegistry
-from app.data_hub.router import DataHubRouter
+from app.data_hub.router import DataHubRouter, request_fingerprint
 from app.domain.quality import DataQualityStatus
 from app.domain.quality_subject import SubjectRef, canonical_semantic_key
 from app.models import (
@@ -30,7 +30,11 @@ from app.models import (
     MarketDailyBar,
     MarketQuote,
 )
-from app.services.market_cache import resolve_cached_quote, resolve_cached_series
+from app.services.market_cache import (
+    resolve_cached_quote,
+    resolve_cached_series,
+    validate_series_for_persistence,
+)
 
 
 class MarketStub(DataProvider):
@@ -43,6 +47,7 @@ class MarketStub(DataProvider):
         quote_type: str = "realtime",
         daily_close: str = "10.00",
         adjustment: str = "qfq",
+        row_count: int = 3,
         observed_at: datetime | None = None,
         failures: set[str] | None = None,
     ):
@@ -63,6 +68,7 @@ class MarketStub(DataProvider):
         self.quote_type = quote_type
         self.daily_close = Decimal(daily_close)
         self.adjustment = adjustment
+        self.row_count = row_count
         self.observed_at = observed_at
         self.failures = failures or set()
 
@@ -94,8 +100,8 @@ class MarketStub(DataProvider):
     def get_history(self, symbol: str, start: date, end: date) -> list[DailyBar]:
         self._fail_if_requested("get_history")
         rows = []
-        for offset in range(3):
-            trade_date = end - timedelta(days=2 - offset)
+        for offset in range(self.row_count):
+            trade_date = end - timedelta(days=self.row_count - 1 - offset)
             observed_at = datetime.combine(trade_date, datetime.min.time())
             rows.append(
                 DailyBar(
@@ -384,10 +390,16 @@ def test_market_call_results_do_not_overwrite_other_subjects(session):
     first = router.get_quote("300502")
     second = router.get_quote("600000")
     assert router.result_for(
-        "market.quote.realtime", "get_quote", first.subject
+        "market.quote.realtime",
+        "get_quote",
+        first.subject,
+        first.request_fingerprint,
     ) is first
     assert router.result_for(
-        "market.quote.realtime", "get_quote", second.subject
+        "market.quote.realtime",
+        "get_quote",
+        second.subject,
+        second.request_fingerprint,
     ) is second
 
 
@@ -408,9 +420,19 @@ def test_market_call_results_do_not_overwrite_other_operations(session):
         symbol="300502",
         subject=subject,
     )
-    assert router.result_for("market.quote.realtime", "get_quote", subject) is first
+    assert router.result_for(
+        "market.quote.realtime",
+        "get_quote",
+        subject,
+        first.request_fingerprint,
+    ) is first
     assert (
-        router.result_for("market.quote.realtime", "get_quote_alias", subject)
+        router.result_for(
+            "market.quote.realtime",
+            "get_quote_alias",
+            subject,
+            second.request_fingerprint,
+        )
         is second
     )
 
@@ -945,3 +967,318 @@ def test_sector_cache_uses_stable_sector_subject(session):
     assert selected.subject == subject
     assert len(subject.subject_id) == 12
     assert selected.quality_record_id == result.quality_record_id
+
+
+def test_same_stock_history_windows_do_not_overwrite_call_results(session):
+    router = _router(session, MarketStub("a"))
+    subject = stock_daily_subject("300502", "qfq", "CNY", "share")
+    first = router.get_history("300502", date(2026, 7, 1), date(2026, 7, 10))
+    second = router.get_history("300502", date(2026, 7, 11), date(2026, 7, 20))
+
+    assert first.request_fingerprint != second.request_fingerprint
+    assert router.result_for(
+        "market.daily.qfq",
+        "get_history",
+        subject,
+        first.request_fingerprint,
+    ) is first
+    assert router.result_for(
+        "market.daily.qfq",
+        "get_history",
+        subject,
+        second.request_fingerprint,
+    ) is second
+
+
+def test_identical_requests_generate_identical_fingerprints(session):
+    router = _router(session, MarketStub("a"))
+    first = router.get_history("300502", date(2026, 7, 1), date(2026, 7, 10))
+    second = router.get_history("300502", date(2026, 7, 1), date(2026, 7, 10))
+    assert first.request_fingerprint == second.request_fingerprint
+
+
+def test_request_fingerprint_ignores_dict_order():
+    first = request_fingerprint(
+        capability="market.test",
+        operation="fetch",
+        args=(),
+        kwargs={"filters": {"symbol": " 300502 ", "limit": 10}},
+    )
+    second = request_fingerprint(
+        capability="market.test",
+        operation="fetch",
+        args=(),
+        kwargs={"filters": {"limit": 10, "symbol": "300502"}},
+    )
+    assert first == second
+
+
+def test_request_fingerprint_normalizes_dates_datetimes_and_decimals():
+    utc = datetime(2026, 7, 24, 4, 0, tzinfo=timezone.utc)
+    cst = datetime.fromisoformat("2026-07-24T12:00:00+08:00")
+    first = request_fingerprint(
+        capability="market.test",
+        operation="fetch",
+        args=(date(2026, 7, 24), utc, Decimal("10.00")),
+        kwargs={},
+    )
+    second = request_fingerprint(
+        capability="market.test",
+        operation="fetch",
+        args=(date.fromisoformat("2026-07-24"), cst, Decimal("10")),
+        kwargs={},
+    )
+    assert first == second
+
+
+def test_provider_result_public_meta_exposes_request_fingerprint(session):
+    result = _router(session, MarketStub("a")).get_quote("300502")
+    assert len(result.request_fingerprint) == 64
+    assert result.public_meta()["request_fingerprint"] == result.request_fingerprint
+
+
+def test_result_for_requires_exact_request_fingerprint(session):
+    router = _router(session, MarketStub("a"))
+    result = router.get_quote("300502")
+    assert router.result_for(
+        result.capability,
+        result.operation,
+        result.subject,
+        result.request_fingerprint,
+    ) is result
+    assert router.result_for(
+        result.capability,
+        result.operation,
+        result.subject,
+        "0" * 64,
+    ) is None
+
+
+def test_quote_and_history_request_identities_are_distinct(session):
+    router = _router(session, MarketStub("a"))
+    quote = router.get_quote("300502")
+    history = router.get_history("300502", date(2026, 7, 1), date(2026, 7, 10))
+    assert quote.request_fingerprint != history.request_fingerprint
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"normalized_digest": "0" * 64},
+        {"observed_at": datetime(2020, 1, 1)},
+        {"provider_id": "forged-provider"},
+        {"operation": "forged-operation"},
+        {"request_fingerprint": "f" * 64},
+    ],
+)
+def test_mark_persisted_rejects_runtime_lineage_mismatch(session, change):
+    router = _router(session, MarketStub("a"))
+    result = router.get_quote("300502")
+    with pytest.raises(ProviderUnavailableError):
+        router.mark_persisted(replace(result, **change))
+
+
+def test_mark_persisted_rejects_dataclass_copy_of_current_result(session):
+    router = _router(session, MarketStub("a"))
+    result = router.get_quote("300502")
+    with pytest.raises(ProviderUnavailableError):
+        router.mark_persisted(replace(result))
+
+
+def test_mark_persisted_allows_exact_current_lineage(session):
+    router = _router(session, MarketStub("a"))
+    result = router.get_quote("300502")
+    router.mark_persisted(result)
+    record = _quality_record(session, result)
+    assert record.persisted is True
+
+
+def test_series_rejects_partial_cache_even_above_min_rows(session):
+    router = _router(session, MarketStub("a", row_count=100))
+    result = router.get_history("300502", date(2026, 1, 1), date(2026, 7, 24))
+    _persist_daily(session, router, result, row_count=90)
+    selected = _series_selection(session, min_rows=80)
+    assert selected.executable is False
+    assert selected.structure_reason == "row_count_mismatch"
+
+
+def test_series_rejects_lineage_not_persisted(session):
+    router = _router(session, MarketStub("a"))
+    result = router.get_history("300502", date(2026, 7, 1), date(2026, 7, 24))
+    rows = result.require_value()
+    for bar in rows:
+        session.add(
+            MarketDailyBar(
+                symbol=bar.symbol,
+                trade_date=bar.trade_date,
+                open=bar.open,
+                high=bar.high,
+                low=bar.low,
+                close=bar.close,
+                volume=bar.volume,
+                adjustment=bar.adjustment,
+                price_unit=bar.price_unit,
+                volume_unit=bar.volume_unit,
+                observed_at=bar.observed_at,
+                quality_status=result.quality_status.value,
+                quality_record_id=result.quality_record_id,
+                source=bar.source,
+                fetched_at=bar.fetched_at,
+            )
+        )
+    session.commit()
+    selected = _series_selection(session)
+    assert selected.executable is False
+    assert selected.structure_reason == "lineage_not_persisted"
+
+
+def test_series_rejects_capability_mismatch(session):
+    router = _router(session, MarketStub("a"))
+    result = router.get_history("300502", date(2026, 7, 1), date(2026, 7, 24))
+    _persist_daily(session, router, result)
+    subject = stock_daily_subject("300502", "qfq", "CNY", "share")
+    selected = resolve_cached_series(
+        session,
+        cache_symbol="300502",
+        capability="market.daily.unadjusted",
+        subject=subject,
+        adjustment="qfq",
+        price_unit="CNY",
+        volume_unit="share",
+        min_rows=3,
+    )
+    assert selected.executable is False
+    assert selected.structure_reason == "lineage_scope_mismatch"
+
+
+def test_series_rejects_subject_mismatch(session):
+    router = _router(session, MarketStub("a"))
+    result = router.get_history("300502", date(2026, 7, 1), date(2026, 7, 24))
+    _persist_daily(session, router, result)
+    selected = resolve_cached_series(
+        session,
+        cache_symbol="300502",
+        capability="market.daily.qfq",
+        subject=stock_daily_subject("600000", "qfq", "CNY", "share"),
+        adjustment="qfq",
+        price_unit="CNY",
+        volume_unit="share",
+        min_rows=3,
+    )
+    assert selected.executable is False
+    assert selected.structure_reason == "lineage_scope_mismatch"
+
+
+def test_series_rejects_semantic_key_mismatch(session):
+    router = _router(session, MarketStub("a"))
+    result = router.get_history("300502", date(2026, 7, 1), date(2026, 7, 24))
+    _persist_daily(session, router, result)
+    selected = resolve_cached_series(
+        session,
+        cache_symbol="300502",
+        capability="market.daily.qfq",
+        subject=stock_daily_subject("300502", "hfq", "CNY", "share"),
+        adjustment="qfq",
+        price_unit="CNY",
+        volume_unit="share",
+        min_rows=3,
+    )
+    assert selected.executable is False
+    assert selected.structure_reason == "lineage_scope_mismatch"
+
+
+def test_series_rejects_observed_at_mismatch(session):
+    router = _router(session, MarketStub("a"))
+    result = router.get_history("300502", date(2026, 7, 1), date(2026, 7, 24))
+    stored = _persist_daily(session, router, result)
+    stored[-1].observed_at += timedelta(minutes=1)
+    session.commit()
+    selected = _series_selection(session)
+    assert selected.executable is False
+    assert selected.structure_reason == "observed_at_mismatch"
+
+
+def test_series_complete_lineage_has_no_structure_error(session):
+    router = _router(session, MarketStub("a"))
+    result = router.get_history("300502", date(2026, 7, 1), date(2026, 7, 24))
+    _persist_daily(session, router, result)
+    selected = _series_selection(session)
+    assert selected.executable is True
+    assert selected.structure_reason is None
+
+
+def test_preflight_rejects_partial_refresh_without_changing_cache(session):
+    router = _router(session, MarketStub("cached"))
+    current = router.get_history("300502", date(2026, 7, 1), date(2026, 7, 24))
+    stored = _persist_daily(session, router, current)
+    old_ids = [item.id for item in stored]
+    refresh = _router(session, MarketStub("refresh")).get_history(
+        "300502", date(2026, 7, 1), date(2026, 7, 24)
+    )
+    with pytest.raises(ValueError, match="insufficient_rows"):
+        validate_series_for_persistence(
+            refresh.require_value()[:2],
+            subject=refresh.subject,
+            min_rows=3,
+        )
+    assert session.scalars(select(MarketDailyBar.id).order_by(MarketDailyBar.id)).all() == old_ids
+
+
+def test_preflight_accepts_complete_same_source_refresh(session):
+    result = _router(session, MarketStub("a")).get_history(
+        "300502", date(2026, 7, 1), date(2026, 7, 24)
+    )
+    validated = validate_series_for_persistence(
+        result.require_value(),
+        subject=result.subject,
+        min_rows=3,
+    )
+    assert validated == result.require_value()
+
+
+def test_preflight_rejects_duplicate_dates(session):
+    result = _router(session, MarketStub("a")).get_history(
+        "300502", date(2026, 7, 1), date(2026, 7, 24)
+    )
+    bars = list(result.require_value())
+    bars[1] = replace(bars[1], trade_date=bars[0].trade_date)
+    with pytest.raises(ValueError, match="duplicate_trade_dates"):
+        validate_series_for_persistence(bars, subject=result.subject, min_rows=3)
+
+
+def test_preflight_rejects_mixed_sources(session):
+    result = _router(session, MarketStub("a")).get_history(
+        "300502", date(2026, 7, 1), date(2026, 7, 24)
+    )
+    bars = list(result.require_value())
+    bars[1] = replace(bars[1], source="other")
+    with pytest.raises(ValueError, match="mixed_sources"):
+        validate_series_for_persistence(bars, subject=result.subject, min_rows=3)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"adjustment": "unadjusted"},
+        {"price_unit": "USD"},
+        {"volume_unit": "lot"},
+    ],
+)
+def test_preflight_rejects_mixed_dimensions(session, change):
+    result = _router(session, MarketStub("a")).get_history(
+        "300502", date(2026, 7, 1), date(2026, 7, 24)
+    )
+    bars = list(result.require_value())
+    bars[1] = replace(bars[1], **change)
+    with pytest.raises(ValueError, match="mixed_dimensions"):
+        validate_series_for_persistence(bars, subject=result.subject, min_rows=3)
+
+
+def test_preflight_rejects_invalid_ohlc(session):
+    result = _router(session, MarketStub("a")).get_history(
+        "300502", date(2026, 7, 1), date(2026, 7, 24)
+    )
+    bars = list(result.require_value())
+    bars[1] = replace(bars[1], high=bars[1].low - Decimal("1"))
+    with pytest.raises(ValueError, match="invalid_ohlc"):
+        validate_series_for_persistence(bars, subject=result.subject, min_rows=3)
