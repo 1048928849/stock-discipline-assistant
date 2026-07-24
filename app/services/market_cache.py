@@ -162,8 +162,48 @@ def replace_market_series(
     rows = validate_series_for_persistence(bars, subject=subject, min_rows=min_rows)
     if result.subject != subject or result.quality_record_id is None:
         raise ProviderUnavailableError("series result has no matching complete lineage")
-    if len(rows) != len(trusted) and not isinstance(trusted, dict):
+    if isinstance(trusted, list):
+        expected_row_count = len(trusted)
+    elif isinstance(trusted, dict) and isinstance(trusted.get("rows"), list):
+        expected_row_count = len(trusted["rows"])
+    else:
+        raise ProviderUnavailableError("unsupported series result structure")
+    if len(rows) != expected_row_count:
         raise ProviderUnavailableError("series persistence row count does not match result")
+
+    current = router.result_for(
+        result.capability,
+        result.operation,
+        result.subject,
+        result.request_fingerprint,
+    )
+    if current is not result:
+        raise ProviderUnavailableError(
+            "series result is not the current exact Router call lineage"
+        )
+    record = db.get(DataQualityRecord, result.quality_record_id)
+    if record is None:
+        raise ProviderUnavailableError("series result has no quality record")
+    if record.row_count != expected_row_count:
+        raise ProviderUnavailableError(
+            "series quality record row count does not match result"
+        )
+    if record.capability != result.capability or not _scope_matches(
+        record,
+        capability=result.capability,
+        subject=subject,
+    ):
+        raise ProviderUnavailableError("series quality record scope does not match result")
+    if record.quality_status != result.quality_status.value:
+        raise ProviderUnavailableError("series quality record quality does not match result")
+    if record.normalized_digest != result.normalized_digest:
+        raise ProviderUnavailableError("series quality record digest does not match result")
+    if _as_datetime(record.observed_at) != _as_datetime(result.observed_at):
+        raise ProviderUnavailableError(
+            "series quality record observed_at does not match result"
+        )
+    if record.provider_id != result.provider_id:
+        raise ProviderUnavailableError("series quality record provider does not match result")
 
     first = rows[0]
     db.execute(
