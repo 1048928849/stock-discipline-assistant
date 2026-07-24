@@ -6,6 +6,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     Numeric,
@@ -172,9 +173,33 @@ class DataQualityRecord(Base):
     """Immutable quality decision for a provider refresh or persisted cache."""
 
     __tablename__ = "data_quality_records"
+    __table_args__ = (
+        Index(
+            "ix_data_quality_records_subject_scope",
+            "capability",
+            "subject_type",
+            "subject_id",
+            "semantic_key",
+            "id",
+        ),
+        Index(
+            "ix_data_quality_records_supersedes_record_id",
+            "supersedes_record_id",
+        ),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     symbol: Mapped[str | None] = mapped_column(String(40), index=True)
     capability: Mapped[str] = mapped_column(String(80), index=True)
+    subject_type: Mapped[str | None] = mapped_column(String(20))
+    subject_id: Mapped[str | None] = mapped_column(String(160))
+    semantic_key: Mapped[str | None] = mapped_column(String(200))
+    supersedes_record_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "data_quality_records.id",
+            name="fk_data_quality_records_supersedes_record",
+            use_alter=True,
+        )
+    )
     quality_status: Mapped[str] = mapped_column(String(20), index=True)
     observed_at: Mapped[datetime | None] = mapped_column(DateTime)
     fetched_at: Mapped[datetime] = mapped_column(DateTime)
@@ -196,6 +221,44 @@ class DataQualityRecord(Base):
     checked_at: Mapped[datetime | None] = mapped_column(DateTime)
     latest_content_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class DataQualitySubjectHead(Base):
+    __tablename__ = "data_quality_subject_heads"
+    __table_args__ = (
+        UniqueConstraint(
+            "capability",
+            "subject_type",
+            "subject_id",
+            "semantic_key",
+            name="uq_data_quality_subject_head_scope",
+        ),
+        Index(
+            "ix_data_quality_subject_heads_scope_generation",
+            "capability",
+            "subject_type",
+            "subject_id",
+            "semantic_key",
+            "generation",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    capability: Mapped[str] = mapped_column(String(80), nullable=False)
+    subject_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    subject_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    semantic_key: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    current_record_id: Mapped[int] = mapped_column(
+        ForeignKey("data_quality_records.id", name="fk_quality_subject_head_current_record"),
+        nullable=False,
+        index=True,
+    )
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
 
 
 class DataProviderCallLog(Base):
