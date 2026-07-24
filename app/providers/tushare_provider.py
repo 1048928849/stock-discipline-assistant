@@ -30,8 +30,8 @@ class TushareProvider(
         self.metadata = ProviderMetadata(
             provider_id="tushare",
             supported_capabilities=(
-                "market.daily",
-                "market.quote",
+                "market.daily.unadjusted",
+                "market.quote.latest_close",
                 "fundamental.profile",
                 "fundamental.statements",
                 "fundamental.valuation",
@@ -91,10 +91,14 @@ class TushareProvider(
         if not rows:
             raise ProviderUnavailableError("Tushare免费日线没有当日行情；该Provider不冒充实时行情")
         row = rows[0]
+        observed_at = datetime.strptime(str(row["trade_date"]), "%Y%m%d")
         return Quote(
             symbol=symbol,
             name=symbol,
             price=Decimal(str(row["close"])),
+            quote_type="latest_close",
+            observed_at=observed_at,
+            price_unit="CNY",
             source="tushare_daily_close",
             source_api="daily",
             fetched_at=datetime.now(),
@@ -118,6 +122,10 @@ class TushareProvider(
                     low=Decimal(str(row["low"])),
                     close=Decimal(str(row["close"])),
                     volume=Decimal(str(row["vol"])) * 100,
+                    adjustment="unadjusted",
+                    price_unit="CNY",
+                    volume_unit="share",
+                    observed_at=datetime.strptime(str(row["trade_date"]), "%Y%m%d"),
                     source="tushare_daily_unadjusted",
                     fetched_at=fetched_at,
                 )

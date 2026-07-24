@@ -24,8 +24,8 @@ class ProfessionalMarketApiProvider(MarketDataProvider):
         self.metadata = ProviderMetadata(
             provider_id="professional_market_api",
             supported_capabilities=(
-                "market.quote",
-                "market.daily",
+                "market.quote.realtime",
+                "market.daily.qfq",
                 "market.index_daily",
                 "market.sector_daily",
             ),
@@ -79,13 +79,18 @@ class ProfessionalMarketApiProvider(MarketDataProvider):
 
     def get_quote(self, symbol: str) -> Quote:
         row = self._get("/market/quote", {"symbol": symbol})
+        fetched_at = datetime.fromisoformat(row.get("fetched_at") or datetime.now().isoformat())
+        observed_at = datetime.fromisoformat(row.get("observed_at") or fetched_at.isoformat())
         return Quote(
             symbol=symbol,
             name=str(row.get("name") or symbol),
             price=Decimal(str(row["price"])),
+            quote_type=str(row.get("quote_type") or "realtime"),
+            observed_at=observed_at,
+            price_unit=str(row.get("price_unit") or "CNY"),
             source="professional_market_api",
             source_api="/market/quote",
-            fetched_at=datetime.fromisoformat(row.get("fetched_at") or datetime.now().isoformat()),
+            fetched_at=fetched_at,
         )
 
     def get_history(self, symbol: str, start: date, end: date) -> list[DailyBar]:
@@ -109,6 +114,12 @@ class ProfessionalMarketApiProvider(MarketDataProvider):
                 low=Decimal(str(row["low"])),
                 close=Decimal(str(row["close"])),
                 volume=Decimal(str(row["volume"])),
+                adjustment=str(row.get("adjustment") or "qfq"),
+                price_unit=str(row.get("price_unit") or "CNY"),
+                volume_unit=str(row.get("volume_unit") or "share"),
+                observed_at=datetime.fromisoformat(
+                    row.get("observed_at") or f"{str(row['date'])[:10]}T00:00:00"
+                ),
                 source="professional_market_api_qfq",
                 fetched_at=datetime.fromisoformat(
                     row.get("fetched_at") or datetime.now().isoformat()

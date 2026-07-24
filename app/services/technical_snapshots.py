@@ -15,19 +15,13 @@ def load_qfq_frame(db: Session, symbol: str) -> pd.DataFrame:
         select(MarketDailyBar)
         .where(
             MarketDailyBar.symbol == symbol,
-            MarketDailyBar.source.in_(
-                (
-                    "akshare_qfq",
-                    "akshare_eastmoney_qfq",
-                    "akshare_tencent_qfq",
-                    "akshare_sina_qfq",
-                )
-            ),
+            MarketDailyBar.adjustment == "qfq",
+            MarketDailyBar.quality_status.in_(("VERIFIED", "SINGLE_SOURCE")),
         )
         .order_by(MarketDailyBar.trade_date)
     ).all()
     if not bars:
-        raise ValueError("没有前复权历史数据，请先执行 AKShare 行情同步")
+        raise ValueError("没有可信前复权历史数据，请先执行行情同步")
     sources = {}
     for item in bars:
         sources.setdefault(item.source, []).append(item)
@@ -99,9 +93,11 @@ def snapshot_holding(db: Session, holding: Holding) -> TechnicalSnapshot:
 
 
 def refresh_qfq_history(db: Session, symbol: str, days: int = 550) -> int:
-    bars = UnifiedDataService(db).get_history(
+    provider = UnifiedDataService(db)
+    result = provider.get_history(
         symbol, date.today() - timedelta(days=days), date.today()
-    ).require_value()
+    )
+    bars = result.require_trusted_value()
     source = bars[0].source if bars else "akshare_qfq"
     existing = {
         item.trade_date: item
@@ -120,9 +116,22 @@ def refresh_qfq_history(db: Session, symbol: str, days: int = 550) -> int:
             stored.low = bar.low
             stored.close = bar.close
             stored.volume = bar.volume
+            stored.adjustment = bar.adjustment
+            stored.price_unit = bar.price_unit
+            stored.volume_unit = bar.volume_unit
+            stored.observed_at = bar.observed_at
+            stored.quality_status = result.quality_status.value
+            stored.quality_record_id = result.quality_record_id
             stored.fetched_at = bar.fetched_at
         else:
-            db.add(MarketDailyBar(**bar.__dict__))
+            db.add(
+                MarketDailyBar(
+                    **bar.__dict__,
+                    quality_status=result.quality_status.value,
+                    quality_record_id=result.quality_record_id,
+                )
+            )
+    provider.mark_persisted(result)
     return len(bars)
 
 

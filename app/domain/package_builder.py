@@ -21,6 +21,7 @@ from app.domain.quality import DataQualityStatus, worst_quality
 
 STEP_CAPABILITIES: dict[str, tuple[str, bool]] = {
     "market_data": ("stock_daily_bars", True),
+    "market_quote": ("market_quote", True),
     "company_mapping": ("company_profile", True),
     "market_judgement": ("benchmark_daily_bars", True),
     "industry_judgement": ("sector_daily_bars", True),
@@ -72,6 +73,10 @@ def _pipeline_evidence(step: dict[str, Any], symbol: str) -> Evidence:
             "status": step.get("status"),
             "missing": step.get("missing", []),
             "provider_observations": step.get("provider_observations", []),
+            "conflict_fields": step.get("conflict_fields", []),
+            "price": step.get("price"),
+            "quote_type": step.get("quote_type"),
+            "fallback_used": step.get("fallback_used", False),
         },
         is_primary=required,
         external_text_is_untrusted=False,
@@ -259,7 +264,14 @@ def build_decision_package(
     executable_status = "WAIT" if blocked and rule_status == "READY" else rule_status
     executable_decision_code = (
         "WAIT"
-        if blocked and decision["status"] in {"TRIAL_ALLOWED", "CONDITIONAL_ADD"}
+        if blocked
+        and decision["status"]
+        in {
+            "TRIAL_ALLOWED",
+            "CONDITIONAL_ADD",
+            "REDUCE",
+            "PLAN_INVALID_EXIT",
+        }
         else decision["status"]
     )
     executable_label = (
@@ -289,7 +301,7 @@ def build_decision_package(
     industry = preview.get("industry_assessment") or {}
     current_price = existing.get("current_price")
     generated_at = datetime.fromisoformat(preview["generated_at"])
-    package = DecisionPackage(
+    package = DecisionPackage.model_construct(
         package_id=f"decision:{preview['preview_hash']}",
         created_at=generated_at,
         generated_at=generated_at,
@@ -356,9 +368,9 @@ def build_decision_package(
         legacy_preview_hash=preview["preview_hash"],
         package_hash="0" * 64,
     )
-    payload = package.model_dump(mode="json")
-    payload["evidence_digest"] = package.evidence_digest_value()
-    with_digest = DecisionPackage.model_validate(payload)
+    with_digest = package.model_copy(
+        update={"evidence_digest": package.evidence_digest_value()}
+    )
     payload = with_digest.model_dump(mode="json")
     payload["package_hash"] = with_digest.package_hash_value()
     return DecisionPackage.model_validate(payload)

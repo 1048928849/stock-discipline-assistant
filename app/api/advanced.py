@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.data_hub.contracts import ProviderUnavailableError, Quote
+from app.data_hub.contracts import ProviderUnavailableError
 from app.database import get_db
 from app.errors import AppError
 from app.models import (
@@ -277,19 +277,44 @@ def market_sync(
     db.commit()
     provider = build_data_hub(db)
     try:
-        quote_error = None
-        try:
-            quote_result = provider.get_quote(symbol)
-            quote = quote_result.value
-            if quote is None:
-                quote_error = "; ".join(quote_result.errors) or "quote unavailable"
-        except ProviderUnavailableError as exc:
-            quote = None
-            quote_error = str(exc)
+        quote_result = provider.get_quote(symbol)
         history_result = provider.get_history(
             symbol, date.today() - timedelta(days=days), date.today()
         )
-        bars = history_result.value
+        try:
+            quote = quote_result.require_trusted_value()
+            bars = history_result.require_trusted_value()
+        except ProviderUnavailableError as exc:
+            db.commit()
+            blocked = next(
+                (
+                    result.quality_status.value
+                    for result in (quote_result, history_result)
+                    if result.quality_status.value in {"CONFLICTED", "STALE", "MISSING"}
+                ),
+                "MISSING",
+            )
+            code = f"MARKET_DATA_{blocked}"
+            raise AppError(
+                422,
+                code,
+                str(exc),
+                {
+                    "quote_quality_status": quote_result.quality_status.value,
+                    "history_quality_status": history_result.quality_status.value,
+                    "provider_observations": {
+                        "quote": quote_result.provider_observations,
+                        "history": history_result.provider_observations,
+                    },
+                    "conflict_fields": sorted(
+                        {*quote_result.conflict_fields, *history_result.conflict_fields}
+                    ),
+                    "fallback_used": (
+                        quote_result.fallback_used or history_result.fallback_used
+                    ),
+                    "cache_used": quote_result.cache_used or history_result.cache_used,
+                },
+            ) from exc
         if not bars:
             raise ProviderUnavailableError("历史行情为空，未写入数据库")
         dates = [bar.trade_date for bar in bars]
@@ -299,21 +324,15 @@ def market_sync(
             for bar in bars
         ):
             raise ProviderUnavailableError("历史行情完整性检查失败，未写入数据库")
-        if quote is None:
-            latest = bars[-1]
-            previous_quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
-            quote = Quote(
-                symbol=symbol,
-                name=previous_quote.name if previous_quote and previous_quote.name else symbol,
-                price=latest.close,
-                source=latest.source,
-                source_api="history_latest_close",
-                fetched_at=latest.fetched_at,
-            )
         stored = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol)) or MarketQuote(
             symbol=symbol,
             name=quote.name,
             price=quote.price,
+            quote_type=quote.quote_type,
+            observed_at=quote.observed_at,
+            price_unit=quote.price_unit,
+            quality_status=quote_result.quality_status.value,
+            quality_record_id=quote_result.quality_record_id,
             source=quote.source,
             source_api=quote.source_api,
             fetched_at=quote.fetched_at,
@@ -321,6 +340,11 @@ def market_sync(
         db.add(stored)
         stored.name = quote.name
         stored.price = quote.price
+        stored.quote_type = quote.quote_type
+        stored.observed_at = quote.observed_at
+        stored.price_unit = quote.price_unit
+        stored.quality_status = quote_result.quality_status.value
+        stored.quality_record_id = quote_result.quality_record_id
         stored.source = quote.source
         stored.source_api = quote.source_api
         stored.fetched_at = quote.fetched_at
@@ -339,9 +363,21 @@ def market_sync(
                 existing.low = bar.low
                 existing.close = bar.close
                 existing.volume = bar.volume
+                existing.adjustment = bar.adjustment
+                existing.price_unit = bar.price_unit
+                existing.volume_unit = bar.volume_unit
+                existing.observed_at = bar.observed_at
+                existing.quality_status = history_result.quality_status.value
+                existing.quality_record_id = history_result.quality_record_id
                 existing.fetched_at = bar.fetched_at
             else:
-                db.add(MarketDailyBar(**bar.__dict__))
+                db.add(
+                    MarketDailyBar(
+                        **bar.__dict__,
+                        quality_status=history_result.quality_status.value,
+                        quality_record_id=history_result.quality_record_id,
+                    )
+                )
                 inserted += 1
         history_sources = sorted({bar.source for bar in bars})
         db.add(
@@ -349,7 +385,7 @@ def market_sync(
                 source=" + ".join([quote.source, *history_sources]),
                 api_name=f"{quote.source_api} + {'/'.join(history_sources)}",
                 status="success",
-                error=f"实时行情降级原因：{quote_error}" if quote_error else None,
+                error=None,
                 row_count=inserted,
             )
         )
@@ -357,6 +393,8 @@ def market_sync(
         job.finished_at = datetime.now()
         job.result_count = inserted + 1
         job.last_error = None
+        provider.mark_persisted(quote_result)
+        provider.mark_persisted(history_result)
         db.commit()
         return {
             "status": "success",
@@ -371,10 +409,25 @@ def market_sync(
             },
             "bars_inserted": inserted,
             "history_source": history_sources[0],
-            "fallback_used": bool(quote_error) or history_result.fallback_used,
+            "quote_quality_status": quote_result.quality_status.value,
+            "history_quality_status": history_result.quality_status.value,
+            "provider_observations": {
+                "quote": quote_result.provider_observations,
+                "history": history_result.provider_observations,
+            },
+            "conflict_fields": sorted(
+                {*quote_result.conflict_fields, *history_result.conflict_fields}
+            ),
+            "fallback_used": quote_result.fallback_used or history_result.fallback_used,
+            "cache_used": quote_result.cache_used or history_result.cache_used,
             "data_date": bars[-1].trade_date.isoformat(),
             "updated_at": datetime.now().isoformat(),
         }
+    except AppError:
+        job.status = "blocked"
+        job.finished_at = datetime.now()
+        db.commit()
+        raise
     except ProviderUnavailableError as exc:
         job.status = "failed"
         job.finished_at = datetime.now()
@@ -408,6 +461,11 @@ def market_sync(
                 "bars_inserted": 0,
                 "history_source": cached_bar.source,
                 "fallback_used": True,
+                "cache_used": True,
+                "quote_quality_status": cached_quote.quality_status,
+                "history_quality_status": cached_bar.quality_status,
+                "provider_observations": [],
+                "conflict_fields": [],
                 "data_date": cached_bar.trade_date.isoformat(),
                 "updated_at": datetime.now().isoformat(),
             }

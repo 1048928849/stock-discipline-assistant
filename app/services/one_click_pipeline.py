@@ -7,6 +7,7 @@ from decimal import Decimal
 
 import pandas as pd
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.data_hub.contracts import ProviderUnavailableError
@@ -21,7 +22,9 @@ from app.models import (
     CompanyFinancialPeriod,
     CompanyProfile,
     CompanyResearchEvidence,
+    CompanyResearchRefresh,
     CompanyValuationSnapshot,
+    DataQualityRecord,
     MarketDailyBar,
     MarketQuote,
     PlanAnalysisRun,
@@ -96,6 +99,13 @@ def _sync_stock(
     cached = _latest_bar(db, symbol)
     stale = cached is None or get_trading_calendar().session_lag(cached.trade_date) > 0
     if cached and not stale and not refresh:
+        quote_step = _cached_quote_step(db, symbol)
+        record = _latest_quality_record(db, symbol, "market.daily.qfq")
+        cached_quality = (
+            record.quality_status
+            if record and not record.persisted
+            else cached.quality_status
+        )
         return (
             _step(
                 "market_data",
@@ -105,20 +115,31 @@ def _sync_stock(
                 source=cached.source,
                 data_time=cached.fetched_at.isoformat(),
                 observed_at=cached.trade_date.isoformat(),
+                quality_status=cached_quality,
             ),
-            {"data_date": cached.trade_date.isoformat(), "source": cached.source},
+            {
+                "data_date": cached.trade_date.isoformat(),
+                "source": cached.source,
+                "quote_step": quote_step,
+            },
         )
     try:
         history_result = provider.get_history(
             symbol, date.today() - timedelta(days=900), date.today()
         )
-        bars = history_result.require_value()
+        if history_result.quality_status.blocks_execution:
+            db.commit()
+        bars = history_result.require_trusted_value()
         if len(bars) < 80:
             raise ProviderUnavailableError(f"前复权日线仅有 {len(bars)} 根，少于80根")
         quote_error = None
+        quote_result = None
         try:
-            quote = provider.get_quote(symbol).require_value()
+            quote_result = provider.get_quote(symbol)
+            quote = quote_result.require_trusted_value()
         except ProviderUnavailableError as exc:
+            if quote_result and quote_result.quality_status.blocks_execution:
+                db.commit()
             quote_error = str(exc)
             latest = bars[-1]
             old_quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
@@ -128,6 +149,9 @@ def _sync_stock(
                 symbol=symbol,
                 name=old_quote.name if old_quote and old_quote.name else symbol,
                 price=latest.close,
+                quote_type="latest_close",
+                observed_at=latest.observed_at,
+                price_unit=latest.price_unit,
                 source=latest.source,
                 source_api="history_latest_close",
                 fetched_at=latest.fetched_at,
@@ -141,28 +165,88 @@ def _sync_stock(
                 )
             )
             if item is None:
-                db.add(MarketDailyBar(**bar.__dict__))
+                db.add(
+                    MarketDailyBar(
+                        **bar.__dict__,
+                        quality_status=history_result.quality_status.value,
+                        quality_record_id=history_result.quality_record_id,
+                    )
+                )
             else:
-                for key in ("open", "high", "low", "close", "volume", "fetched_at"):
+                for key in (
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "adjustment",
+                    "price_unit",
+                    "volume_unit",
+                    "observed_at",
+                    "fetched_at",
+                ):
                     setattr(item, key, getattr(bar, key))
+                item.quality_status = history_result.quality_status.value
+                item.quality_record_id = history_result.quality_record_id
         stored_quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
-        if stored_quote is None:
+        if quote_result and not quote_result.quality_status.blocks_execution and stored_quote is None:
             stored_quote = MarketQuote(
                 symbol=symbol,
                 name=quote.name,
                 price=quote.price,
+                quote_type=quote.quote_type,
+                observed_at=quote.observed_at,
+                price_unit=quote.price_unit,
+                quality_status=(
+                    quote_result.quality_status.value if quote_result else "SINGLE_SOURCE"
+                ),
+                quality_record_id=quote_result.quality_record_id if quote_result else None,
                 source=quote.source,
                 source_api=quote.source_api,
                 fetched_at=quote.fetched_at,
             )
             db.add(stored_quote)
-        else:
+        elif quote_result and not quote_result.quality_status.blocks_execution and stored_quote:
             stored_quote.name = quote.name
             stored_quote.price = quote.price
+            stored_quote.quote_type = quote.quote_type
+            stored_quote.observed_at = quote.observed_at
+            stored_quote.price_unit = quote.price_unit
+            stored_quote.quality_status = (
+                quote_result.quality_status.value if quote_result else "SINGLE_SOURCE"
+            )
+            stored_quote.quality_record_id = (
+                quote_result.quality_record_id if quote_result else None
+            )
             stored_quote.source = quote.source
             stored_quote.source_api = quote.source_api
             stored_quote.fetched_at = quote.fetched_at
+        provider.mark_persisted(history_result)
+        if quote_result and not quote_result.quality_status.blocks_execution:
+            provider.mark_persisted(quote_result)
         db.commit()
+        quote_step = _step(
+            "market_quote",
+            "当前价格质量",
+            "success"
+            if quote_result and not quote_result.quality_status.blocks_execution
+            else "partial",
+            "已取得实时价格。" if quote_result else "实时价格不可用，明确降级为最新收盘价。",
+            source=quote.source,
+            observed_at=quote.observed_at.isoformat(),
+            fetched_at=quote.fetched_at.isoformat(),
+            data_time=quote.observed_at.isoformat(),
+            quality_status=(
+                quote_result.quality_status.value if quote_result else "MISSING"
+            ),
+            provider_observations=(
+                quote_result.provider_observations if quote_result else []
+            ),
+            conflict_fields=quote_result.conflict_fields if quote_result else [],
+            quote_type=quote.quote_type,
+            price=str(quote.price),
+            fallback_used=quote_result is None,
+        )
         return (
             _step(
                 "market_data",
@@ -180,12 +264,17 @@ def _sync_stock(
                 source=bars[-1].source,
                 data_time=bars[-1].fetched_at.isoformat(),
             ),
-            {"data_date": bars[-1].trade_date.isoformat(), "source": bars[-1].source},
+            {
+                "data_date": bars[-1].trade_date.isoformat(),
+                "source": bars[-1].source,
+                "quote_step": quote_step,
+            },
         )
     except Exception as exc:
         db.rollback()
         cached = _latest_bar(db, symbol)
         if cached:
+            quote_step = _cached_quote_step(db, symbol)
             return (
                 _step(
                     "market_data",
@@ -195,9 +284,18 @@ def _sync_stock(
                     fallback_used=True,
                     source=cached.source,
                     data_time=cached.fetched_at.isoformat(),
+                    quality_status=(
+                        "CONFLICTED"
+                        if "quality is CONFLICTED" in str(exc)
+                        else cached.quality_status
+                    ),
                     missing=["最新行情"],
                 ),
-                {"data_date": cached.trade_date.isoformat(), "source": cached.source},
+                {
+                    "data_date": cached.trade_date.isoformat(),
+                    "source": cached.source,
+                    "quote_step": quote_step,
+                },
             )
         return (
             _step(
@@ -207,7 +305,11 @@ def _sync_stock(
                 f"行情同步失败且没有可用缓存：{exc}",
                 missing=["前复权日线", "当前价格"],
             ),
-            {"data_date": None, "source": "数据不足"},
+            {
+                "data_date": None,
+                "source": "数据不足",
+                "quote_step": _cached_quote_step(db, symbol),
+            },
         )
 
 
@@ -290,10 +392,17 @@ def _market_assessment(db: Session, provider: DataHubRouter) -> tuple[dict, dict
                         low=close,
                         close=close,
                         volume=Decimal(str(row.get("volume") or 0)),
+                        adjustment="unadjusted",
+                        price_unit="CNY",
+                        volume_unit="share",
+                        observed_at=datetime.combine(row["date"], datetime.min.time()),
+                        quality_status=history_result.quality_status.value,
+                        quality_record_id=history_result.quality_record_id,
                         source=history["source"],
                         fetched_at=history["fetched_at"],
                     )
                 )
+        provider.mark_persisted(history_result)
         db.commit()
         assessment = _series_assessment(history["rows"])
         detail = (
@@ -352,12 +461,17 @@ def _ensure_profile(
 ) -> tuple[CompanyProfile | None, dict]:
     profile = db.scalar(select(CompanyProfile).where(CompanyProfile.symbol == symbol))
     if profile and profile.industry:
+        record = _latest_quality_record(db, symbol, "fundamental.profile")
         profile_quality = (
-            "STALE"
+            record.quality_status
+            if record and not record.persisted
+            else "STALE"
             if observation_is_stale(
-                profile.fetched_at,
+                record.observed_at if record and record.observed_at else profile.fetched_at,
                 policy_for("fundamental.profile"),
             )
+            else record.quality_status
+            if record
             else "SINGLE_SOURCE"
         )
         return profile, _step(
@@ -393,6 +507,7 @@ def _ensure_profile(
         else:
             for key, value in values.items():
                 setattr(profile, key, value)
+        provider.mark_persisted(profile_result, cached_at=now)
         db.commit()
         return profile, _step(
             "company_mapping",
@@ -555,11 +670,17 @@ def _research_inventory(db: Session, symbol: str) -> tuple[dict, dict]:
         .where(CompanyValuationSnapshot.symbol == symbol)
         .order_by(CompanyValuationSnapshot.trade_date.desc())
     )
+    announcement_scan = db.scalar(
+        select(CompanyResearchRefresh).where(
+            CompanyResearchRefresh.symbol == symbol,
+            CompanyResearchRefresh.section == "announcements",
+        )
+    )
     risks = [item for item in announcements if item.risk_level in {"红", "黄"}]
     missing = []
     if not financials:
         missing.append("最近12季度财务数据")
-    if not announcements:
+    if not announcement_scan or not announcement_scan.last_success_at:
         missing.append("公司公告目录")
     if not evidence:
         missing.append("产业与公开信息证据")
@@ -568,6 +689,9 @@ def _research_inventory(db: Session, symbol: str) -> tuple[dict, dict]:
     result = {
         "financial_periods": len(financials),
         "announcements": len(announcements),
+        "announcement_scan_completed": bool(
+            announcement_scan and announcement_scan.last_success_at
+        ),
         "risk_events": [
             {
                 "title": item.title,
@@ -590,24 +714,27 @@ def _research_inventory(db: Session, symbol: str) -> tuple[dict, dict]:
         missing=missing,
         source="本地公司研究中心（原始来源保留在证据记录）",
         data_time=datetime.now().isoformat(),
-        observed_at=max(
-            (item.published_date for item in announcements),
-            default=None,
-        ).isoformat()
-        if announcements
+        observed_at=announcement_scan.checked_at.isoformat()
+        if announcement_scan and announcement_scan.checked_at
         else None,
         quality_status=(
-            "STALE"
-            if announcements
+            announcement_scan.quality_status
+            if announcement_scan and announcement_scan.quality_status
+            else "STALE"
+            if announcement_scan
+            and announcement_scan.checked_at
             and observation_is_stale(
-                max(item.fetched_at for item in announcements),
+                announcement_scan.checked_at,
                 policy_for("announcement.catalog"),
             )
-            else "SINGLE_SOURCE"
-            if announcements
             else "MISSING"
         ),
-        required_missing=[] if announcements else ["announcements"],
+        required_missing=(
+            []
+            if announcement_scan
+            and announcement_scan.quality_status in {"VERIFIED", "SINGLE_SOURCE"}
+            else ["announcements"]
+        ),
         optional_missing=[
             item
             for item, available in (
@@ -617,6 +744,47 @@ def _research_inventory(db: Session, symbol: str) -> tuple[dict, dict]:
             )
             if not available
         ],
+    )
+
+
+def _latest_quality_record(
+    db: Session, symbol: str, capability: str
+) -> DataQualityRecord | None:
+    return db.scalar(
+        select(DataQualityRecord)
+        .where(
+            DataQualityRecord.symbol == symbol,
+            DataQualityRecord.capability == capability,
+        )
+        .order_by(DataQualityRecord.id.desc())
+    )
+
+
+def _cached_quote_step(db: Session, symbol: str) -> dict:
+    quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
+    record = _latest_quality_record(db, symbol, "market.quote.realtime")
+    quality = (
+        record.quality_status
+        if record and not record.persisted
+        else quote.quality_status
+        if quote
+        else "MISSING"
+    )
+    return _step(
+        "market_quote",
+        "当前价格质量",
+        "success" if quality in {"VERIFIED", "SINGLE_SOURCE"} else "partial",
+        "已读取持久化行情质量。" if quote else "没有可用的当前价格。",
+        source=quote.source if quote else "none",
+        observed_at=quote.observed_at.isoformat() if quote else None,
+        fetched_at=quote.fetched_at.isoformat() if quote else None,
+        data_time=quote.observed_at.isoformat() if quote else None,
+        quality_status=quality,
+        provider_observations=record.provider_observations if record else [],
+        conflict_fields=record.conflict_fields if record else [],
+        quote_type=quote.quote_type if quote else None,
+        price=str(quote.price) if quote else None,
+        fallback_used=bool(quote and quote.quote_type != "realtime"),
     )
 
 
@@ -682,6 +850,7 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
     try:
         stock_step, stock_meta = _sync_stock(db, payload.symbol, provider, payload.refresh)
         steps.append(stock_step)
+        steps.append(stock_meta.get("quote_step") or _cached_quote_step(db, payload.symbol))
         research_refresh = refresh_company_research_if_needed(
             db,
             payload.symbol,
@@ -910,6 +1079,8 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
 
 
 def confirm_one_click_plan(db: Session, run_id: int) -> dict:
+    if db.get_bind().dialect.name == "sqlite":
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
     run = db.scalar(
         select(PlanAnalysisRun).where(PlanAnalysisRun.id == run_id).with_for_update()
     )
@@ -941,12 +1112,30 @@ def confirm_one_click_plan(db: Session, run_id: int) -> dict:
         preview_hash=plan["preview_hash"],
         ai_analysis_id=run.ai_analysis_id,
     )
-    saved = freeze_trade_plan(
-        db,
-        request=save_request,
-        decision_package=decision_package,
-        analysis_created_at=run.created_at,
-    )
+    try:
+        saved = freeze_trade_plan(
+            db,
+            request=save_request,
+            decision_package=decision_package,
+            analysis_created_at=run.created_at,
+            analysis_run_id=run.id,
+        )
+    except IntegrityError as exc:
+        db.rollback()
+        existing = db.scalar(
+            select(TradePlan).where(TradePlan.analysis_run_id == run_id)
+        )
+        if existing:
+            raise AppError(
+                409,
+                "ANALYSIS_ALREADY_CONFIRMED",
+                "该分析已经保存为正式计划。",
+            ) from exc
+        raise AppError(
+            409,
+            "PLAN_VERSION_CONFLICT",
+            "计划版本发生并发冲突，请重新分析后确认。",
+        ) from exc
     frozen_plan = db.get(TradePlan, saved["id"])
     if frozen_plan:
         frozen_plan.engine_snapshot = {

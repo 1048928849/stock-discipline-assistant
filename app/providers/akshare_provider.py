@@ -32,8 +32,8 @@ class AKShareProvider(
         self.metadata = ProviderMetadata(
             provider_id="akshare",
             supported_capabilities=(
-                "market.quote",
-                "market.daily",
+                "market.quote.realtime",
+                "market.daily.qfq",
                 "market.index_daily",
                 "market.sector_daily",
                 "market.symbols",
@@ -110,13 +110,17 @@ class AKShareProvider(
         if rows.empty:
             raise ProviderUnavailableError(f"{api_name} 未找到股票代码 {symbol}")
         row = rows.iloc[0]
+        now = datetime.now()
         return Quote(
             symbol=symbol,
             name=str(row["名称"]),
             price=Decimal(str(row["最新价"])),
+            quote_type="realtime",
+            observed_at=now,
+            price_unit="CNY",
             source=source,
             source_api=api_name,
-            fetched_at=datetime.now(),
+            fetched_at=now,
         )
 
     def get_quote(self, symbol: str) -> Quote:
@@ -174,6 +178,13 @@ class AKShareProvider(
                     low=Decimal(str(row[columns["low"]])),
                     close=Decimal(str(row[columns["close"]])),
                     volume=Decimal(str(row[columns["volume"]])) * volume_multiplier,
+                    adjustment="qfq",
+                    price_unit="CNY",
+                    volume_unit="share",
+                    observed_at=datetime.combine(
+                        date.fromisoformat(str(row[columns["date"]])[:10]),
+                        datetime.min.time(),
+                    ),
                     source=source,
                     fetched_at=fetched_at,
                 )

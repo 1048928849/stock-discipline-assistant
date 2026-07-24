@@ -209,6 +209,10 @@ class DecisionPackage(DomainModel):
         unknown = sorted(references - known)
         if unknown:
             raise ValueError(f"DecisionPackage references unknown evidence_id: {unknown}")
+        if self.evidence_digest == "0" * 64:
+            raise ValueError("DecisionPackage evidence_digest cannot be the zero hash")
+        if self.package_hash == "0" * 64:
+            raise ValueError("DecisionPackage package_hash cannot be the zero hash")
 
         required = set(self.required_capabilities)
         represented = {item.capability for item in self.evidence if item.required}
@@ -257,9 +261,9 @@ class DecisionPackage(DomainModel):
                 raise ValueError(
                     f"DecisionPackage quality_snapshot mismatch for {capability}"
                 )
-        if self.evidence_digest != "0" * 64 and self.evidence_digest_value() != self.evidence_digest:
+        if self.evidence_digest_value() != self.evidence_digest:
             raise ValueError("DecisionPackage evidence_digest mismatch")
-        if self.package_hash != "0" * 64 and self.package_hash_value() != self.package_hash:
+        if self.package_hash_value() != self.package_hash:
             raise ValueError("DecisionPackage package_hash mismatch")
         if computed_quality.blocks_execution:
             if self.ready_allowed or self.freeze_allowed:

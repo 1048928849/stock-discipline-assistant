@@ -712,7 +712,10 @@ def sync_company_research(
             if isinstance(raw_row_count, (int, float, str))
             else cached_counts.get(section, 0)
         )
-        cache_used = not external_success and cached_counts.get(section, 0) > 0
+        cache_available = cached_counts.get(section, 0) > 0 or bool(
+            section == "announcements" and existing and existing.last_success_at
+        )
+        cache_used = not external_success and cache_available
         if cache_used:
             result["status"] = "cache_fallback"
             result["cache_used"] = True
@@ -730,6 +733,32 @@ def sync_company_research(
             if isinstance(provider, DataHubRouter)
             else None
         )
+        if external_success and call and call.quality_status.value in {
+            "VERIFIED",
+            "SINGLE_SOURCE",
+        }:
+            provider.mark_persisted(call, cached_at=fetched_at)
+        quality_status = (
+            call.quality_status.value
+            if call
+            else "SINGLE_SOURCE"
+            if external_success
+            else "MISSING"
+        )
+        checked_at = (
+            fetched_at
+            if section == "announcements" and external_success
+            else existing.checked_at
+            if section == "announcements" and existing
+            else None
+        )
+        result["quality_status"] = quality_status
+        if call:
+            result["provider_observations"] = call.provider_observations
+            result["conflict_fields"] = call.conflict_fields
+            result["normalized_digest"] = call.normalized_digest
+        if checked_at:
+            result["checked_at"] = checked_at.isoformat()
         values = {
             "status": result["status"],
             "provider_id": call.provider_id
@@ -744,10 +773,31 @@ def sync_company_research(
             "last_success_at": fetched_at
             if external_success
             else (existing.last_success_at if existing else None),
-            "data_date": date.today() if row_count else None,
+            "data_date": (
+                date.today()
+                if row_count or (section == "announcements" and external_success)
+                else None
+            ),
             "stale_after": fetched_at + timedelta(hours=fresh_hours[section])
             if external_success
             else (existing.stale_after if existing else None),
+            "quality_status": quality_status,
+            "observed_at": (
+                checked_at
+                if section == "announcements"
+                else DataHubRouter._as_datetime(call.observed_at)
+                if call
+                else existing.observed_at
+                if existing
+                else None
+            ),
+            "fetched_at": call.fetched_at if call else fetched_at,
+            "checked_at": checked_at,
+            "scan_start": call.fetched_at if call and section == "announcements" else None,
+            "scan_end": call.fetched_at if call and section == "announcements" else None,
+            "normalized_digest": call.normalized_digest if call else None,
+            "provider_observations": call.provider_observations if call else [],
+            "conflict_fields": call.conflict_fields if call else [],
             "error": result.get("message") if not external_success else None,
         }
         if existing is None:
