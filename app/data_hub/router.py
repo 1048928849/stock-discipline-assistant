@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, time as datetime_time
+from datetime import date, datetime, time as datetime_time, timezone
+from decimal import Decimal
 from typing import Any, Callable
 
 from sqlalchemy import select
@@ -46,7 +49,84 @@ MARKET_SUBJECT_CAPABILITIES = frozenset(
         "market.sector_daily",
     }
 )
-CallResultKey = tuple[str, str, str, str, str]
+CallResultKey = tuple[str, str, str, str, str, str]
+
+
+def _normalized_decimal(value: Decimal) -> str:
+    if value == 0:
+        return "0"
+    return format(value.normalize(), "f")
+
+
+def _normalize_request_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, Decimal):
+        return {"$decimal": _normalized_decimal(value)}
+    if isinstance(value, datetime):
+        normalized = value
+        if normalized.tzinfo is None:
+            normalized = normalized.replace(tzinfo=timezone.utc)
+        normalized = normalized.astimezone(timezone.utc)
+        return {"$datetime": normalized.isoformat().replace("+00:00", "Z")}
+    if isinstance(value, date):
+        return {"$date": value.isoformat()}
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        return [_normalize_request_value(item) for item in value]
+    if isinstance(value, dict):
+        normalized = {}
+        for key, child in value.items():
+            normalized_key = str(key).strip()
+            if normalized_key in normalized:
+                raise ValueError("duplicate_normalized_request_key")
+            normalized[normalized_key] = _normalize_request_value(child)
+        return {key: normalized[key] for key in sorted(normalized)}
+    raise TypeError(f"unsupported request identity value: {type(value).__name__}")
+
+
+def _request_identity(
+    *,
+    capability: str,
+    operation: str,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    symbol: str | None,
+) -> tuple[str, dict[str, Any]]:
+    summary = {
+        "capability": capability.strip(),
+        "operation": operation.strip(),
+        "args": _normalize_request_value(args),
+        "kwargs": _normalize_request_value(kwargs),
+        "symbol": _normalize_request_value(symbol),
+    }
+    encoded = json.dumps(
+        summary,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), summary
+
+
+def request_fingerprint(
+    *,
+    capability: str,
+    operation: str,
+    args: tuple[Any, ...] = (),
+    kwargs: dict[str, Any] | None = None,
+    symbol: str | None = None,
+) -> str:
+    fingerprint, _ = _request_identity(
+        capability=capability,
+        operation=operation,
+        args=args,
+        kwargs=kwargs or {},
+        symbol=symbol,
+    )
+    return fingerprint
 
 
 @dataclass
@@ -69,6 +149,8 @@ class ProviderResult:
     quality_record_id: int | None = None
     subject: SubjectRef | None = None
     operation: str = ""
+    request_fingerprint: str = ""
+    request_summary: dict[str, Any] = field(default_factory=dict)
 
     def require_value(
         self,
@@ -117,6 +199,7 @@ class ProviderResult:
             "subject_id": self.subject.subject_id if self.subject else None,
             "semantic_key": self.subject.semantic_key if self.subject else None,
             "operation": self.operation,
+            "request_fingerprint": self.request_fingerprint,
         }
 
 
@@ -139,36 +222,44 @@ class DataHubRouter:
     def _call_result_key(
         capability: str,
         operation: str,
-        subject: SubjectRef,
+        subject: SubjectRef | None,
+        request_fingerprint: str,
     ) -> CallResultKey:
         return (
             capability,
             operation,
-            subject.subject_type,
-            subject.subject_id,
-            canonical_semantic_key(subject.semantic_key),
+            subject.subject_type if subject else "",
+            subject.subject_id if subject else "",
+            canonical_semantic_key(subject.semantic_key) if subject else "",
+            request_fingerprint,
         )
 
     def result_for(
         self,
         capability: str,
         operation: str,
-        subject: SubjectRef,
+        subject: SubjectRef | None,
+        request_fingerprint: str,
     ) -> ProviderResult | None:
         return self.call_results.get(
-            self._call_result_key(capability, operation, subject)
+            self._call_result_key(
+                capability,
+                operation,
+                subject,
+                request_fingerprint,
+            )
         )
 
     def _remember_result(self, result: ProviderResult) -> ProviderResult:
         self.calls[result.capability] = result
-        if result.subject is not None:
-            self.call_results[
-                self._call_result_key(
-                    result.capability,
-                    result.operation,
-                    result.subject,
-                )
-            ] = result
+        self.call_results[
+            self._call_result_key(
+                result.capability,
+                result.operation,
+                result.subject,
+                result.request_fingerprint,
+            )
+        ] = result
         return result
 
     @staticmethod
@@ -259,7 +350,9 @@ class DataHubRouter:
     @staticmethod
     def _as_datetime(value: datetime | date | None) -> datetime | None:
         if isinstance(value, datetime):
-            return value.replace(tzinfo=None) if value.tzinfo else value
+            if value.tzinfo is not None:
+                return value.astimezone(timezone.utc).replace(tzinfo=None)
+            return value
         if isinstance(value, date):
             return datetime.combine(value, datetime_time.min)
         return None
@@ -481,6 +574,18 @@ class DataHubRouter:
     def mark_persisted(self, result: ProviderResult, cached_at: datetime | None = None) -> None:
         if result.quality_record_id is None:
             raise ProviderUnavailableError("Provider result has no quality audit lineage")
+        current = self.call_results.get(
+            self._call_result_key(
+                result.capability,
+                result.operation,
+                result.subject,
+                result.request_fingerprint,
+            )
+        )
+        if current is not result:
+            raise ProviderUnavailableError(
+                "Provider result is not the current exact Router call lineage"
+            )
         if result.quality_status not in TRUSTED_QUALITY_STATUSES:
             raise ProviderUnavailableError(
                 f"Cannot persist untrusted {result.capability} result "
@@ -495,6 +600,14 @@ class DataHubRouter:
             raise ProviderUnavailableError("Provider result subject does not match lineage")
         if record.quality_status != result.quality_status.value:
             raise ProviderUnavailableError("Provider result quality does not match lineage")
+        if record.normalized_digest != result.normalized_digest:
+            raise ProviderUnavailableError("Provider result digest does not match lineage")
+        if self._as_datetime(record.observed_at) != self._as_datetime(result.observed_at):
+            raise ProviderUnavailableError(
+                "Provider result observed_at does not match lineage"
+            )
+        if record.provider_id != result.provider_id:
+            raise ProviderUnavailableError("Provider result provider does not match lineage")
         record.persisted = True
         record.cached_at = cached_at or datetime.now()
         self.db.flush()
@@ -547,6 +660,13 @@ class DataHubRouter:
             raise ProviderUnavailableError(
                 f"{capability} requires an explicit market subject"
             )
+        fingerprint, request_summary = _request_identity(
+            capability=capability,
+            operation=operation,
+            args=args,
+            kwargs=kwargs,
+            symbol=symbol,
+        )
         policy = policy_for(capability)
         errors: list[str] = []
         observations: list[QualityObservation] = []
@@ -657,6 +777,8 @@ class DataHubRouter:
                 capability=capability,
                 subject=subject,
                 operation=operation,
+                request_fingerprint=fingerprint,
+                request_summary=request_summary,
                 observed_at=selected.observed_at,
                 fetched_at=selected.fetched_at or datetime.now(),
                 fallback_used=bool(errors) or selected.provider_id != observations[0].provider_id,
@@ -703,6 +825,8 @@ class DataHubRouter:
                     capability=capability,
                     subject=subject,
                     operation=operation,
+                    request_fingerprint=fingerprint,
+                    request_summary=request_summary,
                     observed_at=observed_at,
                     fetched_at=now,
                     fallback_used=True,
@@ -740,6 +864,8 @@ class DataHubRouter:
             capability=capability,
             subject=subject,
             operation=operation,
+            request_fingerprint=fingerprint,
+            request_summary=request_summary,
             observed_at=None,
             fetched_at=now,
             fallback_used=bool(errors),
