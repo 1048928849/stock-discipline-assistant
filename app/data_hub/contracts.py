@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 
 class ProviderUnavailableError(RuntimeError):
@@ -16,6 +16,9 @@ class Quote:
     symbol: str
     name: str
     price: Decimal
+    quote_type: Literal["realtime", "delayed", "latest_close", "cache"]
+    observed_at: datetime
+    price_unit: str
     source: str
     source_api: str
     fetched_at: datetime
@@ -30,6 +33,10 @@ class DailyBar:
     low: Decimal
     close: Decimal
     volume: Decimal
+    adjustment: Literal["qfq", "hfq", "unadjusted"]
+    price_unit: str
+    volume_unit: str
+    observed_at: datetime
     source: str
     fetched_at: datetime
 

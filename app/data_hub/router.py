@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, time as datetime_time
 from typing import Any, Callable
 
 from sqlalchemy.orm import Session
@@ -18,7 +18,12 @@ from app.data_hub.quality import (
 )
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.trading_calendar import TradingCalendar, get_trading_calendar
-from app.models import DataProviderCallLog
+from app.models import DataProviderCallLog, DataQualityRecord
+
+
+TRUSTED_QUALITY_STATUSES = frozenset(
+    {DataQualityStatus.VERIFIED, DataQualityStatus.SINGLE_SOURCE}
+)
 
 
 @dataclass
@@ -34,11 +39,36 @@ class ProviderResult:
     observed_at: datetime | date | None = None
     provider_observations: list[dict[str, Any]] = field(default_factory=list)
     conflict_fields: list[str] = field(default_factory=list)
+    normalized_digest: str | None = None
+    adjustment: str | None = None
+    price_unit: str | None = None
+    volume_unit: str | None = None
+    quality_record_id: int | None = None
 
-    def require_value(self) -> Any:
+    def require_value(
+        self,
+        allowed_quality_statuses: set[DataQualityStatus] | frozenset[DataQualityStatus] | None = None,
+    ) -> Any:
+        return self.require_trusted_value(allowed_quality_statuses)
+
+    def require_trusted_value(
+        self,
+        allowed_quality_statuses: set[DataQualityStatus] | frozenset[DataQualityStatus] | None = None,
+    ) -> Any:
         if self.value is None:
             detail = "; ".join(self.errors) or f"{self.capability} is missing"
             raise ProviderUnavailableError(detail)
+        allowed = allowed_quality_statuses or TRUSTED_QUALITY_STATUSES
+        if self.quality_status not in allowed:
+            raise ProviderUnavailableError(
+                f"{self.capability} quality is {self.quality_status.value}; "
+                "trusted business data requires VERIFIED or SINGLE_SOURCE"
+            )
+        return self.value
+
+    def audit_value(self) -> Any:
+        """Return the selected value for diagnostics without asserting trust."""
+
         return self.value
 
     def public_meta(self) -> dict:
@@ -53,6 +83,11 @@ class ProviderResult:
             "quality_status": self.quality_status.value,
             "provider_observations": self.provider_observations,
             "conflict_fields": self.conflict_fields,
+            "normalized_digest": self.normalized_digest,
+            "adjustment": self.adjustment,
+            "price_unit": self.price_unit,
+            "volume_unit": self.volume_unit,
+            "quality_record_id": self.quality_record_id,
         }
 
 
@@ -99,9 +134,13 @@ class DataHubRouter:
     def _observed_at(
         cls, capability: str, value: Any, fetched_at: datetime
     ) -> datetime | date | None:
-        if capability == "market.quote":
-            return getattr(value, "fetched_at", None) or fetched_at
+        if capability.startswith("market.quote"):
+            return getattr(value, "observed_at", None) or fetched_at
         if capability == "fundamental.profile":
+            return fetched_at
+        if capability in {"market.symbols", "market.indices", "market.sectors"}:
+            return fetched_at
+        if capability.startswith("announcement."):
             return fetched_at
         if isinstance(value, list):
             if value and hasattr(value[-1], "trade_date"):
@@ -113,9 +152,13 @@ class DataHubRouter:
                 for key in (
                     "published_at",
                     "published_date",
+                    "report_date",
                     "trade_date",
                     "date",
                     "observed_at",
+                    "报告日",
+                    "公告时间",
+                    "公告日期",
                 ):
                     parsed = cls._parse_time(row.get(key))
                     if parsed is not None:
@@ -123,12 +166,18 @@ class DataHubRouter:
                         break
             if candidates:
                 return max(candidates)
-            if capability.startswith("announcement."):
-                return fetched_at
             return None
         if isinstance(value, dict):
             if isinstance(value.get("rows"), list):
                 return cls._observed_at(capability, value["rows"], fetched_at)
+            nested = [
+                cls._observed_at(capability, child, fetched_at)
+                for child in value.values()
+                if isinstance(child, list)
+            ]
+            nested = [item for item in nested if item is not None]
+            if nested:
+                return max(nested)
             for key in (
                 "observed_at",
                 "data_time",
@@ -140,6 +189,70 @@ class DataHubRouter:
                 if parsed is not None:
                     return parsed
         return None
+
+    @staticmethod
+    def _as_datetime(value: datetime | date | None) -> datetime | None:
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=None) if value.tzinfo else value
+        if isinstance(value, date):
+            return datetime.combine(value, datetime_time.min)
+        return None
+
+    def _record_quality(self, result: ProviderResult, symbol: str | None) -> ProviderResult:
+        latest_content_at = None
+        if result.capability == "announcement.catalog" and isinstance(result.value, list):
+            candidates = []
+            for row in result.value:
+                if not isinstance(row, dict):
+                    continue
+                for key in ("published_at", "published_date", "公告时间", "公告日期", "date"):
+                    parsed = self._parse_time(row.get(key))
+                    if parsed is not None:
+                        candidates.append(self._as_datetime(parsed))
+                        break
+            latest_content_at = max((item for item in candidates if item), default=None)
+        record = DataQualityRecord(
+            symbol=symbol,
+            capability=result.capability,
+            quality_status=result.quality_status.value,
+            observed_at=self._as_datetime(result.observed_at),
+            fetched_at=result.fetched_at.replace(tzinfo=None)
+            if result.fetched_at.tzinfo
+            else result.fetched_at,
+            provider_id=result.provider_id,
+            provider_observations=result.provider_observations,
+            normalized_digest=result.normalized_digest,
+            conflict_fields=result.conflict_fields,
+            adjustment=result.adjustment,
+            price_unit=result.price_unit,
+            volume_unit=result.volume_unit,
+            row_count=self._row_count(result.value),
+            fallback_used=result.fallback_used,
+            cache_used=result.cache_used,
+            trusted=result.quality_status in TRUSTED_QUALITY_STATUSES,
+            persisted=False,
+            scan_start=result.fetched_at if result.capability == "announcement.catalog" else None,
+            scan_end=result.fetched_at if result.capability == "announcement.catalog" else None,
+            checked_at=result.fetched_at if result.capability == "announcement.catalog" else None,
+            latest_content_at=latest_content_at,
+        )
+        self.db.add(record)
+        self.db.flush()
+        result.quality_record_id = record.id
+        return result
+
+    def mark_persisted(self, result: ProviderResult, cached_at: datetime | None = None) -> None:
+        if result.quality_status not in TRUSTED_QUALITY_STATUSES:
+            raise ProviderUnavailableError(
+                f"Cannot persist untrusted {result.capability} result "
+                f"with quality {result.quality_status.value}"
+            )
+        record = self.db.get(DataQualityRecord, result.quality_record_id)
+        if record is None:
+            raise ProviderUnavailableError("Provider result has no persisted quality audit")
+        record.persisted = True
+        record.cached_at = cached_at or datetime.now()
+        self.db.flush()
 
     def _log(
         self,
@@ -300,7 +413,18 @@ class DataHubRouter:
                     if quality == DataQualityStatus.CONFLICTED
                     else []
                 ),
+                normalized_digest=selected.normalized_digest,
+                adjustment=getattr(selected.value[0], "adjustment", None)
+                if isinstance(selected.value, list) and selected.value
+                else getattr(selected.value, "adjustment", None),
+                price_unit=getattr(selected.value[0], "price_unit", None)
+                if isinstance(selected.value, list) and selected.value
+                else getattr(selected.value, "price_unit", None),
+                volume_unit=getattr(selected.value[0], "volume_unit", None)
+                if isinstance(selected.value, list) and selected.value
+                else getattr(selected.value, "volume_unit", None),
             )
+            result = self._record_quality(result, symbol)
             self.calls[capability] = result
             return result
 
@@ -335,7 +459,9 @@ class DataHubRouter:
                     errors=errors,
                     quality_status=DataQualityStatus.STALE,
                     provider_observations=audit,
+                    normalized_digest=digest,
                 )
+                result = self._record_quality(result, symbol)
                 self._log(
                     provider_id="local_cache",
                     capability=capability,
@@ -365,12 +491,13 @@ class DataHubRouter:
             quality_status=DataQualityStatus.MISSING,
             provider_observations=audit,
         )
+        result = self._record_quality(result, symbol)
         self.calls[capability] = result
         return result
 
     def get_history(self, symbol: str, start: date, end: date, cache_loader=None):
         return self.invoke(
-            "market.daily",
+            "market.daily.qfq",
             "get_history",
             symbol,
             start,
@@ -382,13 +509,41 @@ class DataHubRouter:
 
     def get_quote(self, symbol: str, cache_loader=None):
         return self.invoke(
-            "market.quote",
+            "market.quote.realtime",
             "get_quote",
             symbol,
             symbol=symbol,
             cache_loader=cache_loader,
             validator=lambda value: value is not None
             and getattr(value, "price", None) is not None,
+        )
+
+    def get_latest_close(self, symbol: str, cache_loader=None):
+        return self.invoke(
+            "market.quote.latest_close",
+            "get_quote",
+            symbol,
+            symbol=symbol,
+            cache_loader=cache_loader,
+            validator=lambda value: value is not None
+            and getattr(value, "price", None) is not None
+            and getattr(value, "quote_type", None) == "latest_close",
+        )
+
+    def get_unadjusted_history(
+        self, symbol: str, start: date, end: date, cache_loader=None
+    ):
+        return self.invoke(
+            "market.daily.unadjusted",
+            "get_history",
+            symbol,
+            start,
+            end,
+            symbol=symbol,
+            cache_loader=cache_loader,
+            validator=lambda value: isinstance(value, list)
+            and bool(value)
+            and all(getattr(item, "adjustment", None) == "unadjusted" for item in value),
         )
 
     def get_index_history(self, symbol: str, start: date, end: date, cache_loader=None):

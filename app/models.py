@@ -120,6 +120,13 @@ class MarketQuote(TimestampMixin, Base):
     symbol: Mapped[str] = mapped_column(String(12), unique=True)
     name: Mapped[str | None] = mapped_column(String(100))
     price: Mapped[Decimal] = mapped_column(PRICE)
+    quote_type: Mapped[str] = mapped_column(String(20), default="realtime")
+    observed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    price_unit: Mapped[str] = mapped_column(String(20), default="CNY")
+    quality_status: Mapped[str] = mapped_column(String(20), default="SINGLE_SOURCE")
+    quality_record_id: Mapped[int | None] = mapped_column(
+        ForeignKey("data_quality_records.id"), index=True
+    )
     source: Mapped[str] = mapped_column(String(50))
     source_api: Mapped[str] = mapped_column(String(100))
     fetched_at: Mapped[datetime] = mapped_column(DateTime)
@@ -138,6 +145,14 @@ class MarketDailyBar(Base):
     low: Mapped[Decimal] = mapped_column(PRICE)
     close: Mapped[Decimal] = mapped_column(PRICE)
     volume: Mapped[Decimal] = mapped_column(Numeric(24, 4))
+    adjustment: Mapped[str] = mapped_column(String(20), default="qfq")
+    price_unit: Mapped[str] = mapped_column(String(20), default="CNY")
+    volume_unit: Mapped[str] = mapped_column(String(20), default="share")
+    observed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    quality_status: Mapped[str] = mapped_column(String(20), default="SINGLE_SOURCE")
+    quality_record_id: Mapped[int | None] = mapped_column(
+        ForeignKey("data_quality_records.id"), index=True
+    )
     source: Mapped[str] = mapped_column(String(50))
     fetched_at: Mapped[datetime] = mapped_column(DateTime)
 
@@ -151,6 +166,36 @@ class MarketSourceLog(Base):
     fetched_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     error: Mapped[str | None] = mapped_column(Text)
     row_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class DataQualityRecord(Base):
+    """Immutable quality decision for a provider refresh or persisted cache."""
+
+    __tablename__ = "data_quality_records"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str | None] = mapped_column(String(40), index=True)
+    capability: Mapped[str] = mapped_column(String(80), index=True)
+    quality_status: Mapped[str] = mapped_column(String(20), index=True)
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime)
+    cached_at: Mapped[datetime | None] = mapped_column(DateTime)
+    provider_id: Mapped[str] = mapped_column(String(80))
+    provider_observations: Mapped[list] = mapped_column(JSON, default=list)
+    normalized_digest: Mapped[str | None] = mapped_column(String(64))
+    conflict_fields: Mapped[list] = mapped_column(JSON, default=list)
+    adjustment: Mapped[str | None] = mapped_column(String(20))
+    price_unit: Mapped[str | None] = mapped_column(String(20))
+    volume_unit: Mapped[str | None] = mapped_column(String(20))
+    row_count: Mapped[int] = mapped_column(Integer, default=0)
+    fallback_used: Mapped[bool] = mapped_column(Boolean, default=False)
+    cache_used: Mapped[bool] = mapped_column(Boolean, default=False)
+    trusted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    persisted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    scan_start: Mapped[datetime | None] = mapped_column(DateTime)
+    scan_end: Mapped[datetime | None] = mapped_column(DateTime)
+    checked_at: Mapped[datetime | None] = mapped_column(DateTime)
+    latest_content_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class DataProviderCallLog(Base):
@@ -380,6 +425,15 @@ class CompanyResearchRefresh(Base):
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime)
     data_date: Mapped[date | None] = mapped_column(Date)
     stale_after: Mapped[datetime | None] = mapped_column(DateTime)
+    quality_status: Mapped[str | None] = mapped_column(String(20))
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    fetched_at: Mapped[datetime | None] = mapped_column(DateTime)
+    checked_at: Mapped[datetime | None] = mapped_column(DateTime)
+    scan_start: Mapped[datetime | None] = mapped_column(DateTime)
+    scan_end: Mapped[datetime | None] = mapped_column(DateTime)
+    normalized_digest: Mapped[str | None] = mapped_column(String(64))
+    provider_observations: Mapped[list | None] = mapped_column(JSON)
+    conflict_fields: Mapped[list | None] = mapped_column(JSON)
     error: Mapped[str | None] = mapped_column(Text)
 
 
@@ -408,6 +462,15 @@ class RuleVersion(TimestampMixin, Base):
 
 class TradePlan(TimestampMixin, Base):
     __tablename__ = "trade_plans"
+    __table_args__ = (
+        UniqueConstraint("analysis_run_id", name="uq_trade_plan_analysis_run"),
+        UniqueConstraint(
+            "account_id",
+            "symbol",
+            "plan_version",
+            name="uq_trade_plan_account_symbol_version",
+        ),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
     rule_version_id: Mapped[int] = mapped_column(ForeignKey("rule_versions.id"), index=True)
@@ -442,6 +505,14 @@ class TradePlan(TimestampMixin, Base):
     data_date: Mapped[date] = mapped_column(Date)
     source: Mapped[str] = mapped_column(String(200))
     plan_version: Mapped[int] = mapped_column(Integer, default=1)
+    analysis_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "plan_analysis_runs.id",
+            name="fk_trade_plans_analysis_run",
+            use_alter=True,
+        ),
+        index=True,
+    )
     # SQLite 无法在不重建既有计划表的情况下添加自关联约束；服务层校验父版本。
     parent_plan_id: Mapped[int | None] = mapped_column(Integer)
     preview_hash: Mapped[str | None] = mapped_column(String(64), index=True)

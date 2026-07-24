@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import unicodedata
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -32,6 +34,7 @@ DEFAULT_POLICY = CapabilityQualityPolicy(
 
 
 QUALITY_POLICIES: dict[str, CapabilityQualityPolicy] = {
+    # Compatibility aliases are not used by the production router.
     "market.quote": CapabilityQualityPolicy(
         "market.quote",
         required=True,
@@ -43,6 +46,49 @@ QUALITY_POLICIES: dict[str, CapabilityQualityPolicy] = {
     "market.daily": CapabilityQualityPolicy(
         "market.daily",
         required=True,
+        max_trading_session_lag=0,
+        business_fields=("symbol", "trade_date", "open", "high", "low", "close", "volume"),
+        numeric_tolerance=Decimal("0.0001"),
+        verify_multiple_sources=True,
+    ),
+    "market.quote.realtime": CapabilityQualityPolicy(
+        "market.quote.realtime",
+        required=True,
+        max_age=timedelta(minutes=30),
+        business_fields=("symbol", "price", "quote_type", "price_unit"),
+        numeric_tolerance=Decimal("0.0001"),
+        verify_multiple_sources=True,
+    ),
+    "market.quote.latest_close": CapabilityQualityPolicy(
+        "market.quote.latest_close",
+        required=True,
+        max_trading_session_lag=0,
+        business_fields=("symbol", "price", "quote_type", "price_unit"),
+        numeric_tolerance=Decimal("0.0001"),
+        verify_multiple_sources=True,
+    ),
+    "market.daily.qfq": CapabilityQualityPolicy(
+        "market.daily.qfq",
+        required=True,
+        max_trading_session_lag=0,
+        business_fields=(
+            "symbol",
+            "trade_date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "adjustment",
+            "price_unit",
+            "volume_unit",
+        ),
+        numeric_tolerance=Decimal("0.0001"),
+        verify_multiple_sources=True,
+    ),
+    "market.daily.unadjusted": CapabilityQualityPolicy(
+        "market.daily.unadjusted",
+        required=False,
         max_trading_session_lag=0,
         business_fields=(
             "symbol",
@@ -88,10 +134,16 @@ QUALITY_POLICIES: dict[str, CapabilityQualityPolicy] = {
         verify_multiple_sources=True,
     ),
     "fundamental.statements": CapabilityQualityPolicy(
-        "fundamental.statements", required=False, max_age=timedelta(days=120)
+        "fundamental.statements",
+        required=False,
+        max_age=timedelta(days=120),
+        verify_multiple_sources=True,
     ),
     "fundamental.valuation": CapabilityQualityPolicy(
-        "fundamental.valuation", required=False, max_age=timedelta(days=7)
+        "fundamental.valuation",
+        required=False,
+        max_age=timedelta(days=7),
+        verify_multiple_sources=True,
     ),
     "news.company": CapabilityQualityPolicy(
         "news.company", required=False, max_age=timedelta(hours=24)
@@ -214,30 +266,30 @@ def canonical_value(value: Any, policy: CapabilityQualityPolicy) -> Any:
         }
         value = {
             target: next(
-                (
-                    value[key]
-                    for key in keys
-                    if value.get(key) not in (None, "")
-                ),
+                (value[key] for key in keys if value.get(key) not in (None, "")),
                 None,
             )
             for target, keys in aliases.items()
         }
     if policy.capability == "announcement.catalog" and isinstance(value, list):
+        def normalize_title(raw: Any) -> str:
+            text = unicodedata.normalize("NFKC", str(raw or "")).strip()
+            text = re.sub(r"^\s*(?:公告|临时公告|摘要)\s*[:：\-]\s*", "", text)
+            text = re.sub(r"\.(?:pdf|html?)$", "", text, flags=re.IGNORECASE)
+            return re.sub(r"\s+", "", text)
+
         rows = []
         for item in value:
             if not isinstance(item, dict):
                 continue
+            title = next(
+                (item[key] for key in ("title", "公告标题", "公告名称") if item.get(key)),
+                None,
+            )
             rows.append(
                 {
-                    "title": next(
-                        (
-                            item[key]
-                            for key in ("title", "公告标题", "公告名称")
-                            if item.get(key)
-                        ),
-                        None,
-                    ),
+                    "symbol": item.get("symbol") or item.get("代码"),
+                    "title": normalize_title(title),
                     "published_date": next(
                         (
                             item[key]
@@ -246,35 +298,30 @@ def canonical_value(value: Any, policy: CapabilityQualityPolicy) -> Any:
                         ),
                         None,
                     ),
-                    "url": next(
+                    "announcement_id": next(
                         (
                             item[key]
-                            for key in ("url", "公告链接", "网址")
+                            for key in ("announcement_id", "公告编号", "id")
                             if item.get(key)
                         ),
                         None,
                     ),
+                    "document_hash": item.get("document_hash"),
                 }
             )
-        value = sorted(rows, key=lambda row: (str(row["published_date"]), str(row["title"])))
-    if policy.capability == "market.daily" and isinstance(value, list):
-        rows = []
-        for item in value[-5:]:
-            row = asdict(item) if is_dataclass(item) else dict(item)
-            source = str(row.get("source") or "").lower()
-            row["adjustment"] = (
-                "qfq"
-                if "qfq" in source
-                else "hfq"
-                if "hfq" in source
-                else "unadjusted"
-            )
-            row["price_unit"] = "CNY"
-            row["volume_unit"] = "share"
-            rows.append(row)
-        value = rows
-    if isinstance(value, list) and policy.capability == "market.daily":
-        value = value[-5:]
+        value = sorted(
+            rows,
+            key=lambda row: (
+                str(row["published_date"]),
+                str(row["title"]),
+                str(row["announcement_id"]),
+            ),
+        )
+    if policy.capability.startswith("market.daily") and isinstance(value, list):
+        value = [
+            asdict(item) if is_dataclass(item) else dict(item)
+            for item in value[-5:]
+        ]
     if isinstance(value, dict) and isinstance(value.get("rows"), list):
         value = {"rows": value["rows"][-5:]}
     return _normalize(value, policy=policy)
