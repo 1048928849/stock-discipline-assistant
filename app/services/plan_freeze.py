@@ -4,20 +4,20 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from pydantic import ValidationError
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.domain.models import (
     MARKET_EVIDENCE_CAPABILITIES,
+    SOURCE_EVIDENCE_CAPABILITIES,
     DecisionPackage,
 )
 from app.errors import AppError
-from app.models import (
-    CompanyProfile,
-    CompanyResearchRefresh,
-)
 from app.schemas_workflow import TradePlanPreviewRequest, TradePlanSaveRequest
 from app.services.market_cache import resolve_market_quality_binding
+from app.services.research_cache import (
+    resolve_cached_announcement_catalog,
+    resolve_cached_company_profile,
+)
 
 
 MAX_ANALYSIS_AGE = timedelta(hours=24)
@@ -41,6 +41,21 @@ def _validated_package(value: dict[str, Any] | None) -> DecisionPackage:
             422,
             "DECISION_PACKAGE_MARKET_BINDING_REQUIRED",
             "Legacy DecisionPackage has no exact market quality binding; run a new analysis.",
+        )
+    required_source_evidence = [
+        item
+        for item in raw_evidence
+        if isinstance(item, dict)
+        and item.get("required")
+        and item.get("capability") in SOURCE_EVIDENCE_CAPABILITIES
+    ]
+    if any(
+        not item.get("source_quality_binding") for item in required_source_evidence
+    ):
+        raise AppError(
+            422,
+            "DECISION_PACKAGE_SOURCE_BINDING_REQUIRED",
+            "Legacy DecisionPackage has no exact research source binding; run a new analysis.",
         )
     try:
         package = DecisionPackage.model_validate(value)
@@ -103,28 +118,60 @@ def freeze_trade_plan(
                 f"Market Evidence {evidence.evidence_id} changed: {validation.reason}",
             )
 
-    # Company profile and announcement checks remain on the legacy C.2 path.
-    changed_after_analysis = [
-        db.scalar(
-            select(CompanyProfile).where(
-                CompanyProfile.symbol == request.symbol,
-                CompanyProfile.fetched_at > package.generated_at,
+    for evidence in package.evidence:
+        if not evidence.required or evidence.capability not in SOURCE_EVIDENCE_CAPABILITIES:
+            continue
+        binding = evidence.source_quality_binding
+        if binding.subject_id != request.symbol:
+            raise AppError(
+                422,
+                "SOURCE_BINDING_SCOPE_MISMATCH",
+                f"Research Evidence {evidence.evidence_id} belongs to another symbol.",
             )
-        ),
-        db.scalar(
-            select(CompanyResearchRefresh).where(
-                CompanyResearchRefresh.symbol == request.symbol,
-                CompanyResearchRefresh.section == "announcements",
-                CompanyResearchRefresh.checked_at > package.generated_at,
+        if evidence.capability == "company_profile":
+            selection = resolve_cached_company_profile(
+                db, binding.subject_id, evaluated_at=now
             )
-        ),
-    ]
-    if any(changed_after_analysis):
-        raise AppError(
-            422,
-            "DECISION_PACKAGE_CHANGED",
-            "Required source data changed after analysis; run a new analysis.",
-        )
+            current_scan_start = current_scan_end = current_checked_at = None
+        else:
+            selection = resolve_cached_announcement_catalog(
+                db,
+                binding.subject_id,
+                binding.scan_start.date(),
+                binding.scan_end.date(),
+                evaluated_at=now,
+            )
+            current_scan_start = selection.scan_start
+            current_scan_end = selection.scan_end
+            current_checked_at = selection.checked_at
+        if not selection.executable:
+            error_code = (
+                "DECISION_PACKAGE_CHANGED"
+                if selection.structure_reason
+                else "SOURCE_BINDING_NOT_EXECUTABLE"
+            )
+            raise AppError(
+                422,
+                error_code,
+                f"Research Evidence {evidence.evidence_id} changed: "
+                f"{selection.blocking_reason or 'not executable'}",
+            )
+        selected_observed_at = selection.effective_quality.observed_at
+        if (
+            selection.quality_record_id != binding.quality_record_id
+            or selection.subject.subject_type != binding.subject_type
+            or selection.subject.subject_id != binding.subject_id
+            or (selection.subject.semantic_key or "") != binding.semantic_key
+            or selected_observed_at != binding.observed_at
+            or current_scan_start != binding.scan_start
+            or current_scan_end != binding.scan_end
+            or current_checked_at != binding.checked_at
+        ):
+            raise AppError(
+                422,
+                "SOURCE_BINDING_CHANGED",
+                f"Research Evidence {evidence.evidence_id} uses different lineage.",
+            )
 
     from app.services.trade_plan_generator import (
         _persist_generated_plan,
