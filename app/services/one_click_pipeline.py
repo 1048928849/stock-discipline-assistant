@@ -45,6 +45,7 @@ from app.services.company_research import refresh_company_research_if_needed
 from app.services.data_sources import build_data_hub
 from app.services.market_cache import (
     effective_quality_metadata,
+    market_quality_binding_from_selection,
     mapping_series_bars,
     persist_market_quote,
     replace_market_series,
@@ -63,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 
 def _step(code: str, name: str, status: str, detail: str, **extra) -> dict:
-    return {
+    result = {
         "code": code,
         "name": name,
         "status": status,
@@ -72,6 +73,22 @@ def _step(code: str, name: str, status: str, detail: str, **extra) -> dict:
         "missing": extra.pop("missing", []),
         **extra,
     }
+    if code in {
+        "market_data",
+        "market_quote",
+        "market_judgement",
+        "industry_judgement",
+    }:
+        result.setdefault("market_quality_binding", None)
+    return result
+
+
+def _market_binding_payload(selection, data_capability: str) -> dict | None:
+    binding = market_quality_binding_from_selection(
+        selection,
+        data_capability=data_capability,
+    )
+    return binding.model_dump(mode="json") if binding else None
 
 
 def _default_account(db: Session, payload: OneClickPlanRequest) -> tuple[Account, bool]:
@@ -125,6 +142,9 @@ def _sync_stock(
                 observed_at=latest.observed_at.isoformat(),
                 quality_status=cached.effective_quality.effective_quality.value,
                 quality_record_id=cached.quality_record_id,
+                market_quality_binding=_market_binding_payload(
+                    cached, "market.daily.qfq"
+                ),
                 **effective_quality_metadata(cached.effective_quality),
             ),
             {
@@ -148,7 +168,7 @@ def _sync_stock(
             db.commit()
             quote = quote_result.require_trusted_value()
         except ProviderUnavailableError as exc:
-            if quote_result:
+            if quote_result is not None:
                 db.commit()
             quote_error = str(exc)
             latest = bars[-1]
@@ -225,28 +245,77 @@ def _sync_stock(
             symbol=symbol,
             capability="market.quote.realtime",
         )
+        execution_quote = (
+            stored_quote.value if stored_quote.executable else None
+        )
+        latest = stored_history.bars[-1]
+        display_quote = execution_quote or Quote(
+            symbol=symbol,
+            name=execution_quote.name if execution_quote else symbol,
+            price=latest.close,
+            quote_type="latest_close",
+            observed_at=latest.observed_at,
+            price_unit=latest.price_unit,
+            source=latest.source,
+            source_api="history_latest_close",
+            fetched_at=latest.fetched_at,
+        )
+        used_cached_realtime = execution_quote is not None and quote_error is not None
         quote_step = _step(
             "market_quote",
             "当前价格质量",
             "success"
             if stored_quote.executable
             else "partial",
-            "已取得实时价格。" if quote_result else "实时价格不可用，明确降级为最新收盘价。",
-            source=quote.source,
-            observed_at=quote.observed_at.isoformat(),
-            fetched_at=quote.fetched_at.isoformat(),
-            data_time=quote.observed_at.isoformat(),
+            (
+                "本次刷新失败，继续使用仍新鲜的可信实时缓存。"
+                if used_cached_realtime
+                else "已取得实时价格。"
+                if execution_quote
+                else "实时价格不可用；最新收盘价仅用于展示。"
+            ),
+            source=execution_quote.source if execution_quote else "none",
+            observed_at=(
+                execution_quote.observed_at.isoformat()
+                if execution_quote
+                else None
+            ),
+            fetched_at=(
+                execution_quote.fetched_at.isoformat()
+                if execution_quote
+                else None
+            ),
+            data_time=(
+                execution_quote.observed_at.isoformat()
+                if execution_quote
+                else None
+            ),
             quality_status=(
                 stored_quote.effective_quality.effective_quality.value
             ),
             provider_observations=(
-                quote_result.provider_observations if quote_result else []
+                quote_result.provider_observations
+                if quote_result is not None
+                else []
             ),
-            conflict_fields=quote_result.conflict_fields if quote_result else [],
-            quote_type=quote.quote_type,
-            price=str(quote.price),
-            fallback_used=quote_result is None,
+            conflict_fields=(
+                quote_result.conflict_fields if quote_result is not None else []
+            ),
+            quote_type=display_quote.quote_type,
+            price=str(display_quote.price),
+            execution_quote_type=(
+                execution_quote.quote_type if execution_quote else None
+            ),
+            execution_price=(
+                str(execution_quote.price) if execution_quote else None
+            ),
+            display_quote_type=display_quote.quote_type,
+            display_price=str(display_quote.price),
+            fallback_used=quote_error is not None,
             quality_record_id=stored_quote.quality_record_id,
+            market_quality_binding=_market_binding_payload(
+                stored_quote, "market.quote.realtime"
+            ),
             **effective_quality_metadata(stored_quote.effective_quality),
         )
         return (
@@ -266,6 +335,9 @@ def _sync_stock(
                 source=stored_history.source,
                 data_time=stored_history.bars[-1].fetched_at.isoformat(),
                 quality_record_id=stored_history.quality_record_id,
+                market_quality_binding=_market_binding_payload(
+                    stored_history, "market.daily.qfq"
+                ),
                 **effective_quality_metadata(stored_history.effective_quality),
             ),
             {
@@ -303,6 +375,9 @@ def _sync_stock(
                     else None,
                     quality_status=cached.effective_quality.effective_quality.value,
                     quality_record_id=cached.quality_record_id,
+                    market_quality_binding=_market_binding_payload(
+                        cached, "market.daily.qfq"
+                    ),
                     **effective_quality_metadata(cached.effective_quality),
                     missing=["最新行情"],
                 ),
@@ -321,6 +396,9 @@ def _sync_stock(
                 missing=["前复权日线", "当前价格"],
                 quality_status=cached.effective_quality.effective_quality.value,
                 quality_record_id=cached.quality_record_id,
+                market_quality_binding=_market_binding_payload(
+                    cached, "market.daily.qfq"
+                ),
                 **effective_quality_metadata(cached.effective_quality),
             ),
             {
@@ -392,6 +470,9 @@ def _market_assessment(db: Session, provider: DataHubRouter) -> tuple[dict, dict
             observed_at=cached.bars[-1].observed_at.isoformat(),
             quality_status=cached.effective_quality.effective_quality.value,
             quality_record_id=cached.quality_record_id,
+            market_quality_binding=_market_binding_payload(
+                cached, "market.index_daily"
+            ),
             **effective_quality_metadata(cached.effective_quality),
         )
     try:
@@ -459,6 +540,9 @@ def _market_assessment(db: Session, provider: DataHubRouter) -> tuple[dict, dict
             fetched_at=current.bars[-1].fetched_at.isoformat(),
             provider_observations=history_result.provider_observations,
             quality_record_id=current.quality_record_id,
+            market_quality_binding=_market_binding_payload(
+                current, "market.index_daily"
+            ),
             **effective_quality_metadata(current.effective_quality),
         )
     except Exception as exc:
@@ -492,6 +576,9 @@ def _market_assessment(db: Session, provider: DataHubRouter) -> tuple[dict, dict
                 else None,
                 quality_status=cached.effective_quality.effective_quality.value,
                 quality_record_id=cached.quality_record_id,
+                market_quality_binding=_market_binding_payload(
+                    cached, "market.index_daily"
+                ),
                 **effective_quality_metadata(cached.effective_quality),
                 missing=["最新沪深300行情"],
             )
@@ -504,6 +591,9 @@ def _market_assessment(db: Session, provider: DataHubRouter) -> tuple[dict, dict
             missing=["沪深300近60个交易日"],
             quality_status=cached.effective_quality.effective_quality.value,
             quality_record_id=cached.quality_record_id,
+            market_quality_binding=_market_binding_payload(
+                cached, "market.index_daily"
+            ),
             **effective_quality_metadata(cached.effective_quality),
         )
 
@@ -688,6 +778,9 @@ def _sector_assessment(
             else None,
             quality_status=cached.effective_quality.effective_quality.value,
             quality_record_id=cached.quality_record_id,
+            market_quality_binding=_market_binding_payload(
+                cached, "market.sector_daily"
+            ),
             **effective_quality_metadata(cached.effective_quality),
         )
     try:
@@ -751,6 +844,9 @@ def _sector_assessment(
             fetched_at=current.bars[-1].fetched_at.isoformat(),
             provider_observations=history_result.provider_observations,
             quality_record_id=current.quality_record_id,
+            market_quality_binding=_market_binding_payload(
+                current, "market.sector_daily"
+            ),
             **effective_quality_metadata(current.effective_quality),
         )
     except Exception as exc:
@@ -784,6 +880,9 @@ def _sector_assessment(
                 else None,
                 quality_status=cached.effective_quality.effective_quality.value,
                 quality_record_id=cached.quality_record_id,
+                market_quality_binding=_market_binding_payload(
+                    cached, "market.sector_daily"
+                ),
                 **effective_quality_metadata(cached.effective_quality),
             )
         result = {"state": "无法判断", "relative_20d": None, "is_mainline": None}
@@ -795,6 +894,9 @@ def _sector_assessment(
             missing=["行业指数近60个交易日", "行业相对强度"],
             quality_status=cached.effective_quality.effective_quality.value,
             quality_record_id=cached.quality_record_id,
+            market_quality_binding=_market_binding_payload(
+                cached, "market.sector_daily"
+            ),
             **effective_quality_metadata(cached.effective_quality),
         )
 
@@ -910,15 +1012,16 @@ def _cached_quote_step(db: Session, symbol: str) -> dict:
         symbol=symbol,
         capability="market.quote.realtime",
     )
-    quote = selection.value
-    fallback = None
-    if quote is None:
-        fallback = resolve_cached_quote(
+    execution_quote = selection.value if selection.executable else None
+    display_quote = execution_quote
+    if display_quote is None:
+        display_selection = resolve_cached_quote(
             db,
             symbol=symbol,
             capability="market.quote.latest_close",
         )
-        quote = fallback.value
+        display_quote = display_selection.value
+    quote = execution_quote
     quality = selection.effective_quality.effective_quality.value
     record_id = (
         selection.effective_quality.blocking_record_id
@@ -938,10 +1041,17 @@ def _cached_quote_step(db: Session, symbol: str) -> dict:
         provider_observations=record.provider_observations if record else [],
         conflict_fields=record.conflict_fields if record else [],
         quality_record_id=selection.quality_record_id,
+        market_quality_binding=_market_binding_payload(
+            selection, "market.quote.realtime"
+        ),
         **effective_quality_metadata(selection.effective_quality),
-        quote_type=quote.quote_type if quote else None,
-        price=str(quote.price) if quote else None,
-        fallback_used=bool(fallback and fallback.value),
+        quote_type=display_quote.quote_type if display_quote else None,
+        price=str(display_quote.price) if display_quote else None,
+        execution_quote_type=quote.quote_type if quote else None,
+        execution_price=str(quote.price) if quote else None,
+        display_quote_type=display_quote.quote_type if display_quote else None,
+        display_price=str(display_quote.price) if display_quote else None,
+        fallback_used=display_quote is not None and quote is None,
     )
 
 
