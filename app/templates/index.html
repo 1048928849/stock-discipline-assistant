@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>股票纪律助手</title>
   <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/product-v1.css">
 </head>
 <body data-page="{{ page|default('dashboard') }}">
   <aside class="sidebar">
@@ -41,7 +42,7 @@
             <label><span>账户最大总仓位</span><input name="max_total_position_pct" type="number" min="1" max="100" value="80"></label>
             <label><span>行业集中度上限</span><input name="max_industry_position_pct" type="number" min="1" max="100" value="40"></label>
             <label class="checkbox-label"><input name="enable_ai" type="checkbox" checked>生成AI辅助解释</label>
-            <label class="checkbox-label"><input name="refresh" type="checkbox">强制刷新行情</label>
+            <label class="checkbox-label"><input name="refresh" type="checkbox" checked>刷新完整分析数据</label>
           </div></details>
           <button class="primary-action">开始分析并生成计划</button>
         </form>
@@ -68,7 +69,7 @@
     <section class="panel" data-view="trade-plans"><h2>交易计划</h2><p>行情、市场、行业、个股规则、仓位和AI解释一次生成；用户最后确认保存。</p><div id="rule-version-card"></div>
       <form class="one-click-plan-form" data-result="trade-plan-result" data-progress="trade-plan-progress" data-actions="plan-actions">
         <div class="quick-fields"><label><span>股票代码</span><input name="symbol" pattern="\d{6}" inputmode="numeric" placeholder="例如 300502" required></label><label><span>当前状态</span><select name="position_mode"><option value="空仓">空仓，准备买入</option><option value="持仓">已经持有</option></select></label><label><span>账户</span><select name="account_id" class="one-click-account"><option value="">自动选择上次账户</option></select></label><label class="capital-field"><span>本次计划资金</span><input name="plan_capital" type="number" min="10000" step="10000" value="300000"></label><label class="holding-field" hidden><span>持仓数量</span><input name="holding_quantity" type="number" min="100" step="100"></label><label class="holding-field" hidden><span>持仓成本</span><input name="holding_cost_price" type="number" min="0.01" step="0.01"></label></div>
-        <details class="advanced-settings"><summary>高级设置</summary><div class="quick-fields"><label><span>单笔风险（%）</span><input name="risk_pct" type="number" min="0.1" max="10" step="0.1" value="0.5"></label><label><span>单票最大仓位（%）</span><input name="max_position_pct" type="number" min="1" max="100" value="30"></label><label><span>账户最大总仓位（%）</span><input name="max_total_position_pct" type="number" min="1" max="100" value="80"></label><label><span>行业集中度上限（%）</span><input name="max_industry_position_pct" type="number" min="1" max="100" value="40"></label><label><span>补充逻辑失效条件</span><textarea name="logic_invalidation"></textarea></label><label class="checkbox-label"><input name="enable_ai" type="checkbox" checked>生成AI辅助解释</label><label class="checkbox-label"><input name="refresh" type="checkbox">强制刷新行情</label></div></details>
+        <details class="advanced-settings"><summary>高级设置</summary><div class="quick-fields"><label><span>单笔风险（%）</span><input name="risk_pct" type="number" min="0.1" max="10" step="0.1" value="0.5"></label><label><span>单票最大仓位（%）</span><input name="max_position_pct" type="number" min="1" max="100" value="30"></label><label><span>账户最大总仓位（%）</span><input name="max_total_position_pct" type="number" min="1" max="100" value="80"></label><label><span>行业集中度上限（%）</span><input name="max_industry_position_pct" type="number" min="1" max="100" value="40"></label><label><span>补充逻辑失效条件</span><textarea name="logic_invalidation"></textarea></label><label class="checkbox-label"><input name="enable_ai" type="checkbox" checked>生成AI辅助解释</label><label class="checkbox-label"><input name="refresh" type="checkbox" checked>刷新完整分析数据</label></div></details>
         <button class="primary-action">开始分析并生成计划</button>
       </form>
       <div id="trade-plan-progress" class="pipeline-progress"></div>
@@ -131,5 +132,6 @@
   </main>
   <div id="toast" role="status"></div>
   <script src="/static/app.js"></script>
+  <script src="/static/product-v1.js"></script>
 </body>
 </html>
