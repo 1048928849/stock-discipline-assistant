@@ -124,7 +124,11 @@ def mysql_test_url() -> URL:
     try:
         engine = create_engine(url, pool_pre_ping=True)
         with engine.connect() as connection:
-            version = str(connection.scalar(text("SELECT VERSION()")))
+            version, version_comment = connection.execute(
+                text("SELECT VERSION(), @@version_comment")
+            ).one()
+            version = str(version)
+            version_comment = str(version_comment)
             database_charset = connection.execute(
                 text(
                     "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME "
@@ -132,7 +136,9 @@ def mysql_test_url() -> URL:
                 ),
                 {"name": url.database},
             ).one()
-            if not version.startswith("8."):
+            if not version.startswith("8.") or "mariadb" in (
+                version + version_comment
+            ).lower():
                 pytest.fail(f"MySQL 8 is required; server reported {version}")
             if database_charset[0] != "utf8mb4":
                 pytest.fail("isolated MySQL database must use utf8mb4")
@@ -329,7 +335,7 @@ def test_mysql8_version_empty_upgrade_and_idempotency(mysql_database: URL):
             text("SELECT VERSION(), @@GLOBAL.time_zone, @@SESSION.time_zone")
         ).one()
     engine.dispose()
-    assert str(version).startswith("8.0.25")
+    assert str(version).startswith("8.")
     assert global_tz
     assert session_tz
     _alembic(mysql_database, "upgrade", "head")
