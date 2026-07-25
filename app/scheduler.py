@@ -89,7 +89,11 @@ def sync_x_posts() -> None:
                 job.finished_at = datetime.now()
                 db.commit()
                 return
-            posts = UnifiedDataService(db).collect_social_queries(queries, limit=20).value
+            posts = (
+                UnifiedDataService(db)
+                .collect_social_queries(queries, limit=20)
+                .require_value()
+            )
             count = 0
             for post in posts:
                 exists = db.scalar(

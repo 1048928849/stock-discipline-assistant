@@ -21,7 +21,20 @@ from app.models import (
     XPost,
 )
 from app.config import get_settings
+from app.data_hub.research_subjects import announcement_catalog_window
+from app.data_hub.router import DataHubRouter
+from app.data_hub.trading_calendar import (
+    shanghai_now,
+    to_shanghai_aware,
+    to_utc_storage_naive,
+    utc_storage_naive_to_aware,
+)
 from app.services.data_sources import ProviderResult, UnifiedDataService
+from app.services.research_cache import (
+    persist_announcement_catalog,
+    persist_company_profile,
+)
+from app.services.url_normalization import normalize_announcement_url
 
 
 PROFILE_URL = "http://www.cninfo.com.cn/new/commonUrl?url=data/stock/stockDetail"
@@ -254,11 +267,11 @@ def _implied_scenarios(current_pe: float | None, pe_history: list[float]):
 
 
 def _provider_value(value):
-    return value.value if isinstance(value, ProviderResult) else value
+    return value.require_value() if isinstance(value, ProviderResult) else value
 
 
 def _provider_source(provider, capability: str, default: str) -> str:
-    if isinstance(provider, UnifiedDataService):
+    if isinstance(provider, DataHubRouter):
         call = provider.calls.get(capability)
         if call:
             return call.provider_id
@@ -383,34 +396,57 @@ def sync_company_research(
     symbol: str,
     provider=None,
     include_documents: bool = True,
+    evaluated_at: datetime | None = None,
 ) -> dict:
     provider = provider or UnifiedDataService(db)
-    fetched_at = datetime.now()
+    business_now = to_shanghai_aware(evaluated_at or shanghai_now())
+    business_day = business_now.date()
+    research_storage_now = to_utc_storage_naive(business_now)
+    fetched_at = research_storage_now
+    announcement_start, announcement_end = announcement_catalog_window(
+        evaluated_at=business_now
+    )
     sections = {}
     profile = None
+    exact_calls: dict[str, ProviderResult] = {}
 
     try:
-        raw_profile = _provider_value(provider.company_profile(symbol))
-        profile_source = _provider_source(provider, "fundamental.profile", "巨潮资讯公司概况")
-        profile = db.scalar(select(CompanyProfile).where(CompanyProfile.symbol == symbol))
-        values = {
-            "name": str(raw_profile.get("A股简称") or raw_profile.get("公司名称") or symbol),
-            "industry": raw_profile.get("细分行业") or raw_profile.get("所属行业"),
-            "market": raw_profile.get("所属市场"),
-            "main_business": raw_profile.get("主营业务"),
-            "business_scope": raw_profile.get("经营范围"),
-            "website": raw_profile.get("官方网站"),
-            "source": profile_source,
-            "source_url": PROFILE_URL,
-            "raw_data": raw_profile,
-            "fetched_at": fetched_at,
-        }
-        if profile is None:
-            profile = CompanyProfile(symbol=symbol, **values)
-            db.add(profile)
+        profile_call = provider.company_profile(symbol)
+        if isinstance(provider, DataHubRouter):
+            exact_calls["profile"] = profile_call
+            profile = persist_company_profile(db, provider, profile_call)
         else:
-            for key, value in values.items():
-                setattr(profile, key, value)
+            # Legacy providers do not expose Router lineage and retain their old upsert.
+            raw_profile = _provider_value(profile_call)
+            profile_source = _provider_source(
+                provider, "fundamental.profile", "巨潮资讯公司概况"
+            )
+            profile = db.scalar(
+                select(CompanyProfile).where(CompanyProfile.symbol == symbol)
+            )
+            values = {
+                "name": str(
+                    raw_profile.get("A股简称")
+                    or raw_profile.get("公司名称")
+                    or symbol
+                ),
+                "industry": raw_profile.get("细分行业")
+                or raw_profile.get("所属行业"),
+                "market": raw_profile.get("所属市场"),
+                "main_business": raw_profile.get("主营业务"),
+                "business_scope": raw_profile.get("经营范围"),
+                "website": raw_profile.get("官方网站"),
+                "source": profile_source,
+                "source_url": PROFILE_URL,
+                "raw_data": raw_profile,
+                "fetched_at": fetched_at,
+            }
+            if profile is None:
+                profile = CompanyProfile(symbol=symbol, **values)
+                db.add(profile)
+            else:
+                for key, value in values.items():
+                    setattr(profile, key, value)
         if profile.main_business:
             _upsert_evidence(
                 db,
@@ -418,11 +454,11 @@ def sync_company_research(
                 topic="主营业务",
                 information_type="事实",
                 content=profile.main_business,
-                source_name=profile_source,
+                source_name=profile.source,
                 source_url=PROFILE_URL,
                 source_date=None,
                 raw_data={"field": "主营业务"},
-                fetched_at=fetched_at,
+                fetched_at=profile.fetched_at,
             )
         sections["profile"] = {"status": "success", "rows": 1}
     except Exception as exc:
@@ -460,56 +496,94 @@ def sync_company_research(
         sections["financials"] = {"status": "unavailable", "message": str(exc)}
 
     try:
-        announcement_rows = _provider_value(
-            provider.company_announcements(
-                symbol, date.today() - timedelta(days=3 * 366), date.today()
-            )
+        announcement_call = provider.company_announcements(
+            symbol, announcement_start, announcement_end
         )
+        if isinstance(provider, DataHubRouter):
+            exact_calls["announcements"] = announcement_call
+        announcement_rows = _provider_value(announcement_call)
         inserted = 0
         document_resolution_attempts = 0
         resolved_documents = 0
-        for row in announcement_rows:
+        if isinstance(provider, DataHubRouter):
+            persist_announcement_catalog(
+                db,
+                provider,
+                announcement_call,
+                start=announcement_start,
+                end=announcement_end,
+            )
+            announcement_rows_to_persist = []
+        else:
+            announcement_rows_to_persist = announcement_rows
+        prepared_legacy_announcements = []
+        for row in announcement_rows_to_persist:
             title, published, url, catalog = _announcement_fields(row)
-            if not url:
-                continue
+            normalized_url = normalize_announcement_url(url)
             category, risk = classify_announcement(title)
             document_url = None
             should_resolve = risk in {"红", "黄"} or category == "年报"
             if should_resolve and document_resolution_attempts < 8:
                 document_resolution_attempts += 1
-                document_url = _resolve_announcement_document_url(url)
+                document_url = _resolve_announcement_document_url(normalized_url)
                 if document_url:
                     resolved_documents += 1
-            announcement_item = db.scalar(
-                select(CompanyAnnouncement).where(
-                    CompanyAnnouncement.symbol == symbol, CompanyAnnouncement.url == url
+            prepared_legacy_announcements.append(
+                (
+                    row,
+                    title,
+                    published,
+                    normalized_url,
+                    catalog,
+                    category,
+                    risk,
+                    document_url,
                 )
             )
-            values = {
-                "title": title,
-                "announcement_category": category,
-                "risk_level": risk,
-                "published_date": published,
-                "catalog_source": catalog,
-                "exchange": "上交所" if symbol.startswith(("5", "6", "9")) else "深交所",
-                "url": url,
-                "source_document_url": document_url,
-                "raw_data": row,
-                "fetched_at": fetched_at,
-            }
-            if announcement_item is None:
-                db.add(CompanyAnnouncement(symbol=symbol, **values))
-                inserted += 1
-            else:
-                for key, value in values.items():
-                    setattr(announcement_item, key, value)
+        with db.begin_nested():
+            for (
+                row,
+                title,
+                published,
+                normalized_url,
+                catalog,
+                category,
+                risk,
+                document_url,
+            ) in prepared_legacy_announcements:
+                announcement_item = db.scalar(
+                    select(CompanyAnnouncement).where(
+                        CompanyAnnouncement.symbol == symbol,
+                        CompanyAnnouncement.url == normalized_url,
+                    )
+                )
+                values = {
+                    "title": title,
+                    "announcement_category": category,
+                    "risk_level": risk,
+                    "published_date": published,
+                    "catalog_source": catalog,
+                    "exchange": "上交所"
+                    if symbol.startswith(("5", "6", "9"))
+                    else "深交所",
+                    "url": normalized_url,
+                    "source_document_url": document_url,
+                    "raw_data": row,
+                    "fetched_at": fetched_at,
+                }
+                if announcement_item is None:
+                    db.add(CompanyAnnouncement(symbol=symbol, **values))
+                    inserted += 1
+                else:
+                    for key, value in values.items():
+                        setattr(announcement_item, key, value)
+            db.flush()
         sections["announcements"] = {
             "status": "success",
             "rows": len(announcement_rows),
             "inserted": inserted,
             "original_documents_resolved": resolved_documents,
         }
-        db.flush()
     except Exception as exc:
         sections["announcements"] = {"status": "unavailable", "message": str(exc)}
 
@@ -711,12 +785,18 @@ def sync_company_research(
             if isinstance(raw_row_count, (int, float, str))
             else cached_counts.get(section, 0)
         )
-        cache_used = not external_success and cached_counts.get(section, 0) > 0
+        cache_available = cached_counts.get(section, 0) > 0 or bool(
+            section == "announcements" and existing and existing.last_success_at
+        )
+        cache_used = not external_success and cache_available
         if cache_used:
             result["status"] = "cache_fallback"
             result["cache_used"] = True
             row_count = cached_counts[section]
-            if isinstance(provider, UnifiedDataService):
+            if isinstance(provider, DataHubRouter) and section not in {
+                "profile",
+                "announcements",
+            }:
                 provider.record_cache_fallback(
                     capability_by_section[section],
                     section,
@@ -724,11 +804,52 @@ def sync_company_research(
                     row_count,
                     str(result.get("message", "外部Provider失败")),
                 )
-        call = (
-            provider.calls.get(capability_by_section[section])
-            if isinstance(provider, UnifiedDataService)
+        call = None
+        if isinstance(provider, DataHubRouter):
+            call = exact_calls.get(section)
+            if call is None and section not in {"profile", "announcements"}:
+                call = provider.calls.get(capability_by_section[section])
+        if (
+            external_success
+            and call
+            and section not in exact_calls
+            and call.quality_status.value in {"VERIFIED", "SINGLE_SOURCE"}
+        ):
+            provider.mark_persisted(call, cached_at=fetched_at)
+        if isinstance(provider, DataHubRouter) and section == "announcements":
+            if call:
+                result["quality_status"] = call.quality_status.value
+                result["provider_observations"] = call.provider_observations
+                result["conflict_fields"] = call.conflict_fields
+                result["normalized_digest"] = call.normalized_digest
+                if call.checked_at:
+                    result["checked_at"] = to_shanghai_aware(
+                        call.checked_at
+                    ).isoformat()
+            continue
+        quality_status = (
+            call.quality_status.value
+            if call
+            else "SINGLE_SOURCE"
+            if external_success
+            else "MISSING"
+        )
+        checked_at = (
+            research_storage_now
+            if section == "announcements" and external_success
+            else existing.checked_at
+            if section == "announcements" and existing
             else None
         )
+        result["quality_status"] = quality_status
+        if call:
+            result["provider_observations"] = call.provider_observations
+            result["conflict_fields"] = call.conflict_fields
+            result["normalized_digest"] = call.normalized_digest
+        if checked_at:
+            result["checked_at"] = utc_storage_naive_to_aware(
+                checked_at
+            ).isoformat()
         values = {
             "status": result["status"],
             "provider_id": call.provider_id
@@ -739,14 +860,65 @@ def sync_company_research(
             else getattr(provider, "provider_id", provider.__class__.__name__),
             "row_count": row_count,
             "cache_used": cache_used,
-            "last_attempt_at": fetched_at,
-            "last_success_at": fetched_at
+            "last_attempt_at": research_storage_now,
+            "last_success_at": research_storage_now
             if external_success
             else (existing.last_success_at if existing else None),
-            "data_date": date.today() if row_count else None,
-            "stale_after": fetched_at + timedelta(hours=fresh_hours[section])
+            "data_date": (
+                business_day
+                if external_success
+                and (row_count or section == "announcements")
+                else (existing.data_date if existing else None)
+            ),
+            "stale_after": research_storage_now
+            + timedelta(hours=fresh_hours[section])
             if external_success
             else (existing.stale_after if existing else None),
+            "quality_status": quality_status,
+            "observed_at": (
+                checked_at
+                if section == "announcements"
+                else DataHubRouter._as_datetime(call.observed_at)
+                if call
+                else existing.observed_at
+                if existing
+                else None
+            ),
+            "fetched_at": (
+                DataHubRouter._as_datetime(call.fetched_at)
+                if call and external_success
+                else research_storage_now
+                if external_success
+                else existing.fetched_at
+                if existing
+                else None
+            ),
+            "checked_at": checked_at,
+            "scan_start": datetime.combine(announcement_start, datetime.min.time())
+            if section == "announcements" and external_success
+            else existing.scan_start
+            if section == "announcements" and existing
+            else None,
+            "scan_end": datetime.combine(announcement_end, datetime.max.time())
+            if section == "announcements" and external_success
+            else existing.scan_end
+            if section == "announcements" and existing
+            else None,
+            "normalized_digest": call.normalized_digest
+            if call
+            else existing.normalized_digest
+            if existing
+            else None,
+            "provider_observations": call.provider_observations
+            if call
+            else existing.provider_observations
+            if existing
+            else [],
+            "conflict_fields": call.conflict_fields
+            if call
+            else existing.conflict_fields
+            if existing
+            else [],
             "error": result.get("message") if not external_success else None,
         }
         if existing is None:
@@ -761,7 +933,7 @@ def sync_company_research(
         if any(v["status"] != "success" for v in sections.values())
         else "success",
         "sections": sections,
-        "updated_at": fetched_at.isoformat(),
+        "updated_at": business_now.isoformat(),
     }
 
 
@@ -772,10 +944,12 @@ def refresh_company_research_if_needed(
     force: bool = False,
     include_documents: bool = False,
     data_service: UnifiedDataService | None = None,
+    evaluated_at: datetime | None = None,
 ) -> dict:
     """检查四类公司研究数据，新鲜则复用，过期则经统一Provider自动刷新。"""
     settings = get_settings()
-    now = datetime.now()
+    business_now = to_shanghai_aware(evaluated_at or shanghai_now())
+    research_storage_now = to_utc_storage_naive(business_now)
     latest = {
         "profile": db.scalar(
             select(func.max(CompanyProfile.fetched_at)).where(CompanyProfile.symbol == symbol)
@@ -805,7 +979,9 @@ def refresh_company_research_if_needed(
     stale = [
         name
         for name, updated in latest.items()
-        if force or updated is None or updated < now - timedelta(hours=limits[name])
+        if force
+        or updated is None
+        or updated < research_storage_now - timedelta(hours=limits[name])
     ]
     if stale:
         result = sync_company_research(
@@ -813,6 +989,7 @@ def refresh_company_research_if_needed(
             symbol,
             provider=data_service or UnifiedDataService(db),
             include_documents=include_documents,
+            evaluated_at=business_now,
         )
     else:
         result = {
@@ -822,13 +999,21 @@ def refresh_company_research_if_needed(
                 name: {
                     "status": "fresh",
                     "rows": 1,
-                    "updated_at": updated.isoformat() if updated else None,
+                    "updated_at": utc_storage_naive_to_aware(updated).isoformat()
+                    if updated
+                    else None,
                     "cache_used": False,
                 }
                 for name, updated in latest.items()
             },
-            "updated_at": now.isoformat(),
+            "updated_at": business_now.isoformat(),
         }
+    announcement_refresh = db.scalar(
+        select(CompanyResearchRefresh).where(
+            CompanyResearchRefresh.symbol == symbol,
+            CompanyResearchRefresh.section == "announcements",
+        )
+    )
     presence = {
         "profile": bool(
             db.scalar(select(CompanyProfile.id).where(CompanyProfile.symbol == symbol))
@@ -842,7 +1027,8 @@ def refresh_company_research_if_needed(
             db.scalar(
                 select(CompanyAnnouncement.id).where(CompanyAnnouncement.symbol == symbol)
             )
-        ),
+        )
+        or bool(announcement_refresh and announcement_refresh.last_success_at),
         "valuation": bool(
             db.scalar(
                 select(CompanyValuationSnapshot.id).where(
@@ -856,7 +1042,7 @@ def refresh_company_research_if_needed(
     ).all()
     return {
         **result,
-        "checked_at": now.isoformat(),
+        "checked_at": business_now.isoformat(),
         "refreshed_sections": stale,
         "missing_data": [name for name, available in presence.items() if not available],
         "freshness": [
@@ -864,10 +1050,16 @@ def refresh_company_research_if_needed(
                 "section": item.section,
                 "status": item.status,
                 "provider_id": item.provider_id,
-                "last_success_at": item.last_success_at.isoformat()
+                "last_success_at": utc_storage_naive_to_aware(
+                    item.last_success_at
+                ).isoformat()
                 if item.last_success_at
                 else None,
-                "stale_after": item.stale_after.isoformat() if item.stale_after else None,
+                "stale_after": utc_storage_naive_to_aware(
+                    item.stale_after
+                ).isoformat()
+                if item.stale_after
+                else None,
                 "cache_used": item.cache_used,
                 "row_count": item.row_count,
             }

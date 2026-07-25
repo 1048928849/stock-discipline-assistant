@@ -5,10 +5,11 @@ from sqlalchemy.exc import IntegrityError
 
 
 class AppError(Exception):
-    def __init__(self, status_code: int, code: str, message: str):
+    def __init__(self, status_code: int, code: str, message: str, details=None):
         self.status_code = status_code
         self.code = code
         self.message = message
+        self.details = details
 
 
 def error_body(code: str, message: str, details=None) -> dict:
@@ -21,7 +22,10 @@ def error_body(code: str, message: str, details=None) -> dict:
 def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def app_error_handler(_: Request, exc: AppError):
-        return JSONResponse(status_code=exc.status_code, content=error_body(exc.code, exc.message))
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=error_body(exc.code, exc.message, exc.details),
+        )
 
     @app.exception_handler(RequestValidationError)
     async def validation_handler(_: Request, exc: RequestValidationError):

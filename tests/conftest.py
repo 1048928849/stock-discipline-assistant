@@ -1,5 +1,6 @@
 import os
 
+os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
 os.environ["DATABASE_URL"] = "sqlite://"
 os.environ["SCHEDULER_ENABLED"] = "false"
 os.environ["LLM_PROVIDER"] = "openai_compatible"
@@ -15,6 +16,38 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import Base, get_db
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def deterministic_legacy_market_session(request, monkeypatch):
+    """Keep pre-D.1 tests independent from the wall clock.
+
+    D.1 contract tests inject their own clock and exercise the production
+    validators without this compatibility fixture.
+    """
+    real_clock_tests = {
+        "test_freeze_market_validation_uses_shanghai_clock",
+        "test_confirm_at_utc_0200_is_treated_as_shanghai_morning",
+        "test_confirm_at_utc_0700_is_treated_as_shanghai_close",
+        "test_confirm_package_age_is_host_timezone_independent",
+        "test_missing_research_attempt_still_allows_fresh_bound_cache_near_boundary",
+        "test_source_binding_confirm_near_freshness_boundary",
+    }
+    if (
+        request.path.name == "test_market_time_contracts.py"
+        or request.node.name in real_clock_tests
+    ):
+        yield
+        return
+
+    from app.data_hub.trading_calendar import TradingPhase, XSHGTradingCalendar
+
+    monkeypatch.setattr(
+        XSHGTradingCalendar,
+        "market_phase",
+        lambda self, now=None: TradingPhase.MORNING_SESSION,
+    )
+    yield
 
 
 @pytest.fixture()

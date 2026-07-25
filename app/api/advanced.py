@@ -9,15 +9,16 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.data_hub.contracts import ProviderUnavailableError
+from app.data_hub.market_subjects import stock_daily_subject
+from app.data_hub.trading_calendar import shanghai_today
 from app.database import get_db
 from app.errors import AppError
 from app.models import (
-    AIAnalysis,
     Account,
     BacktestRun,
     DisciplineRule,
     MarketDailyBar,
-    MarketQuote,
     MarketSourceLog,
     SystemJob,
     Trade,
@@ -26,8 +27,6 @@ from app.models import (
     XWatchAccount,
     XWatchQuery,
 )
-from app.providers.llm_provider import LLMUnavailableError, OpenAICompatibleProvider
-from app.providers.market import ProviderUnavailableError, Quote
 from app.schemas_advanced import (
     BacktestCreate,
     DisciplineAlert,
@@ -40,8 +39,17 @@ from app.schemas_advanced import (
     WatchQueryCreate,
 )
 from app.services.backtests import run_backtest
+from app.services.ai_content import analyze_x_post, test_llm_provider_connection
+from app.services.data_sources import build_data_hub
 from app.services.discipline import check_discipline
-from app.services.data_sources import UnifiedDataService
+from app.services.market_cache import (
+    effective_quality_metadata,
+    persist_market_quote,
+    replace_market_series,
+    resolve_cached_quote,
+    resolve_cached_series,
+    validate_series_for_persistence,
+)
 from app.services.reviews import review_metrics
 
 
@@ -186,7 +194,12 @@ def discipline_check(account_id: int, db: Session = Depends(get_db)):
 
 @router.get("/market/quote/{symbol}")
 def market_quote(symbol: str, db: Session = Depends(get_db)):
-    quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
+    selection = resolve_cached_quote(
+        db,
+        symbol=symbol,
+        capability="market.quote.realtime",
+    )
+    quote = selection.value
     if not quote:
         raise AppError(404, "QUOTE_NOT_FOUND", "尚无该股票行情，请先同步；不会返回伪造数据")
     return {
@@ -196,6 +209,10 @@ def market_quote(symbol: str, db: Session = Depends(get_db)):
         "source": quote.source,
         "source_api": quote.source_api,
         "fetched_at": quote.fetched_at,
+        "quote_type": quote.quote_type,
+        "observed_at": quote.observed_at,
+        "quality_record_id": selection.quality_record_id,
+        **effective_quality_metadata(selection.effective_quality),
     }
 
 
@@ -208,7 +225,7 @@ def _live_market_call(callback):
 
 @router.get("/market/symbols")
 def market_symbols(db: Session = Depends(get_db)):
-    return _live_market_call(lambda: UnifiedDataService(db).list_symbols().value)
+    return _live_market_call(lambda: build_data_hub(db).list_symbols().require_value())
 
 
 @router.get("/market/indices")
@@ -216,12 +233,14 @@ def market_indices(
     family: str = Query(default="上证系列指数", max_length=30),
     db: Session = Depends(get_db),
 ):
-    return _live_market_call(lambda: UnifiedDataService(db).list_indices(family).value)
+    return _live_market_call(
+        lambda: build_data_hub(db).list_indices(family).require_value()
+    )
 
 
 @router.get("/market/sectors")
 def market_sectors(db: Session = Depends(get_db)):
-    return _live_market_call(lambda: UnifiedDataService(db).list_sectors().value)
+    return _live_market_call(lambda: build_data_hub(db).list_sectors().require_value())
 
 
 @router.get("/market/announcements/{symbol}")
@@ -231,7 +250,7 @@ def market_announcements(
     db: Session = Depends(get_db),
 ):
     return _live_market_call(
-        lambda: UnifiedDataService(db).daily_announcements(symbol, day).value
+        lambda: build_data_hub(db).daily_announcements(symbol, day).require_value()
     )
 
 
@@ -242,16 +261,31 @@ def market_history(
     date_to: date | None = None,
     db: Session = Depends(get_db),
 ):
-    query = (
-        select(MarketDailyBar)
-        .where(MarketDailyBar.symbol == symbol)
-        .order_by(MarketDailyBar.trade_date)
+    subject = stock_daily_subject(symbol, "qfq", "CNY", "share")
+    selection = resolve_cached_series(
+        db,
+        cache_symbol=subject.subject_id,
+        capability="market.daily.qfq",
+        subject=subject,
+        adjustment="qfq",
+        price_unit="CNY",
+        volume_unit="share",
+        min_rows=1,
     )
-    if date_from:
-        query = query.where(MarketDailyBar.trade_date >= date_from)
-    if date_to:
-        query = query.where(MarketDailyBar.trade_date <= date_to)
-    return db.scalars(query).all()
+    if not selection.executable:
+        quality = selection.effective_quality.effective_quality.value
+        raise AppError(
+            422,
+            f"MARKET_DATA_{quality}",
+            "历史行情当前不可用于展示或分析",
+            effective_quality_metadata(selection.effective_quality),
+        )
+    return [
+        bar
+        for bar in selection.bars
+        if (date_from is None or bar.trade_date >= date_from)
+        and (date_to is None or bar.trade_date <= date_to)
+    ]
 
 
 @router.post("/market/sync")
@@ -274,78 +308,110 @@ def market_sync(
     job.status = "running"
     job.started_at = datetime.now()
     db.commit()
-    provider = UnifiedDataService(db)
+    provider = build_data_hub(db)
     try:
-        quote_error = None
-        try:
-            quote = provider.get_quote(symbol).value
-        except ProviderUnavailableError as exc:
-            quote = None
-            quote_error = str(exc)
+        quote_result = provider.get_quote(symbol)
+        market_day = shanghai_today()
         history_result = provider.get_history(
-            symbol, date.today() - timedelta(days=days), date.today()
+            symbol, market_day - timedelta(days=days), market_day
         )
-        bars = history_result.value
+        # Acquisition audit survives a later rollback of business cache writes.
+        db.commit()
+        try:
+            quote = quote_result.require_trusted_value()
+            bars = history_result.require_trusted_value()
+        except ProviderUnavailableError as exc:
+            db.commit()
+            blocked = next(
+                (
+                    result.quality_status.value
+                    for result in (quote_result, history_result)
+                    if result.quality_status.value in {"CONFLICTED", "STALE", "MISSING"}
+                ),
+                "MISSING",
+            )
+            code = f"MARKET_DATA_{blocked}"
+            raise AppError(
+                422,
+                code,
+                str(exc),
+                {
+                    "quote_quality_status": quote_result.quality_status.value,
+                    "history_quality_status": history_result.quality_status.value,
+                    "provider_observations": {
+                        "quote": quote_result.provider_observations,
+                        "history": history_result.provider_observations,
+                    },
+                    "conflict_fields": sorted(
+                        {*quote_result.conflict_fields, *history_result.conflict_fields}
+                    ),
+                    "fallback_used": (
+                        quote_result.fallback_used or history_result.fallback_used
+                    ),
+                    "cache_used": quote_result.cache_used or history_result.cache_used,
+                },
+            ) from exc
         if not bars:
             raise ProviderUnavailableError("历史行情为空，未写入数据库")
-        dates = [bar.trade_date for bar in bars]
-        if len(dates) != len(set(dates)) or any(
-            bar.high < max(bar.open, bar.close, bar.low)
-            or bar.low > min(bar.open, bar.close, bar.high)
-            for bar in bars
-        ):
-            raise ProviderUnavailableError("历史行情完整性检查失败，未写入数据库")
-        if quote is None:
-            latest = bars[-1]
-            previous_quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
-            quote = Quote(
-                symbol=symbol,
-                name=previous_quote.name if previous_quote and previous_quote.name else symbol,
-                price=latest.close,
-                source=latest.source,
-                source_api="history_latest_close",
-                fetched_at=latest.fetched_at,
+        subject = stock_daily_subject(symbol, "qfq", "CNY", "share")
+        try:
+            validate_series_for_persistence(bars, subject=subject, min_rows=1)
+            stored_bars = replace_market_series(
+                db,
+                provider,
+                history_result,
+                bars,
+                subject=subject,
+                min_rows=1,
             )
-        stored = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol)) or MarketQuote(
+        except ValueError as exc:
+            raise ProviderUnavailableError(
+                f"历史行情完整性检查失败，未写入数据库：{exc}"
+            ) from exc
+        persist_market_quote(db, provider, quote_result)
+        stored_quote = resolve_cached_quote(
+            db,
             symbol=symbol,
-            name=quote.name,
-            price=quote.price,
-            source=quote.source,
-            source_api=quote.source_api,
-            fetched_at=quote.fetched_at,
+            capability="market.quote.realtime",
         )
-        db.add(stored)
-        stored.name = quote.name
-        stored.price = quote.price
-        stored.source = quote.source
-        stored.source_api = quote.source_api
-        stored.fetched_at = quote.fetched_at
-        inserted = 0
-        for bar in bars:
-            existing = db.scalar(
-                select(MarketDailyBar).where(
-                    MarketDailyBar.symbol == symbol,
-                    MarketDailyBar.trade_date == bar.trade_date,
-                    MarketDailyBar.source == bar.source,
-                )
+        stored_series = resolve_cached_series(
+            db,
+            cache_symbol=subject.subject_id,
+            capability="market.daily.qfq",
+            subject=subject,
+            adjustment="qfq",
+            price_unit="CNY",
+            volume_unit="share",
+            min_rows=1,
+        )
+        blocked = [
+            selection
+            for selection in (stored_quote, stored_series)
+            if not selection.executable
+        ]
+        if blocked:
+            details = ", ".join(
+                f"{selection.effective_quality.capability}="
+                f"{selection.effective_quality.effective_quality.value}"
+                for selection in blocked
             )
-            if existing:
-                existing.open = bar.open
-                existing.high = bar.high
-                existing.low = bar.low
-                existing.close = bar.close
-                existing.volume = bar.volume
-                existing.fetched_at = bar.fetched_at
-            else:
-                db.add(MarketDailyBar(**bar.__dict__))
-                inserted += 1
-        history_sources = sorted({bar.source for bar in bars})
+            raise ProviderUnavailableError(
+                f"market sync blocked by effective quality: {details}"
+            )
+        selected_quote = stored_quote.value
+        selected_bars = stored_series.bars
+        if selected_quote is None or not selected_bars:
+            raise ProviderUnavailableError(
+                "market sync resolved executable data without persisted values"
+            )
+        inserted = len(stored_bars)
+        history_sources = sorted({bar.source for bar in selected_bars})
         db.add(
             MarketSourceLog(
                 source=" + ".join([quote.source, *history_sources]),
                 api_name=f"{quote.source_api} + {'/'.join(history_sources)}",
                 status="success",
-                error=f"实时行情降级原因：{quote_error}" if quote_error else None,
+                error=None,
                 row_count=inserted,
             )
         )
@@ -356,22 +422,55 @@ def market_sync(
         db.commit()
         return {
             "status": "success",
+            "executable": True,
             "quote": {
                 "symbol": symbol,
-                "price": str(quote.price),
-                "source": quote.source,
-                "source_api": quote.source_api,
-                "data_date": quote.fetched_at.date().isoformat(),
-                "updated_at": quote.fetched_at.isoformat(),
+                "price": str(selected_quote.price),
+                "source": selected_quote.source,
+                "source_api": selected_quote.source_api,
+                "data_date": selected_quote.fetched_at.date().isoformat(),
+                "updated_at": selected_quote.fetched_at.isoformat(),
                 "status": "success",
+                **effective_quality_metadata(stored_quote.effective_quality),
             },
             "bars_inserted": inserted,
             "history_source": history_sources[0],
-            "fallback_used": bool(quote_error) or history_result.fallback_used,
-            "data_date": bars[-1].trade_date.isoformat(),
+            "quote_quality_status": (
+                stored_quote.effective_quality.effective_quality.value
+            ),
+            "history_quality_status": (
+                stored_series.effective_quality.effective_quality.value
+            ),
+            "quote_quality": {
+                "capability": "market.quote.realtime",
+                "quality_record_id": stored_quote.quality_record_id,
+                **effective_quality_metadata(stored_quote.effective_quality),
+            },
+            "history_quality": {
+                "capability": "market.daily.qfq",
+                "quality_record_id": stored_series.quality_record_id,
+                **effective_quality_metadata(stored_series.effective_quality),
+            },
+            "provider_observations": {
+                "quote": quote_result.provider_observations,
+                "history": history_result.provider_observations,
+            },
+            "conflict_fields": sorted(
+                {*quote_result.conflict_fields, *history_result.conflict_fields}
+            ),
+            "fallback_used": quote_result.fallback_used or history_result.fallback_used,
+            "cache_used": quote_result.cache_used or history_result.cache_used,
+            "data_date": selected_bars[-1].trade_date.isoformat(),
             "updated_at": datetime.now().isoformat(),
         }
+    except AppError:
+        db.rollback()
+        job.status = "blocked"
+        job.finished_at = datetime.now()
+        db.commit()
+        raise
     except ProviderUnavailableError as exc:
+        db.rollback()
         job.status = "failed"
         job.finished_at = datetime.now()
         job.last_error = str(exc)
@@ -381,29 +480,55 @@ def market_sync(
             )
         )
         db.commit()
-        cached_quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
-        cached_bar = db.scalar(
-            select(MarketDailyBar)
-            .where(MarketDailyBar.symbol == symbol)
-            .order_by(MarketDailyBar.trade_date.desc())
+        cached_quote = resolve_cached_quote(
+            db,
+            symbol=symbol,
+            capability="market.quote.realtime",
         )
-        if cached_quote and cached_bar:
+        subject = stock_daily_subject(symbol, "qfq", "CNY", "share")
+        cached_series = resolve_cached_series(
+            db,
+            cache_symbol=subject.subject_id,
+            capability="market.daily.qfq",
+            subject=subject,
+            adjustment="qfq",
+            price_unit="CNY",
+            volume_unit="share",
+            min_rows=1,
+        )
+        if cached_quote.value and cached_series.bars:
+            quote_value = cached_quote.value
+            cached_bar = cached_series.bars[-1]
             return {
                 "status": "stale_fallback",
+                "executable": cached_quote.executable and cached_series.executable,
                 "message": "实时数据源暂不可用，已回退到最近一次成功数据；请勿视为当前成交价。",
                 "error": str(exc),
                 "quote": {
                     "symbol": symbol,
-                    "price": str(cached_quote.price),
-                    "source": cached_quote.source,
-                    "source_api": cached_quote.source_api,
-                    "data_date": cached_quote.fetched_at.date().isoformat(),
-                    "updated_at": cached_quote.fetched_at.isoformat(),
+                    "price": str(quote_value.price),
+                    "source": quote_value.source,
+                    "source_api": quote_value.source_api,
+                    "data_date": quote_value.fetched_at.date().isoformat(),
+                    "updated_at": quote_value.fetched_at.isoformat(),
                     "status": "stale",
+                    **effective_quality_metadata(cached_quote.effective_quality),
                 },
                 "bars_inserted": 0,
                 "history_source": cached_bar.source,
                 "fallback_used": True,
+                "cache_used": True,
+                "quote_quality_status": (
+                    cached_quote.effective_quality.effective_quality.value
+                ),
+                "history_quality_status": (
+                    cached_series.effective_quality.effective_quality.value
+                ),
+                "history_quality": effective_quality_metadata(
+                    cached_series.effective_quality
+                ),
+                "provider_observations": [],
+                "conflict_fields": [],
                 "data_date": cached_bar.trade_date.isoformat(),
                 "updated_at": datetime.now().isoformat(),
             }
@@ -487,7 +612,11 @@ def x_sync(limit: int = Query(default=20, ge=1, le=100), db: Session = Depends(g
         db.commit()
         raise AppError(422, "X_QUERY_REQUIRED", "请先添加关注账号或查询表达式")
     try:
-        posts = UnifiedDataService(db).collect_social_queries(expressions, limit).value
+        posts = (
+            build_data_hub(db)
+            .collect_social_queries(expressions, limit)
+            .require_value()
+        )
     except ProviderUnavailableError as exc:
         job.status = "paused"
         job.finished_at = datetime.now()
@@ -513,35 +642,7 @@ def ai_analyze(content_id: int, db: Session = Depends(get_db)):
     post = db.get(XPost, content_id)
     if not post:
         raise AppError(404, "CONTENT_NOT_FOUND", "待分析的 X 内容不存在")
-    provider = OpenAICompatibleProvider(get_settings())
-    try:
-        result = provider.analyze(post.content)
-        analysis = AIAnalysis(
-            content_type="x_post",
-            content_id=post.id,
-            source_url=post.url,
-            source_time=post.published_at,
-            model=get_settings().llm_model,
-            status="success",
-            result=result.model_dump(),
-        )
-        db.add(analysis)
-        db.commit()
-        db.refresh(analysis)
-        return analysis
-    except LLMUnavailableError as exc:
-        analysis = AIAnalysis(
-            content_type="x_post",
-            content_id=post.id,
-            source_url=post.url,
-            source_time=post.published_at,
-            model=get_settings().llm_model or "not-configured",
-            status="failed",
-            error=str(exc),
-        )
-        db.add(analysis)
-        db.commit()
-        raise AppError(503, "LLM_UNAVAILABLE", str(exc)) from exc
+    return analyze_x_post(db, post)
 
 
 @router.post("/backtests", status_code=201)
@@ -653,7 +754,4 @@ def settings_status():
 
 @router.post("/settings/llm/test")
 def test_llm_connection():
-    try:
-        return OpenAICompatibleProvider(get_settings()).test_connection()
-    except LLMUnavailableError as exc:
-        raise AppError(503, "LLM_CONNECTION_FAILED", str(exc)) from exc
+    return test_llm_provider_connection()

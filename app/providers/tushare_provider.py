@@ -1,18 +1,27 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from decimal import Decimal
-from typing import Any
+from decimal import Decimal, InvalidOperation
+from typing import Any, Callable
 
 from app.config import Settings
-from app.providers.base import (
+from app.data_hub.contracts import (
     AnnouncementProvider,
+    DailyBar,
     FundamentalDataProvider,
     IndustryConceptProvider,
     MarketDataProvider,
     ProviderMetadata,
+    ProviderUnavailableError,
+    Quote,
 )
-from app.providers.market import DailyBar, ProviderUnavailableError, Quote
+from app.data_hub.trading_calendar import (
+    TradingCalendar,
+    get_trading_calendar,
+    shanghai_now,
+    shanghai_today,
+    to_shanghai_aware,
+)
 
 
 class TushareProvider(
@@ -23,13 +32,21 @@ class TushareProvider(
 ):
     """可启用的Tushare适配器；未配置Token时不会发起请求，也不会视为故障。"""
 
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        calendar: TradingCalendar | None = None,
+        now_fn: Callable[[], datetime] | None = None,
+    ):
         self.settings = settings
+        self.calendar = calendar or get_trading_calendar()
+        self.now_fn = now_fn or shanghai_now
         self.metadata = ProviderMetadata(
             provider_id="tushare",
             supported_capabilities=(
-                "market.daily",
-                "market.quote",
+                "market.daily.unadjusted",
+                "market.quote.latest_close",
                 "fundamental.profile",
                 "fundamental.statements",
                 "fundamental.valuation",
@@ -78,24 +95,46 @@ class TushareProvider(
         if not probe:
             return {"status": "configured", "message": "凭据已配置，尚未主动探测"}
         try:
-            rows = self._pro().trade_cal(exchange="SSE", start_date=date.today().strftime("%Y%m%d"))
+            rows = self._pro().trade_cal(
+                exchange="SSE", start_date=shanghai_today().strftime("%Y%m%d")
+            )
             return {"status": "healthy", "message": f"健康检查成功，返回{len(rows)}行"}
         except Exception as exc:
             return {"status": "unhealthy", "message": f"{type(exc).__name__}: {str(exc)[:160]}"}
 
     def get_quote(self, symbol: str) -> Quote:
-        frame = self._pro().daily(ts_code=self._code(symbol), trade_date=date.today().strftime("%Y%m%d"))
+        raw_fetched_at = self.now_fn()
+        fetched_at = to_shanghai_aware(
+            raw_fetched_at,
+            naive_is_shanghai=raw_fetched_at.tzinfo is None,
+        )
+        expected_session = self.calendar.latest_completed_session(fetched_at)
+        frame = self._pro().daily(
+            ts_code=self._code(symbol),
+            trade_date=expected_session.strftime("%Y%m%d"),
+        )
         rows = self._records(frame)
         if not rows:
             raise ProviderUnavailableError("Tushare免费日线没有当日行情；该Provider不冒充实时行情")
         row = rows[0]
+        try:
+            trade_date = datetime.strptime(str(row["trade_date"]), "%Y%m%d").date()
+            observed_at = self.calendar.session_close_at(trade_date)
+            price = Decimal(str(row["close"]))
+        except (InvalidOperation, KeyError, TypeError, ValueError) as exc:
+            raise ProviderUnavailableError(
+                "Tushare daily close has invalid market semantics"
+            ) from exc
         return Quote(
             symbol=symbol,
             name=symbol,
-            price=Decimal(str(row["close"])),
+            price=price,
+            quote_type="latest_close",
+            observed_at=observed_at,
+            price_unit="CNY",
             source="tushare_daily_close",
             source_api="daily",
-            fetched_at=datetime.now(),
+            fetched_at=fetched_at,
         )
 
     def get_history(self, symbol: str, start: date, end: date) -> list[DailyBar]:
@@ -105,7 +144,11 @@ class TushareProvider(
             end_date=end.strftime("%Y%m%d"),
         )
         rows = []
-        fetched_at = datetime.now()
+        raw_fetched_at = self.now_fn()
+        fetched_at = to_shanghai_aware(
+            raw_fetched_at,
+            naive_is_shanghai=raw_fetched_at.tzinfo is None,
+        )
         for row in reversed(self._records(frame)):
             rows.append(
                 DailyBar(
@@ -116,6 +159,12 @@ class TushareProvider(
                     low=Decimal(str(row["low"])),
                     close=Decimal(str(row["close"])),
                     volume=Decimal(str(row["vol"])) * 100,
+                    adjustment="unadjusted",
+                    price_unit="CNY",
+                    volume_unit="share",
+                    observed_at=self.calendar.session_close_at(
+                        datetime.strptime(str(row["trade_date"]), "%Y%m%d").date()
+                    ),
                     source="tushare_daily_unadjusted",
                     fetched_at=fetched_at,
                 )
@@ -139,7 +188,15 @@ class TushareProvider(
         ]
         if not rows:
             raise ProviderUnavailableError("Tushare未返回指数数据")
-        return {"rows": rows, "source": "Tushare/index_daily", "fetched_at": datetime.now()}
+        raw_fetched_at = self.now_fn()
+        return {
+            "rows": rows,
+            "source": "Tushare/index_daily",
+            "fetched_at": to_shanghai_aware(
+                raw_fetched_at,
+                naive_is_shanghai=raw_fetched_at.tzinfo is None,
+            ),
+        }
 
     def get_sector_history(self, industry: str, start: date, end: date) -> dict:
         raise ProviderUnavailableError("Tushare行业名称需要先映射指数代码，当前免费配置安全跳过")

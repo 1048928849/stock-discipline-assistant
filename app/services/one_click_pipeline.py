@@ -1,27 +1,43 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta
+from copy import deepcopy
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pandas as pd
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.data_hub.contracts import ProviderUnavailableError, Quote
+from app.data_hub.market_subjects import (
+    index_daily_subject,
+    sector_daily_subject,
+    stock_daily_subject,
+)
+from app.data_hub.research_subjects import announcement_catalog_window
+from app.data_hub.router import DataHubRouter
+from app.data_hub.trading_calendar import (
+    shanghai_now,
+    to_market_storage_naive,
+    to_shanghai_aware,
+    utc_storage_naive_to_aware,
+)
+from app.domain.package_builder import build_decision_package
 from app.errors import AppError
 from app.models import (
     Account,
-    CompanyAnnouncement,
     CompanyFinancialPeriod,
     CompanyProfile,
     CompanyResearchEvidence,
     CompanyValuationSnapshot,
-    MarketDailyBar,
+    DataQualityRecord,
     MarketQuote,
     PlanAnalysisRun,
     TradePlan,
 )
-from app.providers.market import ProviderUnavailableError
+from app.research.orchestrator import ExistingAIResearchOrchestrator
 from app.schemas_workflow import (
     OneClickPlanRequest,
     TradePlanAIRequest,
@@ -30,11 +46,26 @@ from app.schemas_workflow import (
 )
 from app.services.trade_plan_ai import run_ai_analysis
 from app.services.company_research import refresh_company_research_if_needed
-from app.services.data_sources import UnifiedDataService
+from app.services.data_sources import build_data_hub
+from app.services.market_cache import (
+    effective_quality_metadata,
+    market_quality_binding_from_selection,
+    mapping_series_bars,
+    persist_market_quote,
+    replace_market_series,
+    resolve_cached_quote,
+    resolve_cached_series,
+    validate_series_for_persistence,
+)
+from app.services.research_cache import (
+    persist_company_profile,
+    resolve_cached_announcement_catalog,
+    resolve_cached_company_profile,
+)
+from app.services.plan_freeze import freeze_trade_plan
 from app.services.trade_plan_generator import (
     GENERATOR_PARAMETERS,
     generate_trade_plan_preview,
-    save_generated_plan,
 )
 
 
@@ -42,7 +73,7 @@ logger = logging.getLogger(__name__)
 
 
 def _step(code: str, name: str, status: str, detail: str, **extra) -> dict:
-    return {
+    result = {
         "code": code,
         "name": name,
         "status": status,
@@ -51,6 +82,22 @@ def _step(code: str, name: str, status: str, detail: str, **extra) -> dict:
         "missing": extra.pop("missing", []),
         **extra,
     }
+    if code in {
+        "market_data",
+        "market_quote",
+        "market_judgement",
+        "industry_judgement",
+    }:
+        result.setdefault("market_quality_binding", None)
+    return result
+
+
+def _market_binding_payload(selection, data_capability: str) -> dict | None:
+    binding = market_quality_binding_from_selection(
+        selection,
+        data_capability=data_capability,
+    )
+    return binding.model_dump(mode="json") if binding else None
 
 
 def _default_account(db: Session, payload: OneClickPlanRequest) -> tuple[Account, bool]:
@@ -76,86 +123,216 @@ def _default_account(db: Session, payload: OneClickPlanRequest) -> tuple[Account
     return account, True
 
 
-def _latest_bar(db: Session, symbol: str) -> MarketDailyBar | None:
-    return db.scalar(
-        select(MarketDailyBar)
-        .where(MarketDailyBar.symbol == symbol)
-        .order_by(MarketDailyBar.trade_date.desc(), MarketDailyBar.fetched_at.desc())
-    )
-
-
 def _sync_stock(
-    db: Session, symbol: str, provider: UnifiedDataService, refresh: bool
+    db: Session,
+    symbol: str,
+    provider: DataHubRouter,
+    refresh: bool,
+    *,
+    evaluated_at: datetime | None = None,
 ) -> tuple[dict, dict]:
-    cached = _latest_bar(db, symbol)
-    stale = cached is None or cached.trade_date < date.today() - timedelta(days=5)
-    if cached and not stale and not refresh:
+    business_day = to_shanghai_aware(evaluated_at or shanghai_now()).date()
+    subject = stock_daily_subject(symbol, "qfq", "CNY", "share")
+    cached = resolve_cached_series(
+        db,
+        cache_symbol=subject.subject_id,
+        capability="market.daily.qfq",
+        subject=subject,
+        adjustment="qfq",
+        price_unit="CNY",
+        volume_unit="share",
+        min_rows=250,
+    )
+    if cached.executable and not refresh:
+        latest = cached.bars[-1]
+        quote_step = _cached_quote_step(db, symbol)
         return (
             _step(
                 "market_data",
                 "行情数据",
                 "success",
-                f"本地前复权日线有效，截止 {cached.trade_date.isoformat()}。",
+                f"本地前复权日线有效，截止 {latest.trade_date.isoformat()}。",
                 source=cached.source,
-                data_time=cached.fetched_at.isoformat(),
+                data_time=latest.fetched_at.isoformat(),
+                observed_at=latest.observed_at.isoformat(),
+                quality_status=cached.effective_quality.effective_quality.value,
+                quality_record_id=cached.quality_record_id,
+                market_quality_binding=_market_binding_payload(
+                    cached, "market.daily.qfq"
+                ),
+                **effective_quality_metadata(cached.effective_quality),
             ),
-            {"data_date": cached.trade_date.isoformat(), "source": cached.source},
+            {
+                "data_date": latest.trade_date.isoformat(),
+                "source": cached.source,
+                "quote_step": quote_step,
+            },
         )
     try:
         history_result = provider.get_history(
-            symbol, date.today() - timedelta(days=900), date.today()
+            symbol, business_day - timedelta(days=900), business_day
         )
-        bars = history_result.value
-        if len(bars) < 80:
-            raise ProviderUnavailableError(f"前复权日线仅有 {len(bars)} 根，少于80根")
+        # Keep acquisition audit durable while cache replacement remains rollbackable.
+        db.commit()
+        bars = history_result.require_trusted_value()
+        validate_series_for_persistence(bars, subject=subject, min_rows=250)
         quote_error = None
+        quote_result = None
         try:
-            quote = provider.get_quote(symbol).value
+            quote_result = provider.get_quote(symbol)
+            db.commit()
+            quote = quote_result.require_trusted_value()
         except ProviderUnavailableError as exc:
+            if quote_result is not None:
+                db.commit()
             quote_error = str(exc)
             latest = bars[-1]
             old_quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
-            from app.providers.market import Quote
-
             quote = Quote(
                 symbol=symbol,
                 name=old_quote.name if old_quote and old_quote.name else symbol,
                 price=latest.close,
+                quote_type="latest_close",
+                observed_at=latest.observed_at,
+                price_unit=latest.price_unit,
                 source=latest.source,
                 source_api="history_latest_close",
                 fetched_at=latest.fetched_at,
             )
-        for bar in bars:
-            item = db.scalar(
-                select(MarketDailyBar).where(
-                    MarketDailyBar.symbol == symbol,
-                    MarketDailyBar.trade_date == bar.trade_date,
-                    MarketDailyBar.source == bar.source,
-                )
+        replace_market_series(
+            db,
+            provider,
+            history_result,
+            bars,
+            subject=subject,
+            min_rows=250,
+        )
+        stored_history = resolve_cached_series(
+            db,
+            cache_symbol=subject.subject_id,
+            capability="market.daily.qfq",
+            subject=subject,
+            adjustment="qfq",
+            price_unit="CNY",
+            volume_unit="share",
+            min_rows=250,
+        )
+        if not stored_history.executable:
+            raise ProviderUnavailableError(
+                "stock history refresh blocked by effective quality: "
+                f"{stored_history.effective_quality.effective_quality.value} "
+                f"({stored_history.blocking_reason or 'not_executable'})"
             )
-            if item is None:
-                db.add(MarketDailyBar(**bar.__dict__))
-            else:
-                for key in ("open", "high", "low", "close", "volume", "fetched_at"):
-                    setattr(item, key, getattr(bar, key))
-        stored_quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
-        if stored_quote is None:
-            stored_quote = MarketQuote(
-                symbol=symbol,
-                name=quote.name,
-                price=quote.price,
-                source=quote.source,
-                source_api=quote.source_api,
-                fetched_at=quote.fetched_at,
-            )
-            db.add(stored_quote)
-        else:
-            stored_quote.name = quote.name
-            stored_quote.price = quote.price
-            stored_quote.source = quote.source
-            stored_quote.source_api = quote.source_api
-            stored_quote.fetched_at = quote.fetched_at
         db.commit()
+
+        if quote_result is not None:
+            try:
+                persist_market_quote(db, provider, quote_result)
+                candidate_quote = resolve_cached_quote(
+                    db,
+                    symbol=symbol,
+                    capability="market.quote.realtime",
+                )
+                if not candidate_quote.executable:
+                    raise ProviderUnavailableError(
+                        "quote refresh blocked by effective quality: "
+                        f"{candidate_quote.effective_quality.effective_quality.value} "
+                        f"({candidate_quote.blocking_reason or 'not_executable'})"
+                    )
+                db.commit()
+            except Exception as exc:
+                db.rollback()
+                quote_error = str(exc)
+                latest = stored_history.bars[-1]
+                quote = Quote(
+                    symbol=symbol,
+                    name=quote.name,
+                    price=latest.close,
+                    quote_type="latest_close",
+                    observed_at=latest.observed_at,
+                    price_unit=latest.price_unit,
+                    source=latest.source,
+                    source_api="history_latest_close",
+                    fetched_at=latest.fetched_at,
+                )
+        stored_quote = resolve_cached_quote(
+            db,
+            symbol=symbol,
+            capability="market.quote.realtime",
+        )
+        execution_quote = (
+            stored_quote.value if stored_quote.executable else None
+        )
+        latest = stored_history.bars[-1]
+        display_quote = execution_quote or Quote(
+            symbol=symbol,
+            name=execution_quote.name if execution_quote else symbol,
+            price=latest.close,
+            quote_type="latest_close",
+            observed_at=latest.observed_at,
+            price_unit=latest.price_unit,
+            source=latest.source,
+            source_api="history_latest_close",
+            fetched_at=latest.fetched_at,
+        )
+        used_cached_realtime = execution_quote is not None and quote_error is not None
+        quote_step = _step(
+            "market_quote",
+            "当前价格质量",
+            "success"
+            if stored_quote.executable
+            else "partial",
+            (
+                "本次刷新失败，继续使用仍新鲜的可信实时缓存。"
+                if used_cached_realtime
+                else "已取得实时价格。"
+                if execution_quote
+                else "实时价格不可用；最新收盘价仅用于展示。"
+            ),
+            source=execution_quote.source if execution_quote else "none",
+            observed_at=(
+                execution_quote.observed_at.isoformat()
+                if execution_quote
+                else None
+            ),
+            fetched_at=(
+                execution_quote.fetched_at.isoformat()
+                if execution_quote
+                else None
+            ),
+            data_time=(
+                execution_quote.observed_at.isoformat()
+                if execution_quote
+                else None
+            ),
+            quality_status=(
+                stored_quote.effective_quality.effective_quality.value
+            ),
+            provider_observations=(
+                quote_result.provider_observations
+                if quote_result is not None
+                else []
+            ),
+            conflict_fields=(
+                quote_result.conflict_fields if quote_result is not None else []
+            ),
+            quote_type=display_quote.quote_type,
+            price=str(display_quote.price),
+            execution_quote_type=(
+                execution_quote.quote_type if execution_quote else None
+            ),
+            execution_price=(
+                str(execution_quote.price) if execution_quote else None
+            ),
+            display_quote_type=display_quote.quote_type,
+            display_price=str(display_quote.price),
+            fallback_used=quote_error is not None,
+            quality_record_id=stored_quote.quality_record_id,
+            market_quality_binding=_market_binding_payload(
+                stored_quote, "market.quote.realtime"
+            ),
+            **effective_quality_metadata(stored_quote.effective_quality),
+        )
         return (
             _step(
                 "market_data",
@@ -164,27 +341,66 @@ def _sync_stock(
                 f"已自动同步 {len(bars)} 根前复权日线，截止 {bars[-1].trade_date.isoformat()}。"
                 + (f" 实时行情失败，使用最新收盘：{quote_error}" if quote_error else ""),
                 fallback_used=bool(quote_error) or history_result.fallback_used,
-                source=bars[-1].source,
-                data_time=bars[-1].fetched_at.isoformat(),
+                quality_status=stored_history.effective_quality.effective_quality.value,
+                observed_at=stored_history.observed_at.isoformat()
+                if stored_history.observed_at
+                else None,
+                fetched_at=stored_history.bars[-1].fetched_at.isoformat(),
+                provider_observations=history_result.provider_observations,
+                source=stored_history.source,
+                data_time=stored_history.bars[-1].fetched_at.isoformat(),
+                quality_record_id=stored_history.quality_record_id,
+                market_quality_binding=_market_binding_payload(
+                    stored_history, "market.daily.qfq"
+                ),
+                **effective_quality_metadata(stored_history.effective_quality),
             ),
-            {"data_date": bars[-1].trade_date.isoformat(), "source": bars[-1].source},
+            {
+                "data_date": stored_history.bars[-1].trade_date.isoformat(),
+                "source": stored_history.source,
+                "quote_step": quote_step,
+            },
         )
     except Exception as exc:
         db.rollback()
-        cached = _latest_bar(db, symbol)
-        if cached:
+        cached = resolve_cached_series(
+            db,
+            cache_symbol=subject.subject_id,
+            capability="market.daily.qfq",
+            subject=subject,
+            adjustment="qfq",
+            price_unit="CNY",
+            volume_unit="share",
+            min_rows=250,
+        )
+        if cached.executable:
+            latest = cached.bars[-1]
+            quote_step = _cached_quote_step(db, symbol)
             return (
                 _step(
                     "market_data",
                     "行情数据",
                     "partial",
-                    f"外部行情同步失败，回退到 {cached.trade_date.isoformat()} 的缓存：{exc}",
+                    f"外部行情同步失败，回退到 {latest.trade_date.isoformat()} 的缓存：{exc}",
                     fallback_used=True,
                     source=cached.source,
-                    data_time=cached.fetched_at.isoformat(),
+                    data_time=latest.fetched_at.isoformat(),
+                    observed_at=cached.observed_at.isoformat()
+                    if cached.observed_at
+                    else None,
+                    quality_status=cached.effective_quality.effective_quality.value,
+                    quality_record_id=cached.quality_record_id,
+                    market_quality_binding=_market_binding_payload(
+                        cached, "market.daily.qfq"
+                    ),
+                    **effective_quality_metadata(cached.effective_quality),
                     missing=["最新行情"],
                 ),
-                {"data_date": cached.trade_date.isoformat(), "source": cached.source},
+                {
+                    "data_date": latest.trade_date.isoformat(),
+                    "source": cached.source,
+                    "quote_step": quote_step,
+                },
             )
         return (
             _step(
@@ -193,8 +409,18 @@ def _sync_stock(
                 "failed",
                 f"行情同步失败且没有可用缓存：{exc}",
                 missing=["前复权日线", "当前价格"],
+                quality_status=cached.effective_quality.effective_quality.value,
+                quality_record_id=cached.quality_record_id,
+                market_quality_binding=_market_binding_payload(
+                    cached, "market.daily.qfq"
+                ),
+                **effective_quality_metadata(cached.effective_quality),
             ),
-            {"data_date": None, "source": "数据不足"},
+            {
+                "data_date": None,
+                "source": "数据不足",
+                "quote_step": _cached_quote_step(db, symbol),
+            },
         )
 
 
@@ -227,17 +453,28 @@ def _series_assessment(rows: list[dict]) -> dict:
     }
 
 
-def _market_assessment(db: Session, provider: UnifiedDataService) -> tuple[dict, dict]:
-    cache_symbol = "CSI000300"
-    cached = db.scalars(
-        select(MarketDailyBar)
-        .where(MarketDailyBar.symbol == cache_symbol)
-        .order_by(MarketDailyBar.trade_date)
-    ).all()
-    if cached and cached[-1].trade_date >= date.today() - timedelta(days=5):
+def _market_assessment(
+    db: Session,
+    provider: DataHubRouter,
+    *,
+    evaluated_at: datetime | None = None,
+) -> tuple[dict, dict]:
+    business_day = to_shanghai_aware(evaluated_at or shanghai_now()).date()
+    subject = index_daily_subject("csi000300", "unadjusted", "CNY", "share")
+    cached = resolve_cached_series(
+        db,
+        cache_symbol=subject.subject_id,
+        capability="market.index_daily",
+        subject=subject,
+        adjustment="unadjusted",
+        price_unit="CNY",
+        volume_unit="share",
+        min_rows=60,
+    )
+    if cached.executable:
         rows = [
             {"date": item.trade_date, "close": float(item.close), "volume": float(item.volume)}
-            for item in cached
+            for item in cached.bars
         ]
         assessment = _series_assessment(rows)
         detail = (
@@ -249,39 +486,64 @@ def _market_assessment(db: Session, provider: UnifiedDataService) -> tuple[dict,
             "市场判断",
             "success",
             detail,
-            source=cached[-1].source,
-            data_time=cached[-1].fetched_at.isoformat(),
+            source=cached.source,
+            data_time=cached.bars[-1].fetched_at.isoformat(),
+            observed_at=cached.bars[-1].observed_at.isoformat(),
+            quality_status=cached.effective_quality.effective_quality.value,
+            quality_record_id=cached.quality_record_id,
+            market_quality_binding=_market_binding_payload(
+                cached, "market.index_daily"
+            ),
+            **effective_quality_metadata(cached.effective_quality),
         )
     try:
         history_result = provider.get_index_history(
-            "csi000300", date.today() - timedelta(days=240), date.today()
+            "csi000300",
+            business_day - timedelta(days=240),
+            business_day,
         )
-        history = history_result.value
-        for row in history["rows"]:
-            existing = db.scalar(
-                select(MarketDailyBar).where(
-                    MarketDailyBar.symbol == cache_symbol,
-                    MarketDailyBar.trade_date == row["date"],
-                    MarketDailyBar.source == history["source"],
-                )
-            )
-            if existing is None:
-                close = Decimal(str(row["close"]))
-                db.add(
-                    MarketDailyBar(
-                        symbol=cache_symbol,
-                        trade_date=row["date"],
-                        open=close,
-                        high=close,
-                        low=close,
-                        close=close,
-                        volume=Decimal(str(row.get("volume") or 0)),
-                        source=history["source"],
-                        fetched_at=history["fetched_at"],
-                    )
-                )
+        # Preserve the acquisition audit before starting the replace transaction.
         db.commit()
-        assessment = _series_assessment(history["rows"])
+        history = history_result.require_value()
+        bars = mapping_series_bars(
+            history,
+            cache_symbol=subject.subject_id,
+            adjustment="unadjusted",
+        )
+        replace_market_series(
+            db,
+            provider,
+            history_result,
+            bars,
+            subject=subject,
+            min_rows=60,
+        )
+        current = resolve_cached_series(
+            db,
+            cache_symbol=subject.subject_id,
+            capability="market.index_daily",
+            subject=subject,
+            adjustment="unadjusted",
+            price_unit="CNY",
+            volume_unit="share",
+            min_rows=60,
+        )
+        if not current.executable:
+            raise ProviderUnavailableError(
+                "index refresh blocked by effective quality: "
+                f"{current.effective_quality.effective_quality.value} "
+                f"({current.blocking_reason or 'not_executable'})"
+            )
+        db.commit()
+        rows = [
+            {
+                "date": item.trade_date,
+                "close": float(item.close),
+                "volume": float(item.volume),
+            }
+            for item in current.bars
+        ]
+        assessment = _series_assessment(rows)
         detail = (
             f"沪深300：20日涨跌 {assessment['return_20d']}%，"
             f"收盘 {assessment.get('close')}，MA20 {assessment.get('ma20')}，"
@@ -292,25 +554,55 @@ def _market_assessment(db: Session, provider: UnifiedDataService) -> tuple[dict,
             "市场判断",
             "success" if assessment["state"] != "无法判断" else "partial",
             detail,
-            source=history["source"],
-            data_time=history["fetched_at"].isoformat(),
+            source=current.source,
+            data_time=current.bars[-1].fetched_at.isoformat(),
+            quality_status=current.effective_quality.effective_quality.value,
+            observed_at=current.observed_at.isoformat()
+            if current.observed_at
+            else None,
+            fetched_at=current.bars[-1].fetched_at.isoformat(),
+            provider_observations=history_result.provider_observations,
+            quality_record_id=current.quality_record_id,
+            market_quality_binding=_market_binding_payload(
+                current, "market.index_daily"
+            ),
+            **effective_quality_metadata(current.effective_quality),
         )
     except Exception as exc:
         db.rollback()
-        if cached:
+        cached = resolve_cached_series(
+            db,
+            cache_symbol=subject.subject_id,
+            capability="market.index_daily",
+            subject=subject,
+            adjustment="unadjusted",
+            price_unit="CNY",
+            volume_unit="share",
+            min_rows=60,
+        )
+        if cached.executable:
             rows = [
                 {"date": item.trade_date, "close": float(item.close), "volume": float(item.volume)}
-                for item in cached
+                for item in cached.bars
             ]
             assessment = _series_assessment(rows)
             return assessment, _step(
                 "market_judgement",
                 "市场判断",
                 "partial",
-                f"指数刷新失败，回退到 {cached[-1].trade_date.isoformat()} 的缓存：{exc}",
+                f"指数刷新失败，回退到 {cached.bars[-1].trade_date.isoformat()} 的缓存：{exc}",
                 fallback_used=True,
-                source=cached[-1].source,
-                data_time=cached[-1].fetched_at.isoformat(),
+                source=cached.source,
+                data_time=cached.bars[-1].fetched_at.isoformat(),
+                observed_at=cached.observed_at.isoformat()
+                if cached.observed_at
+                else None,
+                quality_status=cached.effective_quality.effective_quality.value,
+                quality_record_id=cached.quality_record_id,
+                market_quality_binding=_market_binding_payload(
+                    cached, "market.index_daily"
+                ),
+                **effective_quality_metadata(cached.effective_quality),
                 missing=["最新沪深300行情"],
             )
         assessment = {"state": "无法判断", "risk": "无法判断", "return_20d": None}
@@ -320,6 +612,12 @@ def _market_assessment(db: Session, provider: UnifiedDataService) -> tuple[dict,
             "partial",
             f"宽基指数获取失败，市场环境不作猜测：{exc}",
             missing=["沪深300近60个交易日"],
+            quality_status=cached.effective_quality.effective_quality.value,
+            quality_record_id=cached.quality_record_id,
+            market_quality_binding=_market_binding_payload(
+                cached, "market.index_daily"
+            ),
+            **effective_quality_metadata(cached.effective_quality),
         )
 
 
@@ -327,42 +625,76 @@ def _pick(raw: dict, *keys):
     return next((raw.get(key) for key in keys if raw.get(key) not in (None, "")), None)
 
 
+def _source_binding_payload(selection, data_capability: str) -> dict | None:
+    if (
+        not selection.executable
+        or selection.quality_record_id is None
+        or selection.effective_quality.observed_at is None
+    ):
+        return None
+    payload = {
+        "data_capability": data_capability,
+        "subject_type": selection.subject.subject_type,
+        "subject_id": selection.subject.subject_id,
+        "semantic_key": selection.subject.semantic_key or "",
+        "quality_record_id": selection.quality_record_id,
+        "observed_at": selection.effective_quality.observed_at.isoformat(),
+    }
+    if data_capability == "announcement.catalog":
+        payload.update(
+            {
+                "scan_start": selection.scan_start.isoformat(),
+                "scan_end": selection.scan_end.isoformat(),
+                "checked_at": selection.checked_at.isoformat(),
+            }
+        )
+    return payload
+
+
 def _ensure_profile(
-    db: Session, symbol: str, provider: UnifiedDataService
+    db: Session,
+    symbol: str,
+    provider: DataHubRouter,
+    *,
+    evaluated_at: datetime | None = None,
 ) -> tuple[CompanyProfile | None, dict]:
-    profile = db.scalar(select(CompanyProfile).where(CompanyProfile.symbol == symbol))
+    business_now = to_shanghai_aware(evaluated_at or shanghai_now())
+    selected = resolve_cached_company_profile(
+        db, symbol, evaluated_at=business_now
+    )
+    profile = selected.profile
     if profile and profile.industry:
+        profile_quality = selected.effective_quality.effective_quality.value
         return profile, _step(
             "company_mapping",
             "公司与行业识别",
             "success",
             f"{profile.name}，所属行业：{profile.industry}。",
             source=profile.source,
-            data_time=profile.fetched_at.isoformat(),
+            data_time=utc_storage_naive_to_aware(
+                selected.effective_quality.observed_at
+            ).isoformat(),
+            observed_at=utc_storage_naive_to_aware(
+                selected.effective_quality.observed_at
+            ).isoformat(),
+            quality_status=profile_quality,
+            source_quality_binding=_source_binding_payload(
+                selected, "fundamental.profile"
+            ),
             missing=["概念板块自动映射", "完整产业链节点"] if not profile.raw_data else [],
         )
     try:
         profile_result = provider.company_profile(symbol)
-        raw = profile_result.value
-        now = datetime.now()
-        values = {
-            "name": str(_pick(raw, "A股简称", "公司名称") or symbol),
-            "industry": _pick(raw, "细分行业", "所属行业"),
-            "market": _pick(raw, "所属市场"),
-            "main_business": _pick(raw, "主营业务"),
-            "business_scope": _pick(raw, "经营范围"),
-            "website": _pick(raw, "官方网站"),
-            "source": "巨潮资讯公司概况（AKShare）",
-            "source_url": "http://www.cninfo.com.cn/new/commonUrl?url=data/stock/stockDetail",
-            "raw_data": raw,
-            "fetched_at": now,
-        }
-        if profile is None:
-            profile = CompanyProfile(symbol=symbol, **values)
-            db.add(profile)
-        else:
-            for key, value in values.items():
-                setattr(profile, key, value)
+        db.commit()
+        profile = persist_company_profile(db, provider, profile_result)
+        selected = resolve_cached_company_profile(
+            db, symbol, evaluated_at=business_now
+        )
+        if not selected.executable:
+            raise ProviderUnavailableError(
+                "profile refresh blocked by effective quality: "
+                f"{selected.effective_quality.effective_quality.value}"
+            )
         db.commit()
         return profile, _step(
             "company_mapping",
@@ -370,16 +702,50 @@ def _ensure_profile(
             "success" if profile.industry else "partial",
             f"识别为 {profile.name}；行业：{profile.industry or '暂无可靠数据'}。",
             source=profile.source,
-            data_time=now.isoformat(),
+            data_time=utc_storage_naive_to_aware(
+                selected.effective_quality.observed_at
+            ).isoformat(),
+            observed_at=profile_result.observed_at.isoformat()
+            if profile_result.observed_at
+            else None,
+            fetched_at=profile_result.fetched_at.isoformat(),
+            quality_status=profile_result.quality_status.value,
+            source_quality_binding=_source_binding_payload(
+                selected, "fundamental.profile"
+            ),
+            provider_observations=profile_result.provider_observations,
             missing=[] if profile.industry else ["所属行业", "概念板块", "产业链节点"],
         )
     except Exception as exc:
+        db.rollback()
+        selected = resolve_cached_company_profile(
+            db, symbol, evaluated_at=business_now
+        )
+        profile = selected.profile
         return profile, _step(
             "company_mapping",
             "公司与行业识别",
             "partial",
             f"公司行业识别失败，保留已有信息：{exc}",
             fallback_used=profile is not None,
+            observed_at=(
+                utc_storage_naive_to_aware(
+                    selected.effective_quality.observed_at
+                ).isoformat()
+                if selected.effective_quality.observed_at
+                else None
+            ),
+            data_time=(
+                utc_storage_naive_to_aware(
+                    selected.effective_quality.observed_at
+                ).isoformat()
+                if selected.effective_quality.observed_at
+                else business_now.isoformat()
+            ),
+            quality_status=selected.effective_quality.effective_quality.value,
+            source_quality_binding=_source_binding_payload(
+                selected, "fundamental.profile"
+            ),
             missing=["所属行业", "概念板块", "产业链节点"],
         )
 
@@ -402,13 +768,47 @@ def _sector_board_name(profile: CompanyProfile) -> str:
     return next((board for keys, board in aliases if any(key in text for key in keys)), profile.industry)
 
 
+def _build_sector_assessment(
+    profile: CompanyProfile,
+    board_name: str,
+    rows: list[dict],
+    market: dict,
+) -> dict:
+    assessment = _series_assessment(rows)
+    market_return = market.get("return_20d")
+    relative = (
+        assessment["return_20d"] - market_return
+        if assessment["return_20d"] is not None and market_return is not None
+        else None
+    )
+    state = (
+        "强"
+        if relative is not None and relative >= 3 and assessment["state"] == "上升"
+        else "弱"
+        if relative is not None and relative <= -3 and assessment["state"] == "下降"
+        else "中性"
+    )
+    return {
+        "state": state,
+        "industry": profile.industry,
+        "board_name": board_name,
+        "return_20d": assessment["return_20d"],
+        "relative_20d": round(relative, 2) if relative is not None else None,
+        "is_mainline": bool(state == "强"),
+        "mainline_method": "行业20日涨跌相对沪深300的规则代理，不等同于完整资金主线模型",
+    }
+
+
 def _sector_assessment(
     db: Session,
-    provider: UnifiedDataService,
+    provider: DataHubRouter,
     profile: CompanyProfile | None,
     market: dict,
     refresh: bool = False,
+    *,
+    evaluated_at: datetime | None = None,
 ) -> tuple[dict, dict]:
+    business_day = to_shanghai_aware(evaluated_at or shanghai_now()).date()
     result: dict[str, object]
     if profile is None or not profile.industry:
         result = {"state": "无法判断", "relative_20d": None, "is_mainline": None}
@@ -419,75 +819,146 @@ def _sector_assessment(
             "缺少可靠所属行业，无法计算行业相对强弱。",
             missing=["所属行业", "行业指数"],
         )
-    if not refresh:
-        previous = db.scalar(
-            select(PlanAnalysisRun)
-            .where(
-                PlanAnalysisRun.symbol == profile.symbol,
-                PlanAnalysisRun.status.in_(("success", "confirmed")),
-                PlanAnalysisRun.created_at >= datetime.now() - timedelta(hours=24),
-            )
-            .order_by(PlanAnalysisRun.created_at.desc())
-        )
-        previous_result = previous.result_snapshot if previous else None
-        cached_assessment = (previous_result or {}).get("plan", {}).get("industry_assessment")
-        cached_step = next(
-            (
-                item
-                for item in (previous_result or {}).get("steps", [])
-                if item.get("code") == "industry_judgement" and item.get("status") == "success"
-            ),
-            None,
-        )
-        if cached_assessment and cached_step:
-            prefix = "使用24小时内行业判断缓存；"
-            detail = cached_step["detail"]
-            while detail.startswith(prefix + prefix):
-                detail = detail[len(prefix) :]
-            return cached_assessment, {
-                **cached_step,
-                "detail": detail if detail.startswith(prefix) else f"{prefix}{detail}",
-                "fallback_used": True,
-            }
-    try:
-        board_name = _sector_board_name(profile)
-        history_result = provider.get_sector_history(
-            board_name, date.today() - timedelta(days=240), date.today()
-        )
-        history = history_result.value
-        assessment = _series_assessment(history["rows"])
-        market_return = market.get("return_20d")
-        relative = (
-            assessment["return_20d"] - market_return
-            if assessment["return_20d"] is not None and market_return is not None
-            else None
-        )
-        state = (
-            "强"
-            if relative is not None and relative >= 3 and assessment["state"] == "上升"
-            else "弱"
-            if relative is not None and relative <= -3 and assessment["state"] == "下降"
-            else "中性"
-        )
-        result = {
-            "state": state,
-            "industry": profile.industry,
-            "board_name": board_name,
-            "return_20d": assessment["return_20d"],
-            "relative_20d": round(relative, 2) if relative is not None else None,
-            "is_mainline": bool(state == "强"),
-            "mainline_method": "行业20日涨跌相对沪深300的规则代理，不等同于完整资金主线模型",
-        }
+    board_name = _sector_board_name(profile)
+    subject = sector_daily_subject(board_name, "unadjusted", "CNY", "share")
+    cached = resolve_cached_series(
+        db,
+        cache_symbol=subject.subject_id,
+        capability="market.sector_daily",
+        subject=subject,
+        adjustment="unadjusted",
+        price_unit="CNY",
+        volume_unit="share",
+        min_rows=60,
+    )
+    if cached.executable and not refresh:
+        rows = [
+            {"date": item.trade_date, "close": float(item.close), "volume": float(item.volume)}
+            for item in cached.bars
+        ]
+        result = _build_sector_assessment(profile, board_name, rows, market)
         return result, _step(
             "industry_judgement",
             "行业判断",
             "success",
-            f"{profile.industry}（行情代理板块：{board_name}）20日涨跌 {assessment['return_20d']}%，"
-            f"相对沪深300 {result['relative_20d']}个百分点，判定为{state}。",
-            source=history["source"],
-            data_time=history["fetched_at"].isoformat(),
+            f"使用有效行业行情缓存，判定为{result['state']}。",
+            fallback_used=True,
+            source=cached.source,
+            data_time=cached.bars[-1].fetched_at.isoformat(),
+            observed_at=cached.observed_at.isoformat()
+            if cached.observed_at
+            else None,
+            quality_status=cached.effective_quality.effective_quality.value,
+            quality_record_id=cached.quality_record_id,
+            market_quality_binding=_market_binding_payload(
+                cached, "market.sector_daily"
+            ),
+            **effective_quality_metadata(cached.effective_quality),
+        )
+    try:
+        history_result = provider.get_sector_history(
+            board_name,
+            business_day - timedelta(days=240),
+            business_day,
+        )
+        # Preserve the acquisition audit before starting the replace transaction.
+        db.commit()
+        history = history_result.require_value()
+        bars = mapping_series_bars(
+            history,
+            cache_symbol=subject.subject_id,
+            adjustment="unadjusted",
+        )
+        replace_market_series(
+            db,
+            provider,
+            history_result,
+            bars,
+            subject=subject,
+            min_rows=60,
+        )
+        current = resolve_cached_series(
+            db,
+            cache_symbol=subject.subject_id,
+            capability="market.sector_daily",
+            subject=subject,
+            adjustment="unadjusted",
+            price_unit="CNY",
+            volume_unit="share",
+            min_rows=60,
+        )
+        if not current.executable:
+            raise ProviderUnavailableError(
+                "sector refresh blocked by effective quality: "
+                f"{current.effective_quality.effective_quality.value} "
+                f"({current.blocking_reason or 'not_executable'})"
+            )
+        db.commit()
+        rows = [
+            {
+                "date": item.trade_date,
+                "close": float(item.close),
+                "volume": float(item.volume),
+            }
+            for item in current.bars
+        ]
+        result = _build_sector_assessment(profile, board_name, rows, market)
+        return result, _step(
+            "industry_judgement",
+            "行业判断",
+            "success",
+            f"{profile.industry}（行情代理板块：{board_name}）20日涨跌 {result['return_20d']}%，"
+            f"相对沪深300 {result['relative_20d']}个百分点，判定为{result['state']}。",
+            source=current.source,
+            data_time=current.bars[-1].fetched_at.isoformat(),
+            quality_status=current.effective_quality.effective_quality.value,
+            observed_at=current.observed_at.isoformat()
+            if current.observed_at
+            else None,
+            fetched_at=current.bars[-1].fetched_at.isoformat(),
+            provider_observations=history_result.provider_observations,
+            quality_record_id=current.quality_record_id,
+            market_quality_binding=_market_binding_payload(
+                current, "market.sector_daily"
+            ),
+            **effective_quality_metadata(current.effective_quality),
         )
     except Exception as exc:
+        db.rollback()
+        cached = resolve_cached_series(
+            db,
+            cache_symbol=subject.subject_id,
+            capability="market.sector_daily",
+            subject=subject,
+            adjustment="unadjusted",
+            price_unit="CNY",
+            volume_unit="share",
+            min_rows=60,
+        )
+        if cached.executable:
+            rows = [
+                {"date": item.trade_date, "close": float(item.close), "volume": float(item.volume)}
+                for item in cached.bars
+            ]
+            result = _build_sector_assessment(profile, board_name, rows, market)
+            return result, _step(
+                "industry_judgement",
+                "行业判断",
+                "partial",
+                f"行业指数刷新失败，使用有效缓存：{exc}",
+                fallback_used=True,
+                source=cached.source,
+                data_time=cached.bars[-1].fetched_at.isoformat(),
+                observed_at=cached.observed_at.isoformat()
+                if cached.observed_at
+                else None,
+                quality_status=cached.effective_quality.effective_quality.value,
+                quality_record_id=cached.quality_record_id,
+                market_quality_binding=_market_binding_payload(
+                    cached, "market.sector_daily"
+                ),
+                **effective_quality_metadata(cached.effective_quality),
+            )
         result = {"state": "无法判断", "relative_20d": None, "is_mainline": None}
         return result, _step(
             "industry_judgement",
@@ -495,16 +966,36 @@ def _sector_assessment(
             "partial",
             f"已识别行业“{profile.industry}”，但行业指数获取失败：{exc}",
             missing=["行业指数近60个交易日", "行业相对强度"],
+            quality_status=cached.effective_quality.effective_quality.value,
+            quality_record_id=cached.quality_record_id,
+            market_quality_binding=_market_binding_payload(
+                cached, "market.sector_daily"
+            ),
+            **effective_quality_metadata(cached.effective_quality),
         )
 
 
-def _research_inventory(db: Session, symbol: str) -> tuple[dict, dict]:
+def _research_inventory(
+    db: Session,
+    symbol: str,
+    *,
+    evaluated_at: datetime | None = None,
+) -> tuple[dict, dict]:
+    business_now = to_shanghai_aware(evaluated_at or shanghai_now())
+    announcement_start, announcement_end = announcement_catalog_window(
+        evaluated_at=business_now
+    )
+    announcement_selection = resolve_cached_announcement_catalog(
+        db,
+        symbol,
+        announcement_start,
+        announcement_end,
+        evaluated_at=business_now,
+    )
     financials = db.scalars(
         select(CompanyFinancialPeriod).where(CompanyFinancialPeriod.symbol == symbol)
     ).all()
-    announcements = db.scalars(
-        select(CompanyAnnouncement).where(CompanyAnnouncement.symbol == symbol)
-    ).all()
+    announcements = announcement_selection.announcements
     evidence = db.scalars(
         select(CompanyResearchEvidence).where(CompanyResearchEvidence.symbol == symbol)
     ).all()
@@ -517,7 +1008,7 @@ def _research_inventory(db: Session, symbol: str) -> tuple[dict, dict]:
     missing = []
     if not financials:
         missing.append("最近12季度财务数据")
-    if not announcements:
+    if not announcement_selection.executable:
         missing.append("公司公告目录")
     if not evidence:
         missing.append("产业与公开信息证据")
@@ -526,6 +1017,7 @@ def _research_inventory(db: Session, symbol: str) -> tuple[dict, dict]:
     result = {
         "financial_periods": len(financials),
         "announcements": len(announcements),
+        "announcement_scan_completed": announcement_selection.executable,
         "risk_events": [
             {
                 "title": item.title,
@@ -540,21 +1032,114 @@ def _research_inventory(db: Session, symbol: str) -> tuple[dict, dict]:
         "valuation_available": valuation is not None,
         "missing": missing,
     }
+    announcement_detail = (
+        "公告目录扫描成功，当前覆盖范围未发现公告。"
+        if announcement_selection.executable and not announcements
+        else f"本地已有财务期数 {len(financials)}、公告 {len(announcements)}、产业证据 {len(evidence)}。"
+    )
     return result, _step(
         "company_risk",
         "公司风险与公开信息",
         "success" if not missing else "partial",
-        f"本地已有财务期数 {len(financials)}、公告 {len(announcements)}、产业证据 {len(evidence)}。",
+        announcement_detail,
         missing=missing,
         source="本地公司研究中心（原始来源保留在证据记录）",
-        data_time=datetime.now().isoformat(),
+        data_time=business_now.isoformat(),
+        fetched_at=business_now.isoformat(),
+        observed_at=utc_storage_naive_to_aware(
+            announcement_selection.effective_quality.observed_at
+        ).isoformat()
+        if announcement_selection.effective_quality.observed_at
+        else None,
+        quality_status=(
+            announcement_selection.effective_quality.effective_quality.value
+        ),
+        source_quality_binding=_source_binding_payload(
+            announcement_selection, "announcement.catalog"
+        ),
+        required_missing=(
+            [] if announcement_selection.executable else ["announcements"]
+        ),
+        optional_missing=[
+            item
+            for item, available in (
+                ("financials", bool(financials)),
+                ("valuation", valuation is not None),
+                ("industry_evidence", bool(evidence)),
+            )
+            if not available
+        ],
+    )
+
+
+def _latest_quality_record(
+    db: Session, symbol: str, capability: str
+) -> DataQualityRecord | None:
+    return db.scalar(
+        select(DataQualityRecord)
+        .where(
+            DataQualityRecord.symbol == symbol,
+            DataQualityRecord.capability == capability,
+        )
+        .order_by(DataQualityRecord.id.desc())
+    )
+
+
+def _cached_quote_step(db: Session, symbol: str) -> dict:
+    selection = resolve_cached_quote(
+        db,
+        symbol=symbol,
+        capability="market.quote.realtime",
+    )
+    execution_quote = selection.value if selection.executable else None
+    display_quote = execution_quote
+    if display_quote is None:
+        display_selection = resolve_cached_quote(
+            db,
+            symbol=symbol,
+            capability="market.quote.latest_close",
+        )
+        display_quote = display_selection.value
+    quote = execution_quote
+    quality = selection.effective_quality.effective_quality.value
+    record_id = (
+        selection.effective_quality.blocking_record_id
+        or selection.quality_record_id
+    )
+    record = db.get(DataQualityRecord, record_id) if record_id else None
+    return _step(
+        "market_quote",
+        "当前价格质量",
+        "success" if quality in {"VERIFIED", "SINGLE_SOURCE"} else "partial",
+        "已读取持久化行情质量。" if quote else "没有可用的当前价格。",
+        source=quote.source if quote else "none",
+        observed_at=quote.observed_at.isoformat() if quote else None,
+        fetched_at=quote.fetched_at.isoformat() if quote else None,
+        data_time=quote.observed_at.isoformat() if quote else None,
+        quality_status=quality,
+        provider_observations=record.provider_observations if record else [],
+        conflict_fields=record.conflict_fields if record else [],
+        quality_record_id=selection.quality_record_id,
+        market_quality_binding=_market_binding_payload(
+            selection, "market.quote.realtime"
+        ),
+        **effective_quality_metadata(selection.effective_quality),
+        quote_type=display_quote.quote_type if display_quote else None,
+        price=str(display_quote.price) if display_quote else None,
+        execution_quote_type=quote.quote_type if quote else None,
+        execution_price=str(quote.price) if quote else None,
+        display_quote_type=display_quote.quote_type if display_quote else None,
+        display_price=str(display_quote.price) if display_quote else None,
+        fallback_used=display_quote is not None and quote is None,
     )
 
 
 def _decision(preview: dict, position_mode: str) -> dict:
     holding = preview["existing_position"]
     if position_mode == "持仓":
-        if holding["hard_stop_triggered"] or preview.get("pattern", {}).get("platform_broken"):
+        if preview.get("price_trigger_evaluation_skipped"):
+            status, label = "WAIT", "等待可信实时价格"
+        elif holding["hard_stop_triggered"] or preview.get("pattern", {}).get("platform_broken"):
             status, label = "PLAN_INVALID_EXIT", "计划失效，需要退出"
         elif holding["first_reduction_triggered"]:
             status, label = "REDUCE", "建议减仓"
@@ -581,6 +1166,7 @@ def _decision(preview: dict, position_mode: str) -> dict:
 
 
 def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
+    analysis_started_at = shanghai_now()
     account, created_account = _default_account(db, payload)
     run = PlanAnalysisRun(
         symbol=payload.symbol,
@@ -591,11 +1177,16 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
         pipeline_steps=[],
         result_snapshot=None,
         user_confirmed=False,
+        created_at=to_market_storage_naive(analysis_started_at),
+        updated_at=to_market_storage_naive(analysis_started_at),
     )
     db.add(run)
     db.commit()
     db.refresh(run)
-    provider = UnifiedDataService(db)
+    provider = build_data_hub(db)
+    research_orchestrator = ExistingAIResearchOrchestrator(
+        lambda request: run_ai_analysis(db, request)
+    )
     steps = [
         _step(
             "account",
@@ -604,18 +1195,26 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
             f"使用账户“{account.name}”，权益 {float(account.total_assets):.2f} 元。"
             + (" 已自动建立默认研究账户。" if created_account else ""),
             source="本地账户设置",
-            data_time=datetime.now().isoformat(),
+            data_time=analysis_started_at.isoformat(),
         )
     ]
     try:
-        stock_step, stock_meta = _sync_stock(db, payload.symbol, provider, payload.refresh)
+        stock_step, stock_meta = _sync_stock(
+            db,
+            payload.symbol,
+            provider,
+            payload.refresh,
+            evaluated_at=analysis_started_at,
+        )
         steps.append(stock_step)
+        steps.append(stock_meta.get("quote_step") or _cached_quote_step(db, payload.symbol))
         research_refresh = refresh_company_research_if_needed(
             db,
             payload.symbol,
             force=payload.refresh,
             include_documents=False,
             data_service=provider,
+            evaluated_at=analysis_started_at,
         )
         refresh_sections = research_refresh.get("sections", {})
         refresh_failed = [
@@ -648,13 +1247,29 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
                 freshness=research_refresh.get("freshness", []),
             )
         )
-        profile, profile_step = _ensure_profile(db, payload.symbol, provider)
+        profile, profile_step = _ensure_profile(
+            db,
+            payload.symbol,
+            provider,
+            evaluated_at=analysis_started_at,
+        )
         steps.append(profile_step)
-        market, market_step = _market_assessment(db, provider)
+        market, market_step = _market_assessment(
+            db, provider, evaluated_at=analysis_started_at
+        )
         steps.append(market_step)
-        sector, sector_step = _sector_assessment(db, provider, profile, market, payload.refresh)
+        sector, sector_step = _sector_assessment(
+            db,
+            provider,
+            profile,
+            market,
+            payload.refresh,
+            evaluated_at=analysis_started_at,
+        )
         steps.append(sector_step)
-        research, research_step = _research_inventory(db, payload.symbol)
+        research, research_step = _research_inventory(
+            db, payload.symbol, evaluated_at=analysis_started_at
+        )
         research["refresh"] = research_refresh
         research["provider_status"] = provider.provider_status()
         steps.append(research_step)
@@ -685,17 +1300,26 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
             holding_cost_price=payload.holding_cost_price,
             market_evidence=market_step["detail"],
             market_source=market_step.get("source", "数据不足"),
-            market_data_time=market_step.get("data_time", datetime.now().isoformat()),
+            market_data_time=market_step.get(
+                "data_time", analysis_started_at.isoformat()
+            ),
             sector_evidence=sector_step["detail"],
             sector_source=sector_step.get("source", "数据不足"),
-            sector_data_time=sector_step.get("data_time", datetime.now().isoformat()),
+            sector_data_time=sector_step.get(
+                "data_time", analysis_started_at.isoformat()
+            ),
         )
-        preview = generate_trade_plan_preview(db, generator_request)
+        preview = generate_trade_plan_preview(
+            db, generator_request, evaluated_at=analysis_started_at
+        )
         decision = _decision(preview, payload.position_mode)
         preview["decision"] = decision
         preview["market_assessment"] = market
         preview["industry_assessment"] = sector
         preview["research_inventory"] = research
+        preview["required_research_capabilities"] = (
+            payload.required_research_capabilities
+        )
         steps.extend(
             [
                 _step(
@@ -720,7 +1344,7 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
                     if preview["position_calculation"]
                     else ["有效买入触发价", "硬止损价"],
                     source="确定性规则引擎 + 本地账户",
-                    data_time=datetime.now().isoformat(),
+                    data_time=analysis_started_at.isoformat(),
                 ),
             ]
         )
@@ -730,7 +1354,8 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
             ai_request = TradePlanAIRequest(
                 **generator_request.model_dump(), preview_hash=preview["preview_hash"]
             )
-            ai_result = run_ai_analysis(db, ai_request)
+            research_execution = research_orchestrator.run(ai_request)
+            ai_result = research_execution.legacy_payload
             ai_id = ai_result.get("id")
             steps.append(
                 _step(
@@ -745,7 +1370,9 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
                     if ai_result.get("status") == "success"
                     else ["AI辅助解释"],
                     source=f"{ai_result.get('provider', '未配置')}/{ai_result.get('model', '未配置')}",
-                    data_time=ai_result.get("created_at", datetime.now().isoformat()),
+                    data_time=ai_result.get(
+                        "created_at", analysis_started_at.isoformat()
+                    ),
                 )
             )
         else:
@@ -763,6 +1390,27 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
                     missing=["AI辅助解释"],
                 )
             )
+        decision_package = build_decision_package(
+            preview=preview,
+            decision=decision,
+            steps=steps,
+            ai_result=ai_result,
+            orchestrator_id=research_orchestrator.orchestrator_id,
+        )
+        if decision_package.quality_status.blocks_execution and preview["status"] == "READY":
+            preview = deepcopy(preview)
+            preview["deterministic_rule_status"] = "READY"
+            preview["status"] = "WAIT"
+            preview["current_buy_allowed"] = False
+            preview["buy_plan"]["allowed"] = False
+            preview["confirmation_add"]["allowed"] = False
+            decision = {
+                **decision,
+                "status": decision_package.strategy_decision.decision_code,
+                "label": decision_package.strategy_decision.label,
+                "next_action": decision_package.strategy_decision.next_action,
+            }
+            preview["decision"] = decision
         steps.append(
             _step(
                 "plan_output",
@@ -785,11 +1433,14 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
             "decision": decision,
             "plan": preview,
             "ai": ai_result,
+            "decision_package": decision_package.model_dump(mode="json"),
             "generator_request": generator_request.model_dump(mode="json"),
-            "can_save": bool(preview["buy_plan"]["hard_stop"] and preview["data_date"]),
-            "save_disabled_reason": None
-            if preview["buy_plan"]["hard_stop"] and preview["data_date"]
-            else "缺少可靠买入区、硬止损或行情日期，不能冻结为正式计划。",
+            "can_save": decision_package.freeze_allowed,
+            "save_disabled_reason": (
+                None
+                if decision_package.freeze_allowed
+                else "；".join(decision_package.blocked_reasons)
+            ),
         }
         run.status = "success"
         run.pipeline_steps = steps
@@ -810,13 +1461,31 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
 
 
 def confirm_one_click_plan(db: Session, run_id: int) -> dict:
-    run = db.get(PlanAnalysisRun, run_id)
+    if db.get_bind().dialect.name == "sqlite":
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+    run = db.scalar(
+        select(PlanAnalysisRun).where(PlanAnalysisRun.id == run_id).with_for_update()
+    )
     if run is None:
         raise AppError(404, "ANALYSIS_RUN_NOT_FOUND", "一键分析记录不存在")
     if run.confirmed_plan_id:
         raise AppError(409, "ANALYSIS_ALREADY_CONFIRMED", "该分析已经保存为正式计划")
     result = run.result_snapshot or {}
     plan = result.get("plan") or {}
+    decision_package = result.get("decision_package")
+    if not decision_package:
+        raise AppError(
+            422,
+            "DECISION_PACKAGE_REQUIRED",
+            "Legacy analysis cannot be confirmed; run a new analysis.",
+        )
+    if not decision_package.get("freeze_allowed"):
+        reasons = "；".join(decision_package.get("blocked_reasons") or [])
+        raise AppError(
+            422,
+            "ANALYSIS_QUALITY_BLOCKED",
+            reasons or "数据质量不允许冻结正式计划",
+        )
     generator_payload = result.get("generator_request")
     if not generator_payload or not plan.get("preview_hash"):
         raise AppError(422, "ANALYSIS_NOT_SAVABLE", "分析没有形成可保存的规则快照")
@@ -825,16 +1494,45 @@ def confirm_one_click_plan(db: Session, run_id: int) -> dict:
         preview_hash=plan["preview_hash"],
         ai_analysis_id=run.ai_analysis_id,
     )
-    saved = save_generated_plan(db, save_request)
+    try:
+        saved = freeze_trade_plan(
+            db,
+            request=save_request,
+            decision_package=decision_package,
+            analysis_created_at=run.created_at,
+            analysis_run_id=run.id,
+        )
+    except IntegrityError as exc:
+        db.rollback()
+        existing = db.scalar(
+            select(TradePlan).where(TradePlan.analysis_run_id == run_id)
+        )
+        if existing:
+            raise AppError(
+                409,
+                "ANALYSIS_ALREADY_CONFIRMED",
+                "该分析已经保存为正式计划。",
+            ) from exc
+        raise AppError(
+            409,
+            "PLAN_VERSION_CONFLICT",
+            "计划版本发生并发冲突，请重新分析后确认。",
+        ) from exc
     frozen_plan = db.get(TradePlan, saved["id"])
     if frozen_plan:
-        frozen_plan.engine_snapshot = plan
+        frozen_plan.engine_snapshot = {
+            **plan,
+            "decision_package": decision_package,
+            "freeze_hash": decision_package["package_hash"],
+        }
         frozen_plan.market_snapshot = {
             "market_assessment": plan.get("market_assessment"),
             "industry_assessment": plan.get("industry_assessment"),
+            "quality_snapshot": decision_package["quality_snapshot"],
         }
         frozen_plan.source_snapshot = (
             (result.get("ai") or {}).get("sources")
+            or decision_package.get("evidence")
             or plan.get("sources")
             or []
         )

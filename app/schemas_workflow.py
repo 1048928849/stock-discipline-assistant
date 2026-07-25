@@ -2,7 +2,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 
 class TradePlanCreate(BaseModel):
@@ -100,14 +100,22 @@ class TradePlanSaveRequest(TradePlanPreviewRequest):
 class EvidenceClaim(BaseModel):
     model_config = ConfigDict(extra="forbid")
     claim: str = Field(min_length=1, max_length=2000)
-    source_ids: list[str] = Field(min_length=1, max_length=20)
+    evidence_ids: list[str] = Field(
+        min_length=1,
+        max_length=20,
+        validation_alias=AliasChoices("evidence_ids", "source_ids"),
+    )
     confidence: Literal["high", "medium", "low"]
 
 
 class RawFact(BaseModel):
     model_config = ConfigDict(extra="forbid")
     fact: str = Field(min_length=1, max_length=2000)
-    source_ids: list[str] = Field(min_length=1, max_length=20)
+    evidence_ids: list[str] = Field(
+        min_length=1,
+        max_length=20,
+        validation_alias=AliasChoices("evidence_ids", "source_ids"),
+    )
     as_of: str | None = Field(default=None, max_length=40)
     confidence: Literal["high", "medium", "low"]
 
@@ -124,14 +132,22 @@ class AIStatement(BaseModel):
     model_config = ConfigDict(extra="forbid")
     topic: str = Field(min_length=1, max_length=100)
     content: str = Field(min_length=1, max_length=3000)
-    source_ids: list[str] = Field(default_factory=list, max_length=20)
+    evidence_ids: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        validation_alias=AliasChoices("evidence_ids", "source_ids"),
+    )
     confidence: Literal["high", "medium", "low"]
 
 
 class InformationConflict(BaseModel):
     model_config = ConfigDict(extra="forbid")
     description: str = Field(min_length=1, max_length=2000)
-    source_ids: list[str] = Field(min_length=2, max_length=20)
+    evidence_ids: list[str] = Field(
+        min_length=2,
+        max_length=20,
+        validation_alias=AliasChoices("evidence_ids", "source_ids"),
+    )
 
 
 class DataFreshnessItem(BaseModel):
@@ -139,7 +155,11 @@ class DataFreshnessItem(BaseModel):
     category: str = Field(min_length=1, max_length=80)
     latest_at: str | None = Field(default=None, max_length=40)
     stale: bool
-    source_ids: list[str] = Field(default_factory=list, max_length=50)
+    evidence_ids: list[str] = Field(
+        default_factory=list,
+        max_length=50,
+        validation_alias=AliasChoices("evidence_ids", "source_ids"),
+    )
 
 
 class ProviderStatusItem(BaseModel):
@@ -187,6 +207,9 @@ class OneClickPlanRequest(BaseModel):
     max_total_position_pct: Decimal = Field(default=Decimal("80"), gt=0, le=100)
     max_industry_position_pct: Decimal = Field(default=Decimal("40"), gt=0, le=100)
     logic_invalidation: str | None = Field(default=None, max_length=3000)
+    required_research_capabilities: list[
+        Literal["financials", "valuation", "news", "social_clues"]
+    ] = Field(default_factory=list, max_length=10)
 
     @model_validator(mode="after")
     def validate_one_click_input(self):

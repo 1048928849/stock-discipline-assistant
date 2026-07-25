@@ -77,6 +77,7 @@ def _source(
         and published_date < date.today() - timedelta(days=550)
     )
     return {
+        "evidence_id": source_id,
         "source_id": source_id,
         "symbol": symbol,
         "category": category,
@@ -237,7 +238,7 @@ def build_evidence_package(db: Session, symbol: str, preview: dict) -> dict:
             + _clean_external_text(
                 json.dumps(item["content"], ensure_ascii=False, default=str), limit=500
             ),
-            "source_ids": [item["source_id"]],
+            "evidence_ids": [item["evidence_id"]],
             "as_of": item.get("published_at") or item.get("fetched_at"),
             "confidence": item["confidence"],
         }
@@ -261,7 +262,7 @@ def build_evidence_package(db: Session, symbol: str, preview: dict) -> dict:
                 "category": category,
                 "latest_at": latest or None,
                 "stale": all(bool(item.get("stale")) for item in items),
-                "source_ids": [item["source_id"] for item in items],
+                "evidence_ids": [item["evidence_id"] for item in items],
             }
         )
     provider_rows = preview.get("research_inventory", {}).get("provider_status", [])
@@ -369,7 +370,10 @@ def validate_ai_output(raw: dict, package: dict) -> tuple[dict, dict]:
         result = TradePlanAIResult.model_validate(_normalize_ai_output(raw))
     except ValidationError as exc:
         raise ValueError("模型输出不符合结构化Schema") from exc
-    known = {item["source_id"]: item for item in package["sources"]}
+    known = {
+        item.get("evidence_id") or item["source_id"]: item
+        for item in package["sources"]
+    }
     cited: set[str] = set()
     warnings = []
     cited_items = [
@@ -380,19 +384,19 @@ def validate_ai_output(raw: dict, package: dict) -> tuple[dict, dict]:
         *result.conflicts,
     ]
     for statement in [*result.ai_summaries, *result.ai_inferences]:
-        if not statement.source_ids:
-            raise ValueError("AI归纳或推断缺少source_id")
+        if not statement.evidence_ids:
+            raise ValueError("AI归纳或推断缺少evidence_id")
         cited_items.append(statement)
     for claim in cited_items:
-        for source_id in getattr(claim, "source_ids", []):
-            item = known.get(source_id)
+        for evidence_id in getattr(claim, "evidence_ids", []):
+            item = known.get(evidence_id)
             if not item:
-                raise ValueError(f"引用不存在的source_id：{source_id}")
+                raise ValueError(f"引用不存在的evidence_id：{evidence_id}")
             if item["symbol"] != package["symbol"]:
-                raise ValueError(f"引用了其他股票的数据：{source_id}")
+                raise ValueError(f"引用了其他股票的数据：{evidence_id}")
             if item.get("stale"):
-                warnings.append(f"{source_id} 已过期，结论需谨慎")
-            cited.add(source_id)
+                warnings.append(f"{evidence_id} 已过期，结论需谨慎")
+            cited.add(evidence_id)
     # 只核验AI自有文本；后端冻结字段允许包含规则引擎计算数字。
     evidence_text = json.dumps(package, ensure_ascii=False, default=str)
     output_text = json.dumps(ai_owned, ensure_ascii=False)
@@ -415,6 +419,7 @@ def validate_ai_output(raw: dict, package: dict) -> tuple[dict, dict]:
     return result.model_dump(), {
         "valid": True,
         "warnings": warnings,
+        "cited_evidence_ids": sorted(cited),
         "cited_source_ids": sorted(cited),
     }
 
@@ -455,7 +460,9 @@ def run_ai_analysis(db: Session, request: TradePlanAIRequest) -> dict:
         model=model_name,
         prompt_version=PROMPT_VERSION,
         evidence_package=package,
-        source_ids=[item["source_id"] for item in package["sources"]],
+        source_ids=[
+            item.get("evidence_id") or item["source_id"] for item in package["sources"]
+        ],
     )
     if not settings.llm_enabled or not provider.configured:
         audit = TradePlanAIAnalysis(

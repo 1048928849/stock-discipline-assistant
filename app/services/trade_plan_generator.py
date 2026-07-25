@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from decimal import Decimal, ROUND_FLOOR
 from types import SimpleNamespace
 
@@ -11,12 +11,17 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.errors import AppError
+from app.data_hub.market_subjects import stock_daily_subject
+from app.data_hub.trading_calendar import (
+    shanghai_now,
+    shanghai_today,
+    to_market_storage_naive,
+    to_shanghai_aware,
+)
 from app.models import (
     Account,
     CompanyProfile,
     Holding,
-    MarketDailyBar,
-    MarketQuote,
     RuleVersion,
     TradePlan,
     TradePlanAIAnalysis,
@@ -25,6 +30,7 @@ from app.models import (
 from app.schemas_workflow import TradePlanPreviewRequest, TradePlanSaveRequest
 from app.services.technical import prepare_indicators
 from app.services.technical_snapshots import load_qfq_frame
+from app.services.market_cache import resolve_cached_quote, resolve_cached_series
 from app.services.workflow import ensure_default_rule_version
 
 
@@ -68,7 +74,11 @@ GENERATOR_RULES = {
 }
 
 
-def ensure_generator_rule_version(db: Session) -> RuleVersion:
+def ensure_generator_rule_version(
+    db: Session,
+    *,
+    effective_on: date | None = None,
+) -> RuleVersion:
     current = ensure_default_rule_version(db)
     if all(key in current.parameters for key in GENERATOR_PARAMETERS):
         return current
@@ -80,7 +90,7 @@ def ensure_generator_rule_version(db: Session) -> RuleVersion:
         parameters=parameters,
         rules={**current.rules, **GENERATOR_RULES},
         change_note="集中一键计划的账户、风险、分批仓位和市场降风险参数；旧计划保持原规则版本。",
-        effective_from=date.today(),
+        effective_from=effective_on or shanghai_today(),
         active=True,
     )
     db.add(version)
@@ -257,11 +267,18 @@ def _preview_digest(preview: dict) -> str:
     ).hexdigest()
 
 
-def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -> dict:
+def generate_trade_plan_preview(
+    db: Session,
+    request: TradePlanPreviewRequest,
+    *,
+    evaluated_at: datetime | None = None,
+) -> dict:
     account = db.get(Account, request.account_id)
     if account is None:
         raise AppError(404, "ACCOUNT_NOT_FOUND", "账户不存在")
-    rule = ensure_generator_rule_version(db)
+    now = to_shanghai_aware(evaluated_at or shanghai_now())
+    current_date = now.date()
+    rule = ensure_generator_rule_version(db, effective_on=current_date)
     parameters = {**GENERATOR_PARAMETERS, **rule.parameters}
     profile = db.scalar(select(CompanyProfile).where(CompanyProfile.symbol == request.symbol))
     stored_holding = db.scalar(
@@ -269,21 +286,34 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             Holding.account_id == request.account_id, Holding.symbol == request.symbol
         )
     )
-    latest_bar = db.scalar(
-        select(MarketDailyBar)
-        .where(MarketDailyBar.symbol == request.symbol)
-        .order_by(MarketDailyBar.trade_date.desc(), MarketDailyBar.fetched_at.desc())
+    daily_subject = stock_daily_subject(request.symbol, "qfq", "CNY", "share")
+    daily_selection = resolve_cached_series(
+        db,
+        cache_symbol=daily_subject.subject_id,
+        capability="market.daily.qfq",
+        subject=daily_subject,
+        adjustment="qfq",
+        price_unit="CNY",
+        volume_unit="share",
+        min_rows=250,
     )
-    quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == request.symbol))
+    quote_selection = resolve_cached_quote(
+        db,
+        symbol=request.symbol,
+        capability="market.quote.realtime",
+    )
+    latest_bar = daily_selection.bars[-1] if daily_selection.executable else None
+    quote_value = quote_selection.value
+    executable_quote = quote_value if quote_selection.executable else None
     holding = stored_holding
     if request.position_mode == "空仓":
         holding = None
     elif request.position_mode == "持仓" and request.holding_quantity and request.holding_cost_price:
         reference_price = (
-            quote.price
-            if quote
-            else latest_bar.close
-            if latest_bar
+            executable_quote.price
+            if executable_quote
+            else stored_holding.current_price
+            if stored_holding
             else request.holding_cost_price
         )
         holding = SimpleNamespace(
@@ -296,17 +326,18 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
         )
     missing = []
     try:
-        frame = load_qfq_frame(db, request.symbol)
+        frame = load_qfq_frame(
+            db,
+            request.symbol,
+            selection=daily_selection,
+        )
         pattern = _platform_pattern(frame, parameters)
     except ValueError as exc:
         frame, pattern = None, None
         missing.append(str(exc))
-    now = datetime.now()
     data_time = latest_bar.fetched_at.isoformat() if latest_bar else "数据不足"
     data_date = latest_bar.trade_date.isoformat() if latest_bar else None
-    stale = not latest_bar or latest_bar.trade_date < date.today() - timedelta(
-        days=int(parameters["freshness_days"])
-    )
+    stale = not daily_selection.executable
     source = latest_bar.source if latest_bar else "数据不足"
     gates = []
     market_status = (
@@ -453,7 +484,7 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             gates.append(
                 _gate(code, name, "无法判断", "历史行情数据不足。", source, data_time, missing)
             )
-    current_price = float(quote.price) if quote else pattern["latest_close"] if pattern else None
+    current_price = float(executable_quote.price) if executable_quote else None
     stop = None
     stop_distance_pct = None
     entry_reference = None
@@ -670,7 +701,7 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
         {
             "source_id": "account",
             "name": "本地账户设置",
-            "data_date": date.today().isoformat(),
+            "data_date": current_date.isoformat(),
             "fetched_at": now.isoformat(),
             "stale": False,
         },
@@ -684,14 +715,16 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
         {
             "source_id": "market_sector_context",
             "name": "自动市场/行业规则" if request.market_evidence else "用户判断（旧入口）",
-            "data_date": date.today().isoformat(),
+            "data_date": current_date.isoformat(),
             "fetched_at": now.isoformat(),
             "stale": False,
         },
     ]
     preview = {
         "symbol": request.symbol,
-        "company_name": profile.name if profile else quote.name if quote else request.symbol,
+        "company_name": (
+            profile.name if profile else quote_value.name if quote_value else request.symbol
+        ),
         "status": final_status,
         "status_reason": reasons or ["全部关键闸门通过，只有触发条件实际出现时才允许按计划试错。"],
         "missing_conditions": sorted(
@@ -733,6 +766,19 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             if holding
             else "当前账户未持有该股票。",
         },
+        "current_price_available": quote_value is not None,
+        "current_price_executable": quote_selection.executable,
+        "current_price_quality": (
+            quote_selection.effective_quality.effective_quality.value
+        ),
+        "price_trigger_evaluation_skipped": not quote_selection.executable,
+        "price_trigger_blocking_reason": (
+            None if quote_selection.executable else quote_selection.blocking_reason
+        ),
+        "market_data_quality_record_id": daily_selection.quality_record_id,
+        "market_data_quality": (
+            daily_selection.effective_quality.effective_quality.value
+        ),
         "multi_timeframe": {
             "monthly": monthly,
             "weekly": weekly,
@@ -821,9 +867,16 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
     return preview
 
 
-def save_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
+def _persist_generated_plan(
+    db: Session,
+    request: TradePlanSaveRequest,
+    *,
+    analysis_run_id: int | None = None,
+) -> dict:
     preview_request = TradePlanPreviewRequest(
-        **request.model_dump(exclude={"preview_hash", "ai_analysis_id"})
+        **request.model_dump(
+            exclude={"preview_hash", "ai_analysis_id", "decision_package"}
+        )
     )
     preview = generate_trade_plan_preview(db, preview_request)
     if preview["preview_hash"] != request.preview_hash:
@@ -832,6 +885,7 @@ def save_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
         select(TradePlan)
         .where(TradePlan.account_id == request.account_id, TradePlan.symbol == request.symbol)
         .order_by(TradePlan.plan_version.desc(), TradePlan.id.desc())
+        .with_for_update()
     )
     version = (latest.plan_version or 1) + 1 if latest else 1
     buy_zone = preview["buy_plan"]["buy_zone"]
@@ -882,6 +936,7 @@ def save_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
         data_date=date.fromisoformat(preview["data_date"]),
         source="确定性交易计划生成器",
         plan_version=version,
+        analysis_run_id=analysis_run_id,
         parent_plan_id=latest.id if latest else None,
         preview_hash=preview["preview_hash"],
         engine_snapshot=preview,
@@ -913,7 +968,7 @@ def save_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
                 basis=gate["evidence"],
                 missing_data=gate["missing_conditions"],
                 rule_version=rule.version,
-                checked_at=datetime.now(),
+                checked_at=to_market_storage_naive(shanghai_now()),
             )
         )
     from app.services.plan_execution import initialize_plan_execution
@@ -923,7 +978,6 @@ def save_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
         plan,
         request.position_mode or ("持仓" if preview["existing_position"]["exists"] else "空仓"),
     )
-    db.commit()
     return {
         "id": plan.id,
         "account_id": plan.account_id,
@@ -933,6 +987,14 @@ def save_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
         "execution_status": plan.execution_status,
         "preview": preview,
     }
+
+
+def save_generated_plan(db: Session, request: TradePlanSaveRequest) -> dict:
+    raise AppError(
+        422,
+        "DECISION_PACKAGE_REQUIRED",
+        "Formal plans can only be frozen through the governed analysis confirmation endpoint.",
+    )
 
 
 def plan_history(db: Session, account_id: int, symbol: str) -> list[dict]:

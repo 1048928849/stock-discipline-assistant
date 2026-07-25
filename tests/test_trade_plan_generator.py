@@ -4,9 +4,29 @@ from decimal import Decimal
 import pytest
 
 from app.config import Settings
-from app.models import CompanyProfile, MarketDailyBar, MarketQuote
+from app.data_hub.contracts import DailyBar, DataProvider, ProviderMetadata, Quote
+from app.data_hub.market_subjects import stock_daily_subject
+from app.data_hub.registry import ProviderRegistry
+from app.data_hub.router import DataHubRouter
+from app.data_hub.trading_calendar import (
+    SHANGHAI_TZ,
+    get_trading_calendar,
+    shanghai_now,
+)
+from app.models import (
+    CompanyProfile,
+    DataQualityRecord,
+    MarketDailyBar,
+    MarketQuote,
+)
 from app.providers.llm_provider import OpenAICompatibleProvider
+from app.services.market_cache import persist_market_quote, replace_market_series
+from app.services.research_cache import (
+    persist_announcement_catalog,
+    persist_company_profile,
+)
 from app.services.trade_plan_ai import validate_ai_output
+from app.services import trade_plan_generator as trade_plan_generator_service
 from app.services.trade_plan_generator import _floor_lot, ensure_generator_rule_version
 
 
@@ -22,9 +42,50 @@ def create_account(client, assets="100000", cash="80000"):
     ).json()
 
 
+class GeneratorMarketProvider(DataProvider):
+    metadata = ProviderMetadata(
+        provider_id="generator-fixture",
+        supported_capabilities=(
+            "market.daily.qfq",
+            "market.quote.realtime",
+        ),
+        priority=1,
+        realtime_supported=True,
+    )
+
+    def __init__(
+        self,
+        bars,
+        quote,
+        *,
+        provider_id="generator-fixture",
+        priority=1,
+    ):
+        self.metadata = ProviderMetadata(
+            provider_id=provider_id,
+            supported_capabilities=(
+                "market.daily.qfq",
+                "market.quote.realtime",
+                "market.quote.latest_close",
+            ),
+            priority=priority,
+            realtime_supported=True,
+        )
+        self.bars = bars
+        self.quote = quote
+
+    def health_check(self, probe: bool = False):
+        return {"status": "healthy"}
+
+    def get_history(self, symbol, start, end):
+        return self.bars
+
+    def get_quote(self, symbol):
+        return self.quote
+
+
 def seed_pattern(session, symbol="300502", state="ready", price=None):
-    now = datetime.now()
-    start = date.today() - timedelta(days=309)
+    now = shanghai_now()
     rows = []
     for index in range(260):
         close = 5 + index * 0.019
@@ -45,32 +106,60 @@ def seed_pattern(session, symbol="300502", state="ready", price=None):
     else:
         rows.extend([(10.02, 10.15, 9.9, 100.0)] * 3)
     # 让最后一根始终落在今天，满足新鲜度检查。
-    start = date.today() - timedelta(days=len(rows) - 1)
-    for index, (close, high, low, volume) in enumerate(rows):
-        session.add(
-            MarketDailyBar(
-                symbol=symbol,
-                trade_date=start + timedelta(days=index),
-                open=Decimal(str(close - 0.03)),
-                high=Decimal(str(high)),
-                low=Decimal(str(low)),
-                close=Decimal(str(close)),
-                volume=Decimal(str(volume)),
-                source="akshare_tencent_qfq",
-                fetched_at=now,
-            )
-        )
-    latest = price if price is not None else rows[-1][0]
-    session.add(
-        MarketQuote(
+    calendar = get_trading_calendar()
+    latest_session = calendar.latest_completed_session(now)
+    trade_dates = []
+    candidate = latest_session
+    while len(trade_dates) < len(rows):
+        if calendar.is_session(candidate):
+            trade_dates.append(candidate)
+        candidate -= timedelta(days=1)
+    trade_dates.reverse()
+    start = trade_dates[0]
+    bars = [
+        DailyBar(
             symbol=symbol,
-            name="测试公司",
-            price=Decimal(str(latest)),
-            source="akshare_sina",
-            source_api="stock_zh_a_spot",
+            trade_date=trade_dates[index],
+            open=Decimal(str(close - 0.03)),
+            high=Decimal(str(high)),
+            low=Decimal(str(low)),
+            close=Decimal(str(close)),
+            volume=Decimal(str(volume)),
+            adjustment="qfq",
+            price_unit="CNY",
+            volume_unit="share",
+            observed_at=calendar.session_close_at(trade_dates[index]),
+            source="akshare_tencent_qfq",
             fetched_at=now,
         )
+        for index, (close, high, low, volume) in enumerate(rows)
+    ]
+    latest = price if price is not None else rows[-1][0]
+    quote = Quote(
+        symbol=symbol,
+        name="测试公司",
+        price=Decimal(str(latest)),
+        quote_type="realtime",
+        observed_at=now,
+        price_unit="CNY",
+        source="akshare_sina",
+        source_api="stock_zh_a_spot",
+        fetched_at=now,
     )
+    registry = ProviderRegistry()
+    registry.register(GeneratorMarketProvider(bars, quote))
+    router = DataHubRouter(session, registry)
+    history_result = router.get_history(symbol, start, latest_session)
+    replace_market_series(
+        session,
+        router,
+        history_result,
+        history_result.require_value(),
+        subject=stock_daily_subject(symbol, "qfq", "CNY", "share"),
+        min_rows=250,
+    )
+    quote_result = router.get_quote(symbol)
+    persist_market_quote(session, router, quote_result)
     session.commit()
 
 
@@ -88,6 +177,276 @@ def payload(account_id, symbol="300502", **changes):
     }
     result.update(changes)
     return result
+
+
+def _preview_with_fixed_shanghai_clock(client, session, monkeypatch):
+    fixed = datetime(2026, 7, 24, 10, 0, tzinfo=SHANGHAI_TZ)
+    monkeypatch.setattr(__name__ + ".shanghai_now", lambda: fixed)
+    monkeypatch.setattr("app.data_hub.router.shanghai_now", lambda: fixed)
+    monkeypatch.setattr("app.data_hub.effective_quality.shanghai_now", lambda: fixed)
+    monkeypatch.setattr(
+        trade_plan_generator_service,
+        "shanghai_now",
+        lambda: fixed,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        trade_plan_generator_service,
+        "shanghai_today",
+        lambda: fixed.date(),
+        raising=False,
+    )
+    account = create_account(client)
+    seed_pattern(session)
+    response = client.post(
+        "/api/v1/trade-plan-generator/preview",
+        json=payload(account["id"]),
+    )
+    assert response.status_code == 200, response.text
+    return fixed, response.json()
+
+
+def test_preview_generated_at_is_shanghai_aware(client, session, monkeypatch):
+    fixed, preview = _preview_with_fixed_shanghai_clock(
+        client, session, monkeypatch
+    )
+    generated_at = datetime.fromisoformat(preview["generated_at"])
+    assert generated_at == fixed
+    assert generated_at.utcoffset() == timedelta(hours=8)
+
+
+def test_preview_current_dates_use_shanghai_date(client, session, monkeypatch):
+    fixed, preview = _preview_with_fixed_shanghai_clock(
+        client, session, monkeypatch
+    )
+    current_context = {
+        item["source_id"]: item["data_date"]
+        for item in preview["sources"]
+        if item["source_id"] in {"account", "market_sector_context"}
+    }
+    assert current_context == {
+        "account": fixed.date().isoformat(),
+        "market_sector_context": fixed.date().isoformat(),
+    }
+
+
+def test_preview_hash_is_stable_with_injected_shanghai_clock(
+    client, session, monkeypatch
+):
+    fixed, first = _preview_with_fixed_shanghai_clock(client, session, monkeypatch)
+    response = client.post(
+        "/api/v1/trade-plan-generator/preview",
+        json=payload(first["account"]["id"]),
+    )
+    assert response.status_code == 200, response.text
+    second = response.json()
+    assert first["generated_at"] == second["generated_at"] == fixed.isoformat()
+    assert first["preview_hash"] == second["preview_hash"]
+
+
+def _replace_quote_scenario(session, scenario: str, *, price="10.82"):
+    stored = session.query(MarketQuote).filter_by(symbol="300502").one_or_none()
+    if scenario == "stale":
+        stale_at = datetime.now() - timedelta(minutes=31)
+        stored.observed_at = stale_at
+        session.get(DataQualityRecord, stored.quality_record_id).observed_at = stale_at
+    elif scenario == "missing":
+        session.delete(stored)
+    elif scenario == "conflicted":
+        now = shanghai_now()
+        first = Quote(
+            symbol="300502",
+            name="test company",
+            price=Decimal(price),
+            quote_type="realtime",
+            observed_at=now,
+            price_unit="CNY",
+            source="quote-a",
+            source_api="test",
+            fetched_at=now,
+        )
+        second = Quote(
+            symbol="300502",
+            name="test company",
+            price=Decimal("11.82"),
+            quote_type="realtime",
+            observed_at=now,
+            price_unit="CNY",
+            source="quote-b",
+            source_api="test",
+            fetched_at=now,
+        )
+        registry = ProviderRegistry()
+        registry.register(
+            GeneratorMarketProvider([], first, provider_id="quote-a", priority=1)
+        )
+        registry.register(
+            GeneratorMarketProvider([], second, provider_id="quote-b", priority=2)
+        )
+        DataHubRouter(session, registry).get_quote("300502")
+    elif scenario == "latest_close":
+        session.delete(stored)
+        session.flush()
+        calendar = get_trading_calendar()
+        now = calendar.session_close_at(calendar.latest_completed_session())
+        close = Quote(
+            symbol="300502",
+            name="test company",
+            price=Decimal(price),
+            quote_type="latest_close",
+            observed_at=now,
+            price_unit="CNY",
+            source="latest-close",
+            source_api="test",
+            fetched_at=now,
+        )
+        registry = ProviderRegistry()
+        registry.register(
+            GeneratorMarketProvider([], close, provider_id="latest-close")
+        )
+        router = DataHubRouter(session, registry)
+        persist_market_quote(session, router, router.get_latest_close("300502"))
+    else:
+        raise ValueError(scenario)
+    session.commit()
+
+
+def _holding_preview(client, session, scenario: str, **holding_changes):
+    account = create_account(client)
+    seed_pattern(session)
+    holding = {
+        "account_id": account["id"],
+        "symbol": "300502",
+        "name": "test company",
+        "quantity": 100,
+        "cost_price": 9,
+        "current_price": 10.82,
+        "sector": "test sector",
+        "stop_loss_price": 9.5,
+        "target_price": 10.7,
+        "price_source": "manual",
+        **holding_changes,
+    }
+    assert client.post("/api/v1/holdings", json=holding).status_code == 201
+    _replace_quote_scenario(session, scenario)
+    response = client.post(
+        "/api/v1/trade-plan-generator/preview",
+        json=payload(account["id"]),
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def seed_governed_analysis(session, monkeypatch):
+    class GovernedResearchProvider(DataProvider):
+        metadata = ProviderMetadata(
+            provider_id="governed-research",
+            supported_capabilities=(
+                "fundamental.profile",
+                "announcement.catalog",
+            ),
+            priority=1,
+        )
+
+        def health_check(self, probe: bool = False):
+            return {"status": "healthy"}
+
+        def company_profile(self, symbol):
+            return {
+                "name": "测试公司",
+                "industry": "测试行业",
+                "market": "创业板",
+                "main_business": "测试业务",
+            }
+
+        def company_announcements(self, symbol, start, end):
+            return [
+                {
+                    "公告标题": "最新公告",
+                    "公告日期": end.isoformat(),
+                    "公告链接": "https://example.test/announcement",
+                    "目录来源": "exchange_test",
+                }
+            ]
+
+    registry = ProviderRegistry()
+    registry.register(GovernedResearchProvider())
+    router = DataHubRouter(session, registry)
+    profile_result = router.company_profile("300502")
+    persist_company_profile(session, router, profile_result)
+    start = date.today() - timedelta(days=3 * 366)
+    end = date.today()
+    announcement_result = router.company_announcements("300502", start, end)
+    persist_announcement_catalog(
+        session,
+        router,
+        announcement_result,
+        start=start,
+        end=end,
+    )
+    session.commit()
+    now = shanghai_now()
+    calendar = get_trading_calendar()
+    latest_session = calendar.latest_completed_session(now)
+    trade_dates = []
+    candidate = latest_session
+    while len(trade_dates) < 80:
+        if calendar.is_session(candidate):
+            trade_dates.append(candidate)
+        candidate -= timedelta(days=1)
+    trade_dates.reverse()
+    rows = {
+        "rows": [
+            {
+                "date": trade_date,
+                "close": 100 + index,
+                "volume": 1000 + index,
+            }
+            for index, trade_date in enumerate(trade_dates)
+        ],
+        "source": "test",
+        "fetched_at": now,
+    }
+    monkeypatch.setattr(
+        "app.providers.akshare_provider.AKShareProvider.get_index_history",
+        lambda *_: rows,
+    )
+    monkeypatch.setattr(
+        "app.providers.akshare_provider.AKShareProvider.get_sector_history",
+        lambda *_: rows,
+    )
+    monkeypatch.setattr(
+        "app.services.one_click_pipeline.refresh_company_research_if_needed",
+        lambda db, symbol, **kwargs: {
+            "symbol": symbol,
+            "status": "fresh",
+            "sections": {},
+            "updated_at": datetime.now().isoformat(),
+            "checked_at": datetime.now().isoformat(),
+            "refreshed_sections": [],
+            "missing_data": ["financials", "valuation"],
+            "freshness": [],
+        },
+    )
+
+
+def analyze_and_confirm(client, account_id, **changes):
+    request = {
+        "symbol": "300502",
+        "position_mode": "空仓",
+        "account_id": account_id,
+        "enable_ai": False,
+        **changes,
+    }
+    analyzed = client.post(
+        "/api/v1/trade-plan-generator/analyze", json=request
+    ).json()
+    assert analyzed["can_save"] is True, analyzed
+    saved = client.post(
+        f"/api/v1/trade-plan-generator/analyze/{analyzed['run_id']}/confirm"
+    )
+    assert saved.status_code == 201, saved.text
+    return analyzed, saved.json()
 
 
 @pytest.mark.parametrize(
@@ -158,20 +517,28 @@ def test_position_limits_and_risk_setting_change_quantity(client, session):
     assert next(x for x in limited.json()["gates"] if x["code"] == "position")["status"] == "不通过"
 
 
-def test_save_freezes_versions_and_history(client, session):
+def test_generator_golden_rule_numbers_match_main(client, session):
     account = create_account(client)
     seed_pattern(session)
-    request = payload(account["id"])
-    preview = client.post("/api/v1/trade-plan-generator/preview", json=request).json()
-    saved = client.post(
-        "/api/v1/trade-plan-generator/save",
-        json={**request, "preview_hash": preview["preview_hash"]},
-    )
-    assert saved.status_code == 201, saved.text
-    second = client.post(
-        "/api/v1/trade-plan-generator/save",
-        json={**request, "preview_hash": preview["preview_hash"]},
+    preview = client.post(
+        "/api/v1/trade-plan-generator/preview",
+        json=payload(account["id"]),
     ).json()
+    assert preview["status"] == "READY"
+    assert preview["buy_plan"]["buy_zone"] == [10.4209, 10.5391]
+    assert preview["buy_plan"]["hard_stop"] == 9.7023
+    assert preview["position_calculation"]["final_allowed_quantity"] == 600
+    assert preview["position_calculation"]["trial_quantity"] == 100
+    assert preview["position_calculation"]["per_share_risk"] == 0.7777
+    assert preview["position_calculation"]["maximum_loss"] == 77.77
+
+
+def test_save_freezes_versions_and_history(client, session, monkeypatch):
+    account = create_account(client)
+    seed_pattern(session)
+    seed_governed_analysis(session, monkeypatch)
+    _, saved = analyze_and_confirm(client, account["id"], max_position_pct=20)
+    _, second = analyze_and_confirm(client, account["id"], max_position_pct=20)
     history = client.get(
         f"/api/v1/trade-plan-generator/history?account_id={account['id']}&symbol=300502"
     ).json()
@@ -225,6 +592,97 @@ def test_holding_confirmation_add_stop_reduction_and_industry_limit(client, sess
         "/api/v1/trade-plan-generator/holding-check", json=payload(account["id"])
     ).json()
     assert stopped["existing_position"]["hard_stop_triggered"] is True
+
+
+def test_direct_preview_stale_quote_skips_price_triggers(client, session):
+    preview = _holding_preview(client, session, "stale")
+    assert preview["current_price_quality"] == "STALE"
+    assert preview["current_price_executable"] is False
+    assert preview["price_trigger_evaluation_skipped"] is True
+    assert preview["existing_position"]["current_price"] is None
+
+
+def test_direct_preview_conflicted_quote_skips_price_triggers(client, session):
+    preview = _holding_preview(client, session, "conflicted")
+    assert preview["current_price_quality"] == "CONFLICTED"
+    assert preview["current_price_executable"] is False
+    assert preview["price_trigger_evaluation_skipped"] is True
+
+
+def test_direct_preview_missing_quote_skips_price_triggers(client, session):
+    preview = _holding_preview(client, session, "missing")
+    assert preview["current_price_quality"] == "MISSING"
+    assert preview["current_price_available"] is False
+    assert preview["price_trigger_evaluation_skipped"] is True
+
+
+def test_direct_preview_latest_close_does_not_trigger_realtime_rules(client, session):
+    preview = _holding_preview(client, session, "latest_close", stop_loss_price=11)
+    assert preview["current_price_quality"] == "MISSING"
+    assert preview["existing_position"]["current_price"] is None
+    assert preview["existing_position"]["hard_stop_triggered"] is False
+
+
+def test_holding_hard_stop_not_evaluated_with_untrusted_quote(client, session):
+    preview = _holding_preview(client, session, "conflicted", stop_loss_price=11)
+    assert preview["existing_position"]["hard_stop_triggered"] is False
+
+
+def test_holding_reduction_not_evaluated_with_untrusted_quote(client, session):
+    preview = _holding_preview(client, session, "stale", target_price=10)
+    assert preview["existing_position"]["first_reduction_triggered"] is False
+
+
+def test_holding_add_not_evaluated_with_untrusted_quote(client, session):
+    preview = _holding_preview(client, session, "missing", cost_price=8)
+    assert preview["existing_position"]["confirmation_add_allowed"] is False
+
+
+def test_preview_metadata_comes_from_selected_daily_lineage(client, session):
+    account = create_account(client)
+    seed_pattern(session)
+    selected = session.query(MarketDailyBar).order_by(MarketDailyBar.trade_date).all()
+    quality_record_id = selected[0].quality_record_id
+    preview = client.post(
+        "/api/v1/trade-plan-generator/preview", json=payload(account["id"])
+    ).json()
+    assert preview["market_data_quality_record_id"] == quality_record_id
+    assert preview["data_date"] == selected[-1].trade_date.isoformat()
+    assert preview["sources"][0]["name"] == selected[-1].source
+
+
+def test_invalid_newer_bar_lineage_does_not_change_preview_metadata(client, session):
+    account = create_account(client)
+    seed_pattern(session)
+    trusted = session.query(MarketDailyBar).order_by(MarketDailyBar.trade_date).all()
+    trusted_record_id = trusted[0].quality_record_id
+    session.add(
+        MarketDailyBar(
+            symbol="300502",
+            trade_date=date.today() + timedelta(days=1),
+            open=Decimal("20"),
+            high=Decimal("20"),
+            low=Decimal("20"),
+            close=Decimal("20"),
+            volume=Decimal("100"),
+            adjustment="qfq",
+            price_unit="CNY",
+            volume_unit="share",
+            observed_at=datetime.now(),
+            quality_status="SINGLE_SOURCE",
+            quality_record_id=None,
+            source="invalid-newer-row",
+            fetched_at=datetime.now(),
+        )
+    )
+    session.commit()
+
+    preview = client.post(
+        "/api/v1/trade-plan-generator/preview", json=payload(account["id"])
+    ).json()
+    assert preview["market_data_quality_record_id"] == trusted_record_id
+    assert preview["data_date"] == trusted[-1].trade_date.isoformat()
+    assert preview["sources"][0]["name"] != "invalid-newer-row"
 
 
 def evidence_package(symbol="300502"):
@@ -293,7 +751,9 @@ def valid_ai_result(package=None):
 def test_ai_schema_and_source_validation():
     output, validation = validate_ai_output(valid_ai_result(), evidence_package())
     assert output["ai_summaries"]
+    assert output["ai_summaries"][0]["evidence_ids"] == ["financial:1"]
     assert validation["valid"] is True
+    assert validation["cited_evidence_ids"] == ["financial:1"]
     bad = valid_ai_result()
     bad["supporting_evidence"][0]["source_ids"] = ["missing:9"]
     with pytest.raises(ValueError, match="不存在"):
@@ -486,15 +946,14 @@ def test_ai_timeout_is_audited_without_breaking_rule_plan(client, session, monke
     assert preview["status"] == "READY"
 
 
-def test_confirmed_plan_manual_fills_and_execution_deviations(client, session):
+def test_confirmed_plan_manual_fills_and_execution_deviations(
+    client, session, monkeypatch
+):
     account = create_account(client)
     seed_pattern(session)
-    request = payload(account["id"])
-    preview = client.post("/api/v1/trade-plan-generator/preview", json=request).json()
-    saved = client.post(
-        "/api/v1/trade-plan-generator/save",
-        json={**request, "preview_hash": preview["preview_hash"]},
-    ).json()
+    seed_governed_analysis(session, monkeypatch)
+    analyzed, saved = analyze_and_confirm(client, account["id"])
+    preview = analyzed["plan"]
     plan_id = saved["id"]
     assert saved["execution_status"] in {"entry_triggered", "waiting_entry"}
     buy_price = preview["buy_plan"]["buy_zone"][0]
