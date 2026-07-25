@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timezone
 import json
 
@@ -9,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.data_hub.contracts import ProviderUnavailableError
 from app.data_hub.effective_quality import resolve_effective_quality
+from app.data_hub.quality import canonical_digest, policy_for
 from app.data_hub.research_subjects import (
     announcement_catalog_subject,
     company_profile_subject,
@@ -25,6 +27,9 @@ from app.models import (
 
 PROFILE_CAPABILITY = "fundamental.profile"
 ANNOUNCEMENT_CAPABILITY = "announcement.catalog"
+PAYLOAD_LINEAGE_ERROR = (
+    "research persistence payload does not match quality lineage"
+)
 
 
 @dataclass(frozen=True)
@@ -54,6 +59,21 @@ class CachedAnnouncementCatalogSelection:
     structure_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class _PreparedAnnouncementRow:
+    symbol: str
+    title: str
+    announcement_category: str
+    risk_level: str
+    published_date: date
+    catalog_source: str
+    exchange: str
+    url: str
+    source_document_url: str | None
+    raw_data: dict
+    fetched_at: datetime
+
+
 def _naive_utc(value: datetime | None) -> datetime | None:
     if value is None:
         return None
@@ -81,26 +101,126 @@ def _require_lineage(
     return router.validate_persistence_result(result)
 
 
+def _validated_payload_snapshot(
+    router: DataHubRouter,
+    result: ProviderResult,
+    *,
+    capability: str,
+    subject: SubjectRef,
+) -> tuple[dict | list, DataQualityRecord]:
+    try:
+        snapshot = deepcopy(result.value)
+        if capability == PROFILE_CAPABILITY:
+            if not isinstance(snapshot, dict) or not snapshot:
+                raise ValueError("profile payload must be a non-empty mapping")
+        else:
+            if not isinstance(snapshot, list):
+                raise ValueError("announcement payload must be a list")
+        expected_row_count = router.payload_row_count(capability, snapshot)
+        record = _require_lineage(
+            router,
+            result,
+            capability=capability,
+            subject=subject,
+        )
+        recomputed_digest = canonical_digest(snapshot, policy_for(capability))
+        if (
+            recomputed_digest != result.normalized_digest
+            or recomputed_digest != record.normalized_digest
+            or record.row_count != expected_row_count
+        ):
+            raise ValueError("payload digest or row count mismatch")
+        return snapshot, record
+    except (ProviderUnavailableError, TypeError, ValueError) as exc:
+        raise ProviderUnavailableError(PAYLOAD_LINEAGE_ERROR) from exc
+
+
+def _preflight_announcements(
+    snapshot: list,
+    *,
+    symbol: str,
+    start: date,
+    end: date,
+    fetched_at: datetime,
+) -> list[_PreparedAnnouncementRow]:
+    from app.services.company_research import _announcement_fields, classify_announcement
+
+    prepared: list[_PreparedAnnouncementRow] = []
+    urls: set[str] = set()
+    for row in snapshot:
+        if not isinstance(row, dict):
+            raise ProviderUnavailableError("announcement catalog row must be a mapping")
+        raw_title = row.get("公告标题") or row.get("标题") or row.get("title")
+        if not isinstance(raw_title, str) or not raw_title.strip():
+            raise ProviderUnavailableError("announcement catalog row has no title")
+        try:
+            title, published, url, catalog = _announcement_fields(row)
+        except Exception as exc:
+            raise ProviderUnavailableError(
+                "announcement catalog row cannot be parsed"
+            ) from exc
+        title = title.strip()
+        url = url.strip()
+        catalog = catalog.strip()
+        if not title:
+            raise ProviderUnavailableError("announcement catalog row has no title")
+        if not url:
+            raise ProviderUnavailableError("announcement catalog row has no URL")
+        try:
+            in_requested_coverage = (
+                isinstance(published, date) and start <= published <= end
+            )
+        except (TypeError, ValueError):
+            in_requested_coverage = False
+        if not in_requested_coverage:
+            raise ProviderUnavailableError(
+                "announcement catalog row is outside requested coverage"
+            )
+        if url in urls:
+            raise ProviderUnavailableError("announcement catalog contains duplicate URLs")
+        urls.add(url)
+        category, risk = classify_announcement(title)
+        prepared.append(
+            _PreparedAnnouncementRow(
+                symbol=symbol,
+                title=title,
+                announcement_category=category,
+                risk_level=risk,
+                published_date=published,
+                catalog_source=catalog,
+                exchange="上交所" if symbol.startswith(("5", "6", "9")) else "深交所",
+                url=url,
+                source_document_url=None,
+                raw_data=_json_value(row),
+                fetched_at=fetched_at,
+            )
+        )
+    if len(prepared) != len(snapshot):
+        raise ProviderUnavailableError(
+            "prepared announcement row count does not match provider payload"
+        )
+    return prepared
+
+
 def persist_company_profile(
     db: Session,
     router: DataHubRouter,
     result: ProviderResult,
 ) -> CompanyProfile:
-    payload = result.value
-    if not isinstance(payload, dict):
-        raise ProviderUnavailableError("company profile payload must be a mapping")
     subject = result.subject
     if subject is None:
         raise ProviderUnavailableError("company profile result has no subject")
     expected = company_profile_subject(subject.subject_id)
-    record = _require_lineage(
-        router, result, capability=PROFILE_CAPABILITY, subject=expected
+    payload, record = _validated_payload_snapshot(
+        router,
+        result,
+        capability=PROFILE_CAPABILITY,
+        subject=expected,
     )
     if _naive_utc(record.observed_at) != _naive_utc(result.fetched_at):
         raise ProviderUnavailableError("company profile lineage time does not match fetch")
 
     symbol = expected.subject_id
-    profile = db.scalar(select(CompanyProfile).where(CompanyProfile.symbol == symbol))
     values = {
         "name": str(
             payload.get("A股简称")
@@ -121,14 +241,18 @@ def persist_company_profile(
         "fetched_at": _naive_utc(result.fetched_at),
         "quality_record_id": record.id,
     }
-    if profile is None:
-        profile = CompanyProfile(symbol=symbol, **values)
-        db.add(profile)
-    else:
-        for key, value in values.items():
-            setattr(profile, key, value)
-    db.flush()
-    router.mark_persisted(result, cached_at=result.fetched_at)
+    with db.begin_nested():
+        profile = db.scalar(
+            select(CompanyProfile).where(CompanyProfile.symbol == symbol)
+        )
+        if profile is None:
+            profile = CompanyProfile(symbol=symbol, **values)
+            db.add(profile)
+        else:
+            for key, value in values.items():
+                setattr(profile, key, value)
+        db.flush()
+        router.mark_persisted(result, cached_at=result.fetched_at)
     return profile
 
 
@@ -140,13 +264,14 @@ def persist_announcement_catalog(
     start: date,
     end: date,
 ) -> CompanyResearchRefresh:
-    if not isinstance(result.value, list):
-        raise ProviderUnavailableError("announcement catalog payload must be a list")
     subject = announcement_catalog_subject(
         result.subject.subject_id if result.subject else "", start, end
     )
-    record = _require_lineage(
-        router, result, capability=ANNOUNCEMENT_CAPABILITY, subject=subject
+    snapshot, record = _validated_payload_snapshot(
+        router,
+        result,
+        capability=ANNOUNCEMENT_CAPABILITY,
+        subject=subject,
     )
     expected_start = datetime.combine(start, time.min)
     expected_end = datetime.combine(end, time.max)
@@ -162,50 +287,19 @@ def persist_announcement_catalog(
         raise ProviderUnavailableError("announcement catalog scan lineage is inconsistent")
 
     symbol = subject.subject_id
-    db.execute(
-        delete(CompanyAnnouncement).where(
-            CompanyAnnouncement.symbol == symbol,
-            CompanyAnnouncement.published_date >= start,
-            CompanyAnnouncement.published_date <= end,
-        )
-    )
-    from app.services.company_research import _announcement_fields, classify_announcement
-
-    for row in result.value:
-        if not isinstance(row, dict):
-            raise ProviderUnavailableError("announcement catalog row must be a mapping")
-        title, published, url, catalog = _announcement_fields(row)
-        if not url:
-            continue
-        category, risk = classify_announcement(title)
-        db.add(
-            CompanyAnnouncement(
-                symbol=symbol,
-                title=title,
-                announcement_category=category,
-                risk_level=risk,
-                published_date=published,
-                catalog_source=catalog or result.provider_id,
-                exchange="上交所" if symbol.startswith(("5", "6", "9")) else "深交所",
-                url=url,
-                source_document_url=None,
-                raw_data=_json_value(row),
-                fetched_at=_naive_utc(result.fetched_at),
-            )
-        )
-
-    refresh = db.scalar(
-        select(CompanyResearchRefresh).where(
-            CompanyResearchRefresh.symbol == symbol,
-            CompanyResearchRefresh.section == "announcements",
-        )
+    prepared = _preflight_announcements(
+        snapshot,
+        symbol=symbol,
+        start=start,
+        end=end,
+        fetched_at=_naive_utc(result.fetched_at),
     )
     checked_at = _naive_utc(result.checked_at)
     values = {
         "status": "success",
         "provider_id": result.provider_id,
         "source_name": result.provider_id,
-        "row_count": len(result.value),
+        "row_count": len(snapshot),
         "cache_used": False,
         "last_attempt_at": checked_at,
         "last_success_at": checked_at,
@@ -223,16 +317,31 @@ def persist_announcement_catalog(
         "error": None,
         "quality_record_id": record.id,
     }
-    if refresh is None:
-        refresh = CompanyResearchRefresh(
-            symbol=symbol, section="announcements", **values
+    with db.begin_nested():
+        refresh = db.scalar(
+            select(CompanyResearchRefresh).where(
+                CompanyResearchRefresh.symbol == symbol,
+                CompanyResearchRefresh.section == "announcements",
+            )
         )
-        db.add(refresh)
-    else:
-        for key, value in values.items():
-            setattr(refresh, key, value)
-    db.flush()
-    router.mark_persisted(result, cached_at=result.fetched_at)
+        db.execute(
+            delete(CompanyAnnouncement).where(
+                CompanyAnnouncement.symbol == symbol,
+                CompanyAnnouncement.published_date >= start,
+                CompanyAnnouncement.published_date <= end,
+            )
+        )
+        db.add_all([CompanyAnnouncement(**asdict(row)) for row in prepared])
+        if refresh is None:
+            refresh = CompanyResearchRefresh(
+                symbol=symbol, section="announcements", **values
+            )
+            db.add(refresh)
+        else:
+            for key, value in values.items():
+                setattr(refresh, key, value)
+        db.flush()
+        router.mark_persisted(result, cached_at=result.fetched_at)
     return refresh
 
 

@@ -289,6 +289,15 @@ class DataHubRouter:
             return sum(len(item) for item in value.values() if isinstance(item, list))
         return 1 if value is not None else 0
 
+    @classmethod
+    def payload_row_count(cls, capability: str, value: Any) -> int:
+        """Return the business row count used by quality audit and persistence."""
+        if capability == "fundamental.profile":
+            return 1 if isinstance(value, dict) and bool(value) else 0
+        if capability == "announcement.catalog":
+            return len(value) if isinstance(value, list) else cls._row_count(value)
+        return cls._row_count(value)
+
     @staticmethod
     def _parse_time(value: Any) -> datetime | date | None:
         if isinstance(value, (datetime, date)):
@@ -576,7 +585,7 @@ class DataHubRouter:
             adjustment=result.adjustment,
             price_unit=result.price_unit,
             volume_unit=result.volume_unit,
-            row_count=self._row_count(result.value),
+            row_count=self.payload_row_count(result.capability, result.value),
             fallback_used=result.fallback_used,
             cache_used=result.cache_used,
             trusted=result.quality_status in TRUSTED_QUALITY_STATUSES,
@@ -760,7 +769,7 @@ class DataHubRouter:
                     status="success",
                     started=started,
                     duration_ms=duration_ms,
-                    row_count=self._row_count(value),
+                    row_count=self.payload_row_count(capability, value),
                     fallback_used=index > 0,
                 )
                 if not policy.verify_multiple_sources:
@@ -845,7 +854,7 @@ class DataHubRouter:
 
         if cache_loader and policy.allow_cache_fallback:
             cached = cache_loader()
-            if cached is not None and self._row_count(cached) > 0:
+            if cached is not None and self.payload_row_count(capability, cached) > 0:
                 now = datetime.now()
                 observed_at = self._observed_at(capability, cached, now)
                 digest = canonical_digest(cached, policy)
@@ -896,7 +905,7 @@ class DataHubRouter:
                     status="cache_fallback",
                     started=now,
                     duration_ms=0,
-                    row_count=self._row_count(cached),
+                    row_count=self.payload_row_count(capability, cached),
                     fallback_used=True,
                     cache_used=True,
                     error="; ".join(errors)[:2000] or None,
