@@ -9,12 +9,14 @@ from sqlalchemy.orm import Session
 
 from app.domain.models import (
     MARKET_EVIDENCE_CAPABILITIES,
+    PRODUCT_EVIDENCE_CAPABILITIES,
     SOURCE_EVIDENCE_CAPABILITIES,
     DecisionPackage,
 )
 from app.errors import AppError
 from app.schemas_workflow import TradePlanPreviewRequest, TradePlanSaveRequest
 from app.services.market_cache import resolve_market_quality_binding
+from app.services.product_data import resolve_product_cache
 from app.services.research_cache import (
     resolve_cached_announcement_catalog,
     resolve_cached_company_profile,
@@ -22,8 +24,14 @@ from app.services.research_cache import (
 from app.data_hub.trading_calendar import (
     market_storage_naive_to_aware,
     shanghai_now,
+    storage_naive_to_aware,
+    time_storage_semantics_for_capability,
     to_shanghai_aware,
 )
+from app.domain.quality_subject import SubjectRef
+from app.models import DataQualityRecord
+from app.strategies import CoreDisciplineStrategy
+from app.strategies.contracts import StrategySignal
 
 
 MAX_ANALYSIS_AGE = timedelta(hours=24)
@@ -60,7 +68,8 @@ def _validated_package(
         for item in raw_evidence
         if isinstance(item, dict)
         and item.get("required")
-        and item.get("capability") in MARKET_EVIDENCE_CAPABILITIES
+        and item.get("capability")
+        in {**MARKET_EVIDENCE_CAPABILITIES, **PRODUCT_EVIDENCE_CAPABILITIES}
     ]
     if any(not item.get("market_quality_binding") for item in required_market_evidence):
         raise AppError(
@@ -137,6 +146,8 @@ def freeze_trade_plan(
     for evidence in package.evidence:
         if not evidence.required or evidence.capability not in MARKET_EVIDENCE_CAPABILITIES:
             continue
+        if evidence.capability in PRODUCT_EVIDENCE_CAPABILITIES:
+            continue
         validation = resolve_market_quality_binding(
             db,
             evidence.market_quality_binding,
@@ -147,6 +158,96 @@ def freeze_trade_plan(
                 422,
                 validation.error_code or "MARKET_BINDING_NOT_EXECUTABLE",
                 f"Market Evidence {evidence.evidence_id} changed: {validation.reason}",
+            )
+
+    for evidence in package.evidence:
+        if not evidence.required or evidence.capability not in PRODUCT_EVIDENCE_CAPABILITIES:
+            continue
+        binding = evidence.market_quality_binding
+        subject = SubjectRef(
+            subject_type=binding.subject_type,
+            subject_id=binding.subject_id,
+            semantic_key=binding.semantic_key,
+        )
+        selection = resolve_product_cache(
+            db,
+            capability=binding.data_capability,
+            subject=subject,
+            evaluated_at=now,
+        )
+        record = db.get(DataQualityRecord, binding.quality_record_id)
+        expected_digest = evidence.payload.get("normalized_digest")
+        evidence_fetched_at = (
+            datetime.fromisoformat(evidence.fetched_at.replace("Z", "+00:00"))
+            if evidence.fetched_at
+            else None
+        )
+        record_fetched_at = (
+            storage_naive_to_aware(
+                record.fetched_at,
+                semantics=time_storage_semantics_for_capability(record.capability),
+            )
+            if record
+            else None
+        )
+        if not selection.executable:
+            raise AppError(
+                422,
+                "PRODUCT_BINDING_NOT_EXECUTABLE",
+                f"Product Evidence {evidence.evidence_id} changed: "
+                f"{selection.blocking_reason or 'not executable'}",
+            )
+        if (
+            selection.subject != subject
+            or selection.quality_record_id != binding.quality_record_id
+            or selection.observed_at != binding.observed_at
+            or record is None
+            or record.normalized_digest != expected_digest
+            or record_fetched_at != evidence_fetched_at
+            or len(selection.rows) != evidence.payload.get("row_count")
+        ):
+            raise AppError(
+                422,
+                "PRODUCT_BINDING_CHANGED",
+                f"Product Evidence {evidence.evidence_id} uses different lineage.",
+            )
+
+    signals = {}
+    for raw_signal in package.strategy_signals:
+        try:
+            signal = StrategySignal.model_validate(raw_signal)
+        except ValidationError as exc:
+            raise AppError(
+                422,
+                "STRATEGY_BINDING_CHANGED",
+                "Strategy signal integrity changed; run a new analysis.",
+            ) from exc
+        signals[(signal.strategy_id, signal.strategy_version)] = signal
+    current_core = CoreDisciplineStrategy()
+    for binding in package.strategy_bindings:
+        signal = signals.get((binding.strategy_id, binding.strategy_version))
+        if signal is None:
+            raise AppError(
+                422,
+                "STRATEGY_BINDING_CHANGED",
+                "Strategy binding has no exact signal; run a new analysis.",
+            )
+        if binding.strategy_id == current_core.strategy_id:
+            manifest = current_core.manifest()
+            if (
+                binding.strategy_version != manifest.version
+                or binding.implementation_hash != manifest.implementation_hash
+            ):
+                raise AppError(
+                    422,
+                    "STRATEGY_IMPLEMENTATION_CHANGED",
+                    "Strategy implementation changed; run a new analysis.",
+                )
+        else:
+            raise AppError(
+                422,
+                "STRATEGY_NOT_REGISTERED",
+                "Strategy is no longer registered; run a new analysis.",
             )
 
     for evidence in package.evidence:

@@ -29,6 +29,20 @@ MARKET_EVIDENCE_CAPABILITIES: dict[str, str] = {
     "benchmark_daily_bars": "market.index_daily",
     "sector_daily_bars": "market.sector_daily",
 }
+PRODUCT_EVIDENCE_CAPABILITIES: dict[str, str] = {
+    "market.intraday.60m": "market.intraday.60m",
+    "market.turnover.daily": "market.turnover.daily",
+    "market.breadth.daily": "market.breadth.daily",
+    "market.amount.daily": "market.amount.daily",
+    "market.industry.daily": "market.industry.daily",
+    "market.industry.constituents": "market.industry.constituents",
+    "company.concepts": "company.concepts",
+    "company.industry_chain": "company.industry_chain",
+}
+EXACT_QUALITY_BINDING_CAPABILITIES = {
+    **MARKET_EVIDENCE_CAPABILITIES,
+    **PRODUCT_EVIDENCE_CAPABILITIES,
+}
 MARKET_BINDING_REQUIRED_REASON = (
     "required market Evidence is missing a quality binding"
 )
@@ -248,6 +262,27 @@ class QualitySnapshotItem(DomainModel):
     providers: list[str] = Field(default_factory=list, max_length=100)
 
 
+class StrategyBinding(DomainModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    strategy_id: str = Field(min_length=3, max_length=64)
+    strategy_version: str = Field(min_length=1, max_length=40)
+    implementation_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+    parameter_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+    signal_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+    binding_hash: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+    @model_validator(mode="after")
+    def deterministic_binding_hash(self):
+        expected = _canonical_hash(
+            self.model_dump(mode="json", exclude={"binding_hash"})
+        )
+        if self.binding_hash is not None and self.binding_hash != expected:
+            raise ValueError("binding_hash does not match strategy binding")
+        object.__setattr__(self, "binding_hash", expected)
+        return self
+
+
 def _canonical_hash(value: Any) -> str:
     encoded = json.dumps(
         value,
@@ -279,6 +314,20 @@ class DecisionPackage(DomainModel):
     quality_snapshot: dict[str, QualitySnapshotItem]
     rule_snapshot: dict[str, Any]
     account_snapshot: dict[str, Any]
+    required_data_summary: dict[str, Any] | None = None
+    market_regime: dict[str, Any] | None = None
+    industry_context: dict[str, Any] | None = None
+    concept_chain_context: dict[str, Any] | None = None
+    technical_context: dict[str, Any] | None = None
+    buy_point_assessment: dict[str, Any] | None = None
+    position_constraints: dict[str, Any] | None = None
+    risk_plan: dict[str, Any] | None = None
+    exit_plan: dict[str, Any] | None = None
+    product_snapshot_hash: str | None = Field(
+        default=None, pattern=r"^[a-f0-9]{64}$"
+    )
+    strategy_bindings: list[StrategyBinding] = Field(default_factory=list, max_length=20)
+    strategy_signals: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
     legacy_preview_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
     package_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
 
@@ -328,6 +377,8 @@ class DecisionPackage(DomainModel):
         }
         if self.research_decision.result:
             references.update(self.research_decision.result.evidence_ids)
+        for signal in self.strategy_signals:
+            references.update(signal.get("evidence_refs") or [])
         unknown = sorted(references - known)
         if unknown:
             raise ValueError(f"DecisionPackage references unknown evidence_id: {unknown}")
@@ -343,10 +394,28 @@ class DecisionPackage(DomainModel):
             raise ValueError(
                 f"DecisionPackage missing required capabilities: {missing_capabilities}"
             )
+        bindings = {
+            (item.strategy_id, item.strategy_version): item
+            for item in self.strategy_bindings
+        }
+        if len(bindings) != len(self.strategy_bindings):
+            raise ValueError("DecisionPackage has duplicate strategy bindings")
+        for signal in self.strategy_signals:
+            key = (signal.get("strategy_id"), signal.get("strategy_version"))
+            binding = bindings.get(key)
+            if binding is None:
+                raise ValueError("strategy signal is missing its exact binding")
+            if (
+                signal.get("parameter_hash") != binding.parameter_hash
+                or signal.get("signal_hash") != binding.signal_hash
+            ):
+                raise ValueError("strategy signal does not match its exact binding")
         market_bindings: dict[str, set[str]] = {}
         missing_market_bindings = []
         for item in self.evidence:
-            expected_data_capability = MARKET_EVIDENCE_CAPABILITIES.get(item.capability)
+            expected_data_capability = EXACT_QUALITY_BINDING_CAPABILITIES.get(
+                item.capability
+            )
             if not item.required or expected_data_capability is None:
                 continue
             binding = item.market_quality_binding

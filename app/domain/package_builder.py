@@ -10,6 +10,7 @@ from app.domain.models import (
     Evidence,
     MARKET_BINDING_REQUIRED_REASON,
     MARKET_EVIDENCE_CAPABILITIES,
+    PRODUCT_EVIDENCE_CAPABILITIES,
     SOURCE_BINDING_REQUIRED_REASON,
     SOURCE_EVIDENCE_CAPABILITIES,
     MarketQualityBinding,
@@ -233,6 +234,7 @@ def build_decision_package(
     steps: list[dict[str, Any]],
     ai_result: dict[str, Any],
     orchestrator_id: str,
+    product_result: dict[str, Any] | None = None,
 ) -> DecisionPackage:
     symbol = preview["symbol"]
     evidence_by_id: dict[str, Evidence] = {}
@@ -256,6 +258,9 @@ def build_decision_package(
             evidence_by_id[optional.evidence_id] = optional
     for source in ai_result.get("sources") or []:
         item = _source_evidence(source, symbol)
+        evidence_by_id[item.evidence_id] = item
+    for raw_evidence in (product_result or {}).get("evidence", []):
+        item = Evidence.model_validate(raw_evidence)
         evidence_by_id[item.evidence_id] = item
     promoted_required = set(
         preview.get("required_research_capabilities") or []
@@ -295,7 +300,10 @@ def build_decision_package(
         research_evidence_ids = ["pipeline:company_risk"]
 
     calculations = preview.get("position_calculation") or {}
-    hard_stop = preview.get("buy_plan", {}).get("hard_stop")
+    product_decision = (product_result or {}).get("trade_decision") or {}
+    product_position = product_decision.get("position_constraints") or {}
+    product_risk = product_decision.get("risk_plan") or {}
+    hard_stop = product_risk.get("hard_stop") or preview.get("buy_plan", {}).get("hard_stop")
     rule_status = preview["status"]
     executable_status = "WAIT" if blocked and rule_status == "READY" else rule_status
     executable_decision_code = (
@@ -310,6 +318,9 @@ def build_decision_package(
         }
         else decision["status"]
     )
+    if product_decision.get("executable_status") == "WAIT":
+        executable_status = "WAIT"
+        executable_decision_code = "WAIT"
     executable_label = (
         "等待可靠数据"
         if executable_decision_code == "WAIT" and executable_decision_code != decision["status"]
@@ -325,7 +336,8 @@ def build_decision_package(
         blocked_reasons.append("missing buy zone, hard stop, or market date")
     missing_market_binding = any(
         item.required
-        and item.capability in MARKET_EVIDENCE_CAPABILITIES
+        and item.capability
+        in {**MARKET_EVIDENCE_CAPABILITIES, **PRODUCT_EVIDENCE_CAPABILITIES}
         and item.market_quality_binding is None
         for item in evidence
     )
@@ -341,6 +353,11 @@ def build_decision_package(
     if missing_source_binding:
         freeze_allowed = False
         blocked_reasons.append(SOURCE_BINDING_REQUIRED_REASON)
+    product_blocked_reasons = list(product_decision.get("blocked_reasons") or [])
+    if product_blocked_reasons:
+        ready_allowed = False
+        freeze_allowed = False
+        blocked_reasons.extend(product_blocked_reasons)
 
     optional_unavailable = sorted(
         {
@@ -391,8 +408,12 @@ def build_decision_package(
                 ),
                 "partial",
             ),
-            final_position_quantity=int(calculations.get("final_allowed_quantity", 0)),
-            trial_quantity=int(calculations.get("trial_quantity", 0)),
+            final_position_quantity=int(
+                product_position.get("target_quantity", calculations.get("final_allowed_quantity", 0))
+            ),
+            trial_quantity=int(
+                product_position.get("trial_quantity", calculations.get("trial_quantity", 0))
+            ),
             hard_stop=Decimal(str(hard_stop)) if hard_stop is not None else None,
             hard_stop_triggered=bool(existing.get("hard_stop_triggered")),
             calculations=calculations,
@@ -414,14 +435,36 @@ def build_decision_package(
         quality_status=quality,
         ready_allowed=ready_allowed,
         freeze_allowed=freeze_allowed,
-        blocked_reasons=blocked_reasons,
+        blocked_reasons=sorted(set(blocked_reasons)),
         required_capabilities=sorted(
-            {*REQUIRED_CAPABILITIES, *promoted_required}
+            {
+                *REQUIRED_CAPABILITIES,
+                *promoted_required,
+                *(
+                    item.capability
+                    for item in evidence
+                    if item.required and item.evidence_id.startswith("product:")
+                ),
+            }
         ),
         evidence_digest="0" * 64,
         quality_snapshot=_quality_snapshot(evidence),
         rule_snapshot=preview["rule"],
         account_snapshot=preview["account"],
+        required_data_summary=(product_result or {}).get("required_data"),
+        market_regime=(product_result or {}).get("market_regime"),
+        industry_context=(product_result or {}).get("industry_context"),
+        concept_chain_context=(product_result or {}).get("concept_chain_context"),
+        technical_context=(product_result or {}).get("technical_context"),
+        buy_point_assessment=product_decision.get("buy_point_assessment"),
+        position_constraints=product_position or None,
+        risk_plan=product_risk or None,
+        exit_plan=product_decision.get("exit_plan"),
+        product_snapshot_hash=(product_result or {}).get("snapshot", {}).get(
+            "snapshot_hash"
+        ),
+        strategy_bindings=(product_result or {}).get("strategy_bindings", []),
+        strategy_signals=(product_result or {}).get("strategy_signals", []),
         legacy_preview_hash=preview["preview_hash"],
         package_hash="0" * 64,
     )

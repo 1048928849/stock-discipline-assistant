@@ -10,6 +10,7 @@ from app.domain.models import (
     RiskDecision,
     StrategyDecision,
     SourceQualityBinding,
+    StrategyBinding,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "RiskDecision",
     "StrategyDecision",
     "SourceQualityBinding",
+    "StrategyBinding",
 ]
