@@ -9,6 +9,7 @@ from app.domain.models import (
     ResearchUncertainty,
     RiskDecision,
     StrategyDecision,
+    SourceQualityBinding,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "ResearchUncertainty",
     "RiskDecision",
     "StrategyDecision",
+    "SourceQualityBinding",
 ]

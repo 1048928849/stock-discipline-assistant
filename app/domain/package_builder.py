@@ -9,6 +9,8 @@ from app.domain.models import (
     Evidence,
     MARKET_BINDING_REQUIRED_REASON,
     MARKET_EVIDENCE_CAPABILITIES,
+    SOURCE_BINDING_REQUIRED_REASON,
+    SOURCE_EVIDENCE_CAPABILITIES,
     MarketQualityBinding,
     MarketSnapshot,
     QualitySnapshotItem,
@@ -17,6 +19,7 @@ from app.domain.models import (
     ResearchResult,
     ResearchUncertainty,
     RiskDecision,
+    SourceQualityBinding,
     StrategyDecision,
 )
 from app.domain.quality import DataQualityStatus, worst_quality
@@ -73,6 +76,12 @@ def _pipeline_evidence(step: dict[str, Any], symbol: str) -> Evidence:
         if raw_binding is not None
         else None
     )
+    raw_source_binding = step.get("source_quality_binding")
+    source_binding = (
+        SourceQualityBinding.model_validate(raw_source_binding)
+        if raw_source_binding is not None
+        else None
+    )
     return Evidence(
         evidence_id=f"pipeline:{step['code']}",
         symbol=symbol,
@@ -85,6 +94,7 @@ def _pipeline_evidence(step: dict[str, Any], symbol: str) -> Evidence:
         cached_at=step.get("cached_at"),
         quality_status=_step_quality(step, capability),
         market_quality_binding=binding,
+        source_quality_binding=source_binding,
         payload={
             "name": step.get("name"),
             "detail": step.get("detail"),
@@ -318,6 +328,15 @@ def build_decision_package(
     if missing_market_binding:
         freeze_allowed = False
         blocked_reasons.append(MARKET_BINDING_REQUIRED_REASON)
+    missing_source_binding = any(
+        item.required
+        and item.capability in SOURCE_EVIDENCE_CAPABILITIES
+        and item.source_quality_binding is None
+        for item in evidence
+    )
+    if missing_source_binding:
+        freeze_allowed = False
+        blocked_reasons.append(SOURCE_BINDING_REQUIRED_REASON)
 
     optional_unavailable = sorted(
         {

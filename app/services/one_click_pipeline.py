@@ -17,16 +17,13 @@ from app.data_hub.market_subjects import (
     stock_daily_subject,
 )
 from app.data_hub.router import DataHubRouter
-from app.data_hub.quality import observation_is_stale, policy_for
 from app.domain.package_builder import build_decision_package
 from app.errors import AppError
 from app.models import (
     Account,
-    CompanyAnnouncement,
     CompanyFinancialPeriod,
     CompanyProfile,
     CompanyResearchEvidence,
-    CompanyResearchRefresh,
     CompanyValuationSnapshot,
     DataQualityRecord,
     MarketQuote,
@@ -52,6 +49,11 @@ from app.services.market_cache import (
     resolve_cached_quote,
     resolve_cached_series,
     validate_series_for_persistence,
+)
+from app.services.research_cache import (
+    persist_company_profile,
+    resolve_cached_announcement_catalog,
+    resolve_cached_company_profile,
 )
 from app.services.plan_freeze import freeze_trade_plan
 from app.services.trade_plan_generator import (
@@ -602,24 +604,39 @@ def _pick(raw: dict, *keys):
     return next((raw.get(key) for key in keys if raw.get(key) not in (None, "")), None)
 
 
+def _source_binding_payload(selection, data_capability: str) -> dict | None:
+    if (
+        not selection.executable
+        or selection.quality_record_id is None
+        or selection.effective_quality.observed_at is None
+    ):
+        return None
+    payload = {
+        "data_capability": data_capability,
+        "subject_type": selection.subject.subject_type,
+        "subject_id": selection.subject.subject_id,
+        "semantic_key": selection.subject.semantic_key or "",
+        "quality_record_id": selection.quality_record_id,
+        "observed_at": selection.effective_quality.observed_at.isoformat(),
+    }
+    if data_capability == "announcement.catalog":
+        payload.update(
+            {
+                "scan_start": selection.scan_start.isoformat(),
+                "scan_end": selection.scan_end.isoformat(),
+                "checked_at": selection.checked_at.isoformat(),
+            }
+        )
+    return payload
+
+
 def _ensure_profile(
     db: Session, symbol: str, provider: DataHubRouter
 ) -> tuple[CompanyProfile | None, dict]:
-    profile = db.scalar(select(CompanyProfile).where(CompanyProfile.symbol == symbol))
+    selected = resolve_cached_company_profile(db, symbol)
+    profile = selected.profile
     if profile and profile.industry:
-        record = _latest_quality_record(db, symbol, "fundamental.profile")
-        profile_quality = (
-            record.quality_status
-            if record and not record.persisted
-            else "STALE"
-            if observation_is_stale(
-                record.observed_at if record and record.observed_at else profile.fetched_at,
-                policy_for("fundamental.profile"),
-            )
-            else record.quality_status
-            if record
-            else "SINGLE_SOURCE"
-        )
+        profile_quality = selected.effective_quality.effective_quality.value
         return profile, _step(
             "company_mapping",
             "公司与行业识别",
@@ -629,10 +646,14 @@ def _ensure_profile(
             data_time=profile.fetched_at.isoformat(),
             observed_at=profile.fetched_at.isoformat(),
             quality_status=profile_quality,
+            source_quality_binding=_source_binding_payload(
+                selected, "fundamental.profile"
+            ),
             missing=["概念板块自动映射", "完整产业链节点"] if not profile.raw_data else [],
         )
     try:
         profile_result = provider.company_profile(symbol)
+        db.commit()
         raw = profile_result.require_value()
         now = datetime.now()
         values = {
@@ -653,7 +674,13 @@ def _ensure_profile(
         else:
             for key, value in values.items():
                 setattr(profile, key, value)
-        provider.mark_persisted(profile_result, cached_at=now)
+        profile = persist_company_profile(db, provider, profile_result)
+        selected = resolve_cached_company_profile(db, symbol)
+        if not selected.executable:
+            raise ProviderUnavailableError(
+                "profile refresh blocked by effective quality: "
+                f"{selected.effective_quality.effective_quality.value}"
+            )
         db.commit()
         return profile, _step(
             "company_mapping",
@@ -667,16 +694,29 @@ def _ensure_profile(
             else None,
             fetched_at=profile_result.fetched_at.isoformat(),
             quality_status=profile_result.quality_status.value,
+            source_quality_binding=_source_binding_payload(
+                selected, "fundamental.profile"
+            ),
             provider_observations=profile_result.provider_observations,
             missing=[] if profile.industry else ["所属行业", "概念板块", "产业链节点"],
         )
     except Exception as exc:
+        db.rollback()
+        selected = resolve_cached_company_profile(db, symbol)
+        profile = selected.profile
         return profile, _step(
             "company_mapping",
             "公司与行业识别",
             "partial",
             f"公司行业识别失败，保留已有信息：{exc}",
             fallback_used=profile is not None,
+            observed_at=(
+                selected.observed_at.isoformat() if selected.observed_at else None
+            ),
+            quality_status=selected.effective_quality.effective_quality.value,
+            source_quality_binding=_source_binding_payload(
+                selected, "fundamental.profile"
+            ),
             missing=["所属行业", "概念板块", "产业链节点"],
         )
 
@@ -902,12 +942,15 @@ def _sector_assessment(
 
 
 def _research_inventory(db: Session, symbol: str) -> tuple[dict, dict]:
+    announcement_start = date.today() - timedelta(days=3 * 366)
+    announcement_end = date.today()
+    announcement_selection = resolve_cached_announcement_catalog(
+        db, symbol, announcement_start, announcement_end
+    )
     financials = db.scalars(
         select(CompanyFinancialPeriod).where(CompanyFinancialPeriod.symbol == symbol)
     ).all()
-    announcements = db.scalars(
-        select(CompanyAnnouncement).where(CompanyAnnouncement.symbol == symbol)
-    ).all()
+    announcements = announcement_selection.announcements
     evidence = db.scalars(
         select(CompanyResearchEvidence).where(CompanyResearchEvidence.symbol == symbol)
     ).all()
@@ -916,17 +959,12 @@ def _research_inventory(db: Session, symbol: str) -> tuple[dict, dict]:
         .where(CompanyValuationSnapshot.symbol == symbol)
         .order_by(CompanyValuationSnapshot.trade_date.desc())
     )
-    announcement_scan = db.scalar(
-        select(CompanyResearchRefresh).where(
-            CompanyResearchRefresh.symbol == symbol,
-            CompanyResearchRefresh.section == "announcements",
-        )
-    )
+    announcement_scan = announcement_selection.refresh
     risks = [item for item in announcements if item.risk_level in {"红", "黄"}]
     missing = []
     if not financials:
         missing.append("最近12季度财务数据")
-    if not announcement_scan or not announcement_scan.last_success_at:
+    if not announcement_selection.executable:
         missing.append("公司公告目录")
     if not evidence:
         missing.append("产业与公开信息证据")
@@ -935,9 +973,7 @@ def _research_inventory(db: Session, symbol: str) -> tuple[dict, dict]:
     result = {
         "financial_periods": len(financials),
         "announcements": len(announcements),
-        "announcement_scan_completed": bool(
-            announcement_scan and announcement_scan.last_success_at
-        ),
+        "announcement_scan_completed": announcement_selection.executable,
         "risk_events": [
             {
                 "title": item.title,
@@ -952,11 +988,16 @@ def _research_inventory(db: Session, symbol: str) -> tuple[dict, dict]:
         "valuation_available": valuation is not None,
         "missing": missing,
     }
+    announcement_detail = (
+        "公告目录扫描成功，当前覆盖范围未发现公告。"
+        if announcement_selection.executable and not announcements
+        else f"本地已有财务期数 {len(financials)}、公告 {len(announcements)}、产业证据 {len(evidence)}。"
+    )
     return result, _step(
         "company_risk",
         "公司风险与公开信息",
         "success" if not missing else "partial",
-        f"本地已有财务期数 {len(financials)}、公告 {len(announcements)}、产业证据 {len(evidence)}。",
+        announcement_detail,
         missing=missing,
         source="本地公司研究中心（原始来源保留在证据记录）",
         data_time=datetime.now().isoformat(),
@@ -964,22 +1005,13 @@ def _research_inventory(db: Session, symbol: str) -> tuple[dict, dict]:
         if announcement_scan and announcement_scan.checked_at
         else None,
         quality_status=(
-            announcement_scan.quality_status
-            if announcement_scan and announcement_scan.quality_status
-            else "STALE"
-            if announcement_scan
-            and announcement_scan.checked_at
-            and observation_is_stale(
-                announcement_scan.checked_at,
-                policy_for("announcement.catalog"),
-            )
-            else "MISSING"
+            announcement_selection.effective_quality.effective_quality.value
+        ),
+        source_quality_binding=_source_binding_payload(
+            announcement_selection, "announcement.catalog"
         ),
         required_missing=(
-            []
-            if announcement_scan
-            and announcement_scan.quality_status in {"VERIFIED", "SINGLE_SOURCE"}
-            else ["announcements"]
+            [] if announcement_selection.executable else ["announcements"]
         ),
         optional_missing=[
             item
