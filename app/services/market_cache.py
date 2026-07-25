@@ -63,6 +63,23 @@ class _SeriesCandidate:
     structure_reason: str | None
 
 
+@dataclass(frozen=True)
+class CanonicalSeriesRow:
+    symbol: str
+    trade_date: str
+    open: str
+    high: str
+    low: str
+    close: str
+    volume: str
+    adjustment: str
+    price_unit: str
+    volume_unit: str
+    observed_at: str
+    source: str
+    fetched_at: str
+
+
 def effective_quality_metadata(result: EffectiveQualityResult) -> dict[str, Any]:
     return {
         "stored_quality": result.stored_quality.value if result.stored_quality else None,
@@ -149,6 +166,65 @@ def mapping_series_bars(
     return bars
 
 
+def _canonical_decimal(value: Any) -> str:
+    number = Decimal(str(value))
+    if not number.is_finite():
+        raise ValueError("non_finite_series_number")
+    if number == 0:
+        return "0"
+    return format(number.normalize(), "f")
+
+
+def _canonical_series_datetime(value: Any) -> str:
+    if not isinstance(value, datetime):
+        raise ValueError("invalid_series_datetime")
+    return _as_datetime(value).isoformat(timespec="microseconds")
+
+
+def _canonical_series_text(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("invalid_series_text")
+    return value
+
+
+def canonical_series_row(value: Any) -> CanonicalSeriesRow:
+    trade_date = getattr(value, "trade_date", None)
+    if not isinstance(trade_date, date) or isinstance(trade_date, datetime):
+        raise ValueError("invalid_series_trade_date")
+    return CanonicalSeriesRow(
+        symbol=_canonical_series_text(getattr(value, "symbol", None)),
+        trade_date=trade_date.isoformat(),
+        open=_canonical_decimal(getattr(value, "open", None)),
+        high=_canonical_decimal(getattr(value, "high", None)),
+        low=_canonical_decimal(getattr(value, "low", None)),
+        close=_canonical_decimal(getattr(value, "close", None)),
+        volume=_canonical_decimal(getattr(value, "volume", None)),
+        adjustment=_canonical_series_text(getattr(value, "adjustment", None)),
+        price_unit=_canonical_series_text(getattr(value, "price_unit", None)),
+        volume_unit=_canonical_series_text(getattr(value, "volume_unit", None)),
+        observed_at=_canonical_series_datetime(getattr(value, "observed_at", None)),
+        source=_canonical_series_text(getattr(value, "source", None)),
+        fetched_at=_canonical_series_datetime(getattr(value, "fetched_at", None)),
+    )
+
+
+def _provider_series_rows(
+    trusted: Any,
+    *,
+    subject: SubjectRef,
+) -> list[Any]:
+    if isinstance(trusted, list):
+        return trusted
+    if isinstance(trusted, dict) and isinstance(trusted.get("rows"), list):
+        adjustment, _, _ = _series_semantics(subject)
+        return mapping_series_bars(
+            trusted,
+            cache_symbol=subject.subject_id,
+            adjustment=adjustment,
+        )
+    raise ProviderUnavailableError("unsupported series result structure")
+
+
 def replace_market_series(
     db: Session,
     router: DataHubRouter,
@@ -162,14 +238,21 @@ def replace_market_series(
     rows = validate_series_for_persistence(bars, subject=subject, min_rows=min_rows)
     if result.subject != subject or result.quality_record_id is None:
         raise ProviderUnavailableError("series result has no matching complete lineage")
-    if isinstance(trusted, list):
-        expected_row_count = len(trusted)
-    elif isinstance(trusted, dict) and isinstance(trusted.get("rows"), list):
-        expected_row_count = len(trusted["rows"])
-    else:
-        raise ProviderUnavailableError("unsupported series result structure")
+    expected_rows = _provider_series_rows(trusted, subject=subject)
+    expected_row_count = len(expected_rows)
     if len(rows) != expected_row_count:
         raise ProviderUnavailableError("series persistence row count does not match result")
+    try:
+        expected_canonical = [canonical_series_row(item) for item in expected_rows]
+        actual_canonical = [canonical_series_row(item) for item in rows]
+    except (ArithmeticError, TypeError, ValueError) as exc:
+        raise ProviderUnavailableError(
+            "series persistence content does not match provider result"
+        ) from exc
+    if actual_canonical != expected_canonical:
+        raise ProviderUnavailableError(
+            "series persistence content does not match provider result"
+        )
 
     current = router.result_for(
         result.capability,
@@ -611,8 +694,10 @@ def resolve_cached_series(
 
 
 __all__ = [
+    "CanonicalSeriesRow",
     "CachedQuoteSelection",
     "CachedSeriesSelection",
+    "canonical_series_row",
     "effective_quality_metadata",
     "mapping_series_bars",
     "persist_market_quote",
