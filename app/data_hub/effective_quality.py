@@ -2,13 +2,19 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Sequence
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app.data_hub.quality import observation_is_stale, policy_for
-from app.data_hub.trading_calendar import TradingCalendar, get_trading_calendar
+from app.data_hub.trading_calendar import (
+    SHANGHAI_TZ,
+    TradingCalendar,
+    get_trading_calendar,
+    shanghai_now,
+    to_shanghai_aware,
+)
 from app.domain.quality import DataQualityStatus, worst_quality
 from app.domain.quality_subject import (
     EffectiveQualityRequest,
@@ -69,14 +75,16 @@ def _scope_matches(
 
 
 def _comparable_datetime(value: datetime | date, reference: datetime) -> datetime:
-    result = value if isinstance(value, datetime) else datetime.combine(value, time.min)
-    if result.tzinfo is None and reference.tzinfo is not None:
-        result = result.replace(tzinfo=reference.tzinfo)
-    elif result.tzinfo is not None and reference.tzinfo is None:
-        result = result.astimezone(timezone.utc).replace(tzinfo=None)
-    elif result.tzinfo is not None and reference.tzinfo is not None:
-        result = result.astimezone(reference.tzinfo)
-    return result
+    del reference
+    result = (
+        value
+        if isinstance(value, datetime)
+        else datetime.combine(value, time.min, tzinfo=SHANGHAI_TZ)
+    )
+    return to_shanghai_aware(
+        result,
+        naive_is_shanghai=result.tzinfo is None,
+    )
 
 
 def _conservative_observed_at(
@@ -199,7 +207,10 @@ class EffectiveQualityResolver:
         *,
         evaluated_at: datetime | None = None,
     ) -> dict[QualityKey, EffectiveQualityResult]:
-        current = evaluated_at or datetime.now()
+        current = to_shanghai_aware(
+            evaluated_at or shanghai_now(),
+            naive_is_shanghai=evaluated_at is not None and evaluated_at.tzinfo is None,
+        )
         if not requests:
             return {}
 

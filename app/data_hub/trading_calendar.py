@@ -13,6 +13,39 @@ import pandas as pd
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
+def shanghai_now() -> datetime:
+    return datetime.now(SHANGHAI_TZ)
+
+
+def shanghai_today() -> date:
+    return shanghai_now().date()
+
+
+def to_shanghai_aware(
+    value: datetime,
+    *,
+    naive_is_shanghai: bool = False,
+) -> datetime:
+    if not isinstance(value, datetime):
+        raise TypeError("value must be a datetime")
+    if value.tzinfo is None:
+        if not naive_is_shanghai:
+            raise ValueError("naive datetime requires explicit Shanghai wall-time semantics")
+        return value.replace(tzinfo=SHANGHAI_TZ)
+    return value.astimezone(SHANGHAI_TZ)
+
+
+def to_storage_naive(
+    value: datetime,
+    *,
+    naive_is_shanghai: bool = False,
+) -> datetime:
+    return to_shanghai_aware(
+        value,
+        naive_is_shanghai=naive_is_shanghai,
+    ).replace(tzinfo=None)
+
+
 class TradingPhase(str, Enum):
     PRE_OPEN = "PRE_OPEN"
     MORNING_SESSION = "MORNING_SESSION"
@@ -42,13 +75,16 @@ class XSHGTradingCalendar:
 
     @staticmethod
     def _shanghai_time(value: datetime | None = None) -> datetime:
-        current = value or datetime.now(SHANGHAI_TZ)
-        if current.tzinfo is None:
-            return current.replace(tzinfo=SHANGHAI_TZ)
-        return current.astimezone(SHANGHAI_TZ)
+        return to_shanghai_aware(
+            value or shanghai_now(),
+            naive_is_shanghai=value is not None and value.tzinfo is None,
+        )
 
     def _is_session(self, day: date) -> bool:
         return bool(self._calendar.is_session(pd.Timestamp(day)))
+
+    def is_session(self, day: date) -> bool:
+        return self._is_session(day)
 
     def market_phase(self, now: datetime | None = None) -> TradingPhase:
         """Return the A-share phase using half-open continuous sessions."""

@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 
 import numpy as np
@@ -8,6 +8,7 @@ from app.data_hub.contracts import DailyBar, DataProvider, ProviderMetadata
 from app.data_hub.market_subjects import stock_daily_subject
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
+from app.data_hub.trading_calendar import get_trading_calendar, shanghai_now
 from app.models import Account, Holding
 from app.services.market_cache import replace_market_series
 from app.services.technical import (
@@ -46,9 +47,18 @@ class TechnicalHistoryProvider(DataProvider):
         return {"status": "healthy"}
 
     def get_history(self, symbol, start, end):
+        now = shanghai_now()
+        calendar = get_trading_calendar()
+        latest = min(end, calendar.latest_completed_session(now))
+        trade_dates = []
+        candidate = latest
+        while len(trade_dates) < 260:
+            if calendar.is_session(candidate):
+                trade_dates.append(candidate)
+            candidate -= timedelta(days=1)
+        trade_dates.reverse()
         rows = []
-        for index in range(260):
-            trade_date = end - timedelta(days=259 - index)
+        for index, trade_date in enumerate(trade_dates):
             price = Decimal("10") + Decimal(index) / Decimal("50")
             rows.append(
                 DailyBar(
@@ -62,9 +72,9 @@ class TechnicalHistoryProvider(DataProvider):
                     adjustment="qfq",
                     price_unit="CNY",
                     volume_unit="share",
-                    observed_at=datetime.combine(trade_date, datetime.min.time()),
+                    observed_at=calendar.session_close_at(trade_date),
                     source=self.provider_id,
-                    fetched_at=datetime.now(),
+                    fetched_at=now,
                 )
             )
         return rows

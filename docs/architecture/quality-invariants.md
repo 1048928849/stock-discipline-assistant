@@ -79,10 +79,18 @@ It is not a permanent property copied from acquisition time.
 
 ## Market time and capability contracts
 
-All market timestamps use `Asia/Shanghai` semantics. `observed_at` is the
-business time represented by the quote or bar; `fetched_at` is when this
-system completed the request. A missing business timestamp is never replaced
-with `fetched_at`.
+All market decisions use timezone-aware `Asia/Shanghai` timestamps from the
+central clock helpers: `shanghai_now`, `shanghai_today`, and
+`to_shanghai_aware`. A naive datetime is accepted only at an explicitly
+declared compatibility or persistence boundary. Existing database `DateTime`
+columns store naive Shanghai wall time through `to_storage_naive`; values are
+converted back to aware Shanghai time before comparison. UTC or another aware
+timezone is converted by instant, never by replacing `tzinfo`.
+
+`observed_at` is the business time represented by the quote or bar;
+`fetched_at` is when this system completed the request. A missing business
+timestamp is never replaced with `fetched_at`, and a `fetched_at` later than
+the evaluation clock beyond the contract tolerance is rejected.
 
 A-share continuous sessions are half-open intervals: `[09:30, 11:30)` and
 `[13:00, 15:00)`. Therefore 11:30 is lunch break and 15:00 is closed. The
@@ -97,9 +105,20 @@ realtime request.
 
 `market.daily.qfq` and `market.daily.unadjusted` require explicit adjustment
 and units on every `DailyBar`, matching symbols, unique increasing trade dates,
-same-date observations, legal OHLC values, and non-negative volume. Router
-validation occurs before a `QualityObservation` is formed; persistence
+legal OHLC values, and non-negative volume. Every trade date must be an
+exchange session no later than `latest_completed_session(evaluated_at)`, and
+`observed_at` must equal that session's official 15:00 Shanghai close. A
+current-day row is rejected before 15:00, including during lunch, and becomes
+eligible only once the session is complete. Rows in one response must also
+share source, timezone semantics, and effectively identical fetch time.
+Router validation occurs before a `QualityObservation` is formed; persistence
 preflight remains the second boundary.
+
+The public AKShare adapter deterministically removes rows later than the latest
+completed session and stamps retained bars at official close. Professional
+adapters reject incomplete rows and naive response timestamps. Both approaches
+produce the same downstream daily-bar contract.
+
 - Daily market capabilities use the A-share trading calendar and trading-session lag, not
   natural-day subtraction.
 - Announcement catalog freshness uses the successful scan `checked_at`. The latest
@@ -174,6 +193,11 @@ Tests must traverse production connections rather than fabricating the terminal 
 | Missing data | No value and no cache | Missing audit state | Required Evidence `MISSING` | Rejected | No formal plan |
 | Empty announcement catalog | Successful zero-row scan | Scan state persisted | Required fresh Evidence | Allowed if other gates pass | Distinct from missing |
 | Quote stale, bars fresh | Realtime quote expires | Independent quote/bar lineage | Price-triggered action blocked | Rejected when required | Bars do not mask quote |
+| Morning/lunch current-day bar | Provider returns partial current session | Rejected before cache replacement | No partial bar Evidence | Rejected | Prior complete session remains authoritative |
+| After-close current-day bar | Provider returns official-close row | Persisted with 15:00 observation | Completed-session Evidence | Allowed if other gates pass | Current session is usable |
+| Future fetch timestamp | Provider clock is ahead | Rejected before persistence | `MISSING` attempt | Rejected | Existing trusted cache is unchanged |
+| UTC 02:00 confirmation | Aware UTC instant converts to 10:00 Shanghai | Existing realtime lineage revalidated | Same package | Allowed if otherwise valid | Host timezone independent |
+| UTC 07:00 confirmation | Aware UTC instant converts to 15:00 Shanghai | Realtime quote recomputes stale | Package becomes non-executable | Rejected | Close boundary enforced |
 | Freshness expires after analysis | Initially trusted | No rewrite required | Package becomes stale | Rejected on recomputation | Re-analyze |
 | AI invalid reference/mutation | Valid base Evidence | No deterministic writes | Validation rejects AI output | Deterministic package unchanged | AI isolated |
 | Duplicate confirm | Same run, independent Sessions | Unique `analysis_run_id` | Same package | One success, stable conflict/idempotence | One plan |

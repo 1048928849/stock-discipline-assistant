@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from typing import Callable
 
 import httpx
 
@@ -15,14 +16,27 @@ from app.data_hub.contracts import (
     Quote,
     validate_daily_bar_contract,
 )
-from app.data_hub.trading_calendar import SHANGHAI_TZ
+from app.data_hub.trading_calendar import (
+    TradingCalendar,
+    get_trading_calendar,
+    shanghai_now,
+    to_shanghai_aware,
+)
 
 
 class ProfessionalMarketApiProvider(MarketDataProvider):
     """标准HTTP行情契约：启用后调用 /health、/market/quote、/market/history 等端点。"""
 
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        calendar: TradingCalendar | None = None,
+        now_fn: Callable[[], datetime] | None = None,
+    ):
         self.settings = settings
+        self.calendar = calendar or get_trading_calendar()
+        self.now_fn = now_fn or shanghai_now
         self.metadata = ProviderMetadata(
             provider_id="professional_market_api",
             supported_capabilities=(
@@ -51,6 +65,27 @@ class ProfessionalMarketApiProvider(MarketDataProvider):
     @property
     def _headers(self):
         return {"Authorization": f"Bearer {self.settings.professional_market_api_key}"}
+
+    @staticmethod
+    def _aware_timestamp(value, field: str) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise ProviderUnavailableError(
+                f"professional market contract has invalid {field}"
+            ) from exc
+        if parsed.tzinfo is None:
+            raise ProviderUnavailableError(
+                f"professional market contract requires timezone-aware {field}"
+            )
+        return parsed
+
+    def _now(self) -> datetime:
+        value = self.now_fn()
+        return to_shanghai_aware(
+            value,
+            naive_is_shanghai=value.tzinfo is None,
+        )
 
     def _get(self, path: str, params: dict | None = None):
         if not self.metadata.enabled:
@@ -95,13 +130,12 @@ class ProfessionalMarketApiProvider(MarketDataProvider):
             raise ProviderUnavailableError(
                 "professional quote contract requires quote_type=realtime"
             )
-        try:
-            fetched_at = datetime.fromisoformat(str(row["fetched_at"]))
-            observed_at = datetime.fromisoformat(str(row["observed_at"]))
-        except (TypeError, ValueError) as exc:
-            raise ProviderUnavailableError(
-                "professional quote contract has invalid timestamps"
-            ) from exc
+        fetched_at = to_shanghai_aware(
+            self._aware_timestamp(row["fetched_at"], "fetched_at")
+        )
+        observed_at = to_shanghai_aware(
+            self._aware_timestamp(row["observed_at"], "observed_at")
+        )
         try:
             return Quote(
                 symbol=str(row.get("symbol") or symbol),
@@ -143,6 +177,7 @@ class ProfessionalMarketApiProvider(MarketDataProvider):
                 "professional history contract requires a rows list"
             )
         bars = []
+        raw_timezone_semantics: set[tuple[str, str]] = set()
         required = {
             "date",
             "open",
@@ -167,14 +202,20 @@ class ProfessionalMarketApiProvider(MarketDataProvider):
                 )
             try:
                 trade_date = date.fromisoformat(str(row["date"])[:10])
-                observed_at = (
-                    datetime.fromisoformat(str(row["observed_at"]))
-                    if row.get("observed_at")
-                    else datetime.combine(
-                        trade_date, datetime.min.time(), tzinfo=SHANGHAI_TZ
-                    )
+                raw_fetched_at = self._aware_timestamp(
+                    row["fetched_at"], "fetched_at"
                 )
-                fetched_at = datetime.fromisoformat(str(row["fetched_at"]))
+                if row.get("observed_at"):
+                    raw_observed_at = self._aware_timestamp(
+                        row["observed_at"], "observed_at"
+                    )
+                else:
+                    raw_observed_at = self.calendar.session_close_at(trade_date)
+                raw_timezone_semantics.add(
+                    (str(raw_observed_at.tzinfo), str(raw_fetched_at.tzinfo))
+                )
+                observed_at = to_shanghai_aware(raw_observed_at)
+                fetched_at = to_shanghai_aware(raw_fetched_at)
                 bar = DailyBar(
                     symbol=str(row.get("symbol") or symbol),
                     trade_date=trade_date,
@@ -187,7 +228,7 @@ class ProfessionalMarketApiProvider(MarketDataProvider):
                     price_unit=str(row["price_unit"]),
                     volume_unit=str(row["volume_unit"]),
                     observed_at=observed_at,
-                    source="professional_market_api_qfq",
+                    source=str(row.get("source") or "professional_market_api_qfq"),
                     fetched_at=fetched_at,
                 )
             except (InvalidOperation, TypeError, ValueError) as exc:
@@ -195,10 +236,16 @@ class ProfessionalMarketApiProvider(MarketDataProvider):
                     "professional history contract has invalid field types"
                 ) from exc
             bars.append(bar)
+        if len(raw_timezone_semantics) != 1:
+            raise ProviderUnavailableError(
+                "professional history contract has mixed timezone semantics"
+            )
         validate_daily_bar_contract(
             bars,
             capability="market.daily.qfq",
             expected_symbol=symbol,
+            evaluated_at=self._now(),
+            calendar=self.calendar,
         )
         return bars
 
@@ -216,7 +263,7 @@ class ProfessionalMarketApiProvider(MarketDataProvider):
                 for row in body.get("rows", body)
             ],
             "source": f"professional_market_api{path}",
-            "fetched_at": datetime.now(),
+            "fetched_at": self._now(),
         }
 
     def get_index_history(self, symbol: str, start: date, end: date) -> dict:
@@ -234,7 +281,7 @@ class ProfessionalMarketApiProvider(MarketDataProvider):
                 for row in body.get("rows", body)
             ],
             "source": "professional_market_api/index-history",
-            "fetched_at": datetime.now(),
+            "fetched_at": self._now(),
         }
 
     def get_sector_history(self, industry: str, start: date, end: date) -> dict:
@@ -252,7 +299,7 @@ class ProfessionalMarketApiProvider(MarketDataProvider):
                 for row in body.get("rows", body)
             ],
             "source": "professional_market_api/sector-history",
-            "fetched_at": datetime.now(),
+            "fetched_at": self._now(),
         }
 
 

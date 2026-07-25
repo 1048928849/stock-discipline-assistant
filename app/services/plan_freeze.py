@@ -18,9 +18,16 @@ from app.services.research_cache import (
     resolve_cached_announcement_catalog,
     resolve_cached_company_profile,
 )
+from app.data_hub.trading_calendar import shanghai_now, to_shanghai_aware
 
 
 MAX_ANALYSIS_AGE = timedelta(hours=24)
+
+
+def _comparable_time(value: datetime) -> datetime:
+    return to_shanghai_aware(value, naive_is_shanghai=value.tzinfo is None)
+
+
 def _validated_package(value: dict[str, Any] | None) -> DecisionPackage:
     if not value:
         raise AppError(
@@ -65,7 +72,7 @@ def _validated_package(value: dict[str, Any] | None) -> DecisionPackage:
             "DECISION_PACKAGE_CHANGED",
             "DecisionPackage integrity validation failed; run a new analysis.",
         ) from exc
-    if package.expires_at <= datetime.now():
+    if _comparable_time(package.expires_at) <= shanghai_now():
         raise AppError(
             422,
             "DECISION_PACKAGE_EXPIRED",
@@ -90,7 +97,11 @@ def freeze_trade_plan(
     analysis_run_id: int | None = None,
 ) -> dict:
     package = _validated_package(decision_package)
-    if analysis_created_at and datetime.now() - analysis_created_at > MAX_ANALYSIS_AGE:
+    now = shanghai_now()
+    if (
+        analysis_created_at
+        and now - _comparable_time(analysis_created_at) > MAX_ANALYSIS_AGE
+    ):
         raise AppError(
             422,
             "DECISION_PACKAGE_EXPIRED",
@@ -102,7 +113,6 @@ def freeze_trade_plan(
             "DECISION_PACKAGE_CHANGED",
             "DecisionPackage does not belong to the supplied preview.",
         )
-    now = datetime.now()
     for evidence in package.evidence:
         if not evidence.required or evidence.capability not in MARKET_EVIDENCE_CAPABILITIES:
             continue

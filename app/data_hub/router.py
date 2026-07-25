@@ -36,9 +36,11 @@ from app.data_hub.quality import (
 )
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.trading_calendar import (
-    SHANGHAI_TZ,
     TradingCalendar,
     get_trading_calendar,
+    shanghai_now,
+    to_shanghai_aware,
+    to_storage_naive,
 )
 from app.domain.quality_subject import SubjectRef, canonical_semantic_key
 from app.models import (
@@ -241,12 +243,16 @@ class DataHubRouter:
         self.db = db
         self.registry = registry
         self.calendar = calendar or get_trading_calendar()
-        self.now_fn = now_fn or datetime.now
+        self.now_fn = now_fn or shanghai_now
         self.calls: dict[str, ProviderResult] = {}
         self.call_results: dict[CallResultKey, ProviderResult] = {}
 
     def _now(self) -> datetime:
-        return self.now_fn()
+        value = self.now_fn()
+        return to_shanghai_aware(
+            value,
+            naive_is_shanghai=value.tzinfo is None,
+        )
 
     @staticmethod
     def _call_result_key(
@@ -340,7 +346,7 @@ class DataHubRouter:
             return fetched_at
         if isinstance(value, list):
             if value and hasattr(value[-1], "trade_date"):
-                return max(item.trade_date for item in value)
+                return max(item.observed_at for item in value)
             candidates = []
             for row in value:
                 if not isinstance(row, dict):
@@ -393,10 +399,11 @@ class DataHubRouter:
         market_time: bool = False,
     ) -> datetime | None:
         if isinstance(value, datetime):
-            if value.tzinfo is not None:
-                target_tz = SHANGHAI_TZ if market_time else timezone.utc
-                return value.astimezone(target_tz).replace(tzinfo=None)
-            return value
+            if value.tzinfo is None:
+                return value
+            if market_time:
+                return to_storage_naive(value)
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
         if isinstance(value, date):
             return datetime.combine(value, datetime_time.min)
         return None
@@ -457,11 +464,26 @@ class DataHubRouter:
             or result.normalized_digest is None
         ):
             return None
-        observed_at = self._as_datetime(
+        market_time = result.capability.startswith("market.")
+        stored_observed_at = self._as_datetime(
             result.observed_at,
-            market_time=result.capability.startswith("market."),
+            market_time=market_time,
         )
-        if observed_at is None or observed_at > evaluated_at:
+        observed_at = (
+            to_shanghai_aware(
+                stored_observed_at.replace(tzinfo=timezone.utc)
+                if not market_time
+                else stored_observed_at,
+                naive_is_shanghai=market_time,
+            )
+            if stored_observed_at is not None
+            else None
+        )
+        evaluated = to_shanghai_aware(
+            evaluated_at,
+            naive_is_shanghai=evaluated_at.tzinfo is None,
+        )
+        if observed_at is None or observed_at > evaluated:
             return None
 
         records = self.db.scalars(
@@ -487,9 +509,15 @@ class DataHubRouter:
         superseded_ids = set()
         for candidate in scoped_records:
             conflict = conflicts_by_id.get(candidate.supersedes_record_id)
-            candidate_observed_at = self._as_datetime(candidate.observed_at)
+            candidate_observed_at = (
+                to_shanghai_aware(candidate.observed_at, naive_is_shanghai=True)
+                if candidate.observed_at is not None
+                else None
+            )
             conflict_observed_at = (
-                self._as_datetime(conflict.observed_at) if conflict is not None else None
+                to_shanghai_aware(conflict.observed_at, naive_is_shanghai=True)
+                if conflict is not None and conflict.observed_at is not None
+                else None
             )
             if (
                 conflict is not None
@@ -498,11 +526,11 @@ class DataHubRouter:
                 and candidate.trusted
                 and candidate_observed_at is not None
                 and conflict_observed_at is not None
-                and conflict_observed_at <= candidate_observed_at <= evaluated_at
+                and conflict_observed_at <= candidate_observed_at <= evaluated
                 and not observation_is_stale(
                     candidate.observed_at,
                     policy,
-                    now=evaluated_at,
+                    now=evaluated,
                     calendar=self.calendar,
                 )
             ):
@@ -519,7 +547,8 @@ class DataHubRouter:
         if (
             conflict is None
             or conflict.observed_at is None
-            or observed_at < conflict.observed_at
+            or observed_at
+            < to_shanghai_aware(conflict.observed_at, naive_is_shanghai=True)
         ):
             return None
         return conflict.id
@@ -554,13 +583,13 @@ class DataHubRouter:
                     semantic_key=semantic_key,
                     current_record_id=record.id,
                     generation=1,
-                    updated_at=updated_at,
+                    updated_at=to_storage_naive(updated_at),
                 )
             )
         else:
             head.current_record_id = record.id
             head.generation += 1
-            head.updated_at = updated_at
+            head.updated_at = to_storage_naive(updated_at)
         self.db.flush()
 
     def _record_quality(self, result: ProviderResult, symbol: str | None) -> ProviderResult:
@@ -599,9 +628,10 @@ class DataHubRouter:
                 result.observed_at,
                 market_time=result.capability.startswith("market."),
             ),
-            fetched_at=result.fetched_at.replace(tzinfo=None)
-            if result.fetched_at.tzinfo
-            else result.fetched_at,
+            fetched_at=self._as_datetime(
+                result.fetched_at,
+                market_time=result.capability.startswith("market."),
+            ),
             provider_id=result.provider_id,
             provider_observations=result.provider_observations,
             normalized_digest=result.normalized_digest,
@@ -614,9 +644,9 @@ class DataHubRouter:
             cache_used=result.cache_used,
             trusted=result.quality_status in TRUSTED_QUALITY_STATUSES,
             persisted=False,
-            scan_start=result.scan_start,
-            scan_end=result.scan_end,
-            checked_at=result.checked_at,
+            scan_start=self._as_datetime(result.scan_start),
+            scan_end=self._as_datetime(result.scan_end),
+            checked_at=self._as_datetime(result.checked_at),
             latest_content_at=latest_content_at,
         )
         self.db.add(record)
@@ -628,7 +658,11 @@ class DataHubRouter:
     def mark_persisted(self, result: ProviderResult, cached_at: datetime | None = None) -> None:
         record = self.validate_persistence_result(result)
         record.persisted = True
-        record.cached_at = cached_at or self._now()
+        cache_time = cached_at or self._now()
+        record.cached_at = to_storage_naive(
+            cache_time,
+            naive_is_shanghai=cache_time.tzinfo is None,
+        )
         self.db.flush()
 
     def validate_persistence_result(self, result: ProviderResult) -> DataQualityRecord:
@@ -701,8 +735,8 @@ class DataHubRouter:
                 row_count=row_count,
                 duration_ms=duration_ms,
                 error=error,
-                requested_at=started,
-                completed_at=self._now(),
+                requested_at=to_storage_naive(started),
+                completed_at=to_storage_naive(self._now()),
             )
         )
         self.db.flush()
@@ -767,12 +801,21 @@ class DataHubRouter:
                         value,
                         capability=capability,
                         expected_symbol=symbol or "",
+                        evaluated_at=fetched_at,
+                        calendar=self.calendar,
                     )
                 if validator and not validator(value):
                     raise ProviderUnavailableError(
                         "Provider data failed capability completeness validation"
                     )
                 observed_at = self._observed_at(capability, value, fetched_at)
+                if (
+                    isinstance(observed_at, date)
+                    and not isinstance(observed_at, datetime)
+                    and capability.startswith("market.")
+                    and "daily" in capability
+                ):
+                    observed_at = self.calendar.session_close_at(observed_at)
                 stale = observation_is_stale(
                     observed_at,
                     policy,

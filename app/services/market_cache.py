@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any
 
@@ -14,6 +14,11 @@ from app.data_hub.contracts import DailyBar, ProviderUnavailableError
 from app.data_hub.effective_quality import resolve_effective_quality
 from app.data_hub.market_subjects import stock_quote_subject
 from app.data_hub.router import DataHubRouter, ProviderResult
+from app.data_hub.trading_calendar import (
+    get_trading_calendar,
+    to_shanghai_aware,
+    to_storage_naive,
+)
 from app.domain.quality_subject import (
     EffectiveQualityResult,
     SubjectRef,
@@ -153,13 +158,19 @@ def persist_market_quote(
         "name": quote.name,
         "price": quote.price,
         "quote_type": quote.quote_type,
-        "observed_at": quote.observed_at,
+        "observed_at": to_storage_naive(
+            quote.observed_at,
+            naive_is_shanghai=quote.observed_at.tzinfo is None,
+        ),
         "price_unit": quote.price_unit,
         "quality_status": result.quality_status.value,
         "quality_record_id": result.quality_record_id,
         "source": quote.source,
         "source_api": quote.source_api,
-        "fetched_at": quote.fetched_at,
+        "fetched_at": to_storage_naive(
+            quote.fetched_at,
+            naive_is_shanghai=quote.fetched_at.tzinfo is None,
+        ),
     }
     if stored is None:
         stored = MarketQuote(symbol=quote.symbol, **values)
@@ -179,7 +190,12 @@ def mapping_series_bars(
     adjustment: str,
 ) -> list[DailyBar]:
     source = str(payload["source"])
-    fetched_at = payload["fetched_at"]
+    raw_fetched_at = payload["fetched_at"]
+    fetched_at = to_shanghai_aware(
+        raw_fetched_at,
+        naive_is_shanghai=raw_fetched_at.tzinfo is None,
+    )
+    calendar = get_trading_calendar()
     bars = []
     for row in payload["rows"]:
         close = Decimal(str(row["close"]))
@@ -196,7 +212,7 @@ def mapping_series_bars(
                 adjustment=adjustment,
                 price_unit="CNY",
                 volume_unit="share",
-                observed_at=datetime.combine(trade_date, time.min),
+                observed_at=calendar.session_close_at(trade_date),
                 source=source,
                 fetched_at=fetched_at,
             )
@@ -349,11 +365,17 @@ def replace_market_series(
             adjustment=row.adjustment,
             price_unit=row.price_unit,
             volume_unit=row.volume_unit,
-            observed_at=row.observed_at,
+            observed_at=to_storage_naive(
+                row.observed_at,
+                naive_is_shanghai=row.observed_at.tzinfo is None,
+            ),
             quality_status=result.quality_status.value,
             quality_record_id=result.quality_record_id,
             source=row.source,
-            fetched_at=row.fetched_at,
+            fetched_at=to_storage_naive(
+                row.fetched_at,
+                naive_is_shanghai=row.fetched_at.tzinfo is None,
+            ),
         )
         for row in rows
     ]
@@ -365,9 +387,10 @@ def replace_market_series(
 
 def _as_datetime(value: datetime | date | None) -> datetime:
     if isinstance(value, datetime):
-        if value.tzinfo is not None:
-            return value.astimezone(timezone.utc).replace(tzinfo=None)
-        return value
+        return to_storage_naive(
+            value,
+            naive_is_shanghai=value.tzinfo is None,
+        )
     if isinstance(value, date):
         return datetime.combine(value, time.min)
     return datetime.min

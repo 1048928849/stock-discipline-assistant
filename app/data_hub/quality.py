@@ -9,7 +9,12 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from app.data_hub.trading_calendar import TradingCalendar, get_trading_calendar
+from app.data_hub.trading_calendar import (
+    TradingCalendar,
+    get_trading_calendar,
+    shanghai_now,
+    to_shanghai_aware,
+)
 from app.domain.quality import DataQualityStatus, worst_quality
 
 
@@ -348,7 +353,10 @@ def observation_is_stale(
 ) -> bool:
     if observed_at is None:
         return True
-    current = now or datetime.now()
+    current = to_shanghai_aware(
+        now or shanghai_now(),
+        naive_is_shanghai=now is not None and now.tzinfo is None,
+    )
     if policy.requires_active_session and not (
         calendar or get_trading_calendar()
     ).is_realtime_session(current):
@@ -368,10 +376,10 @@ def observation_is_stale(
         if isinstance(observed_at, datetime)
         else datetime.combine(observed_at, datetime.min.time())
     )
-    if observed_dt.tzinfo and current.tzinfo is None:
-        current = current.replace(tzinfo=observed_dt.tzinfo)
-    elif current.tzinfo and observed_dt.tzinfo is None:
-        observed_dt = observed_dt.replace(tzinfo=current.tzinfo)
+    observed_dt = to_shanghai_aware(
+        observed_dt,
+        naive_is_shanghai=observed_dt.tzinfo is None,
+    )
     return current - observed_dt > policy.max_age
 
 

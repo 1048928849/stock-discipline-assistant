@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from threading import Barrier, Lock, Thread
 
@@ -18,9 +18,12 @@ from app.data_hub.market_subjects import stock_daily_subject
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
 from app.data_hub.trading_calendar import (
+    SHANGHAI_TZ,
     TradingPhase,
     XSHGTradingCalendar,
     get_trading_calendar,
+    shanghai_now,
+    to_shanghai_aware,
 )
 from app.database import Base
 from app.domain.models import DecisionPackage, MARKET_EVIDENCE_CAPABILITIES
@@ -66,7 +69,7 @@ def create_account(client, assets="100000", cash="80000"):
 
 
 def seed_pattern(session, symbol="300502"):
-    now = datetime.now()
+    now = shanghai_now()
     rows = []
     for index in range(260):
         close = 5 + index * 0.019
@@ -76,11 +79,23 @@ def seed_pattern(session, symbol="300502"):
         rows.append((close, close + 0.12, close - 0.12, 100.0))
     rows.extend([(10.55, 10.65, 10.15, 220.0), (10.32, 10.48, 10.12, 55.0)])
     rows.append((10.82, 10.9, 10.3, 180.0))
-    start = date.today() - timedelta(days=len(rows) - 1)
+    calendar = get_trading_calendar()
+    latest = calendar.latest_completed_session(now)
+    trade_dates = []
+    candidate = latest
+    while len(trade_dates) < len(rows):
+        try:
+            calendar.session_close_at(candidate)
+        except ValueError:
+            candidate -= timedelta(days=1)
+            continue
+        trade_dates.append(candidate)
+        candidate -= timedelta(days=1)
+    trade_dates.reverse()
     bars = [
         DailyBar(
             symbol=symbol,
-            trade_date=start + timedelta(days=index),
+            trade_date=trade_dates[index],
             open=Decimal(str(close - 0.03)),
             high=Decimal(str(high)),
             low=Decimal(str(low)),
@@ -89,9 +104,7 @@ def seed_pattern(session, symbol="300502"):
             adjustment="qfq",
             price_unit="CNY",
             volume_unit="share",
-            observed_at=datetime.combine(
-                start + timedelta(days=index), datetime.min.time()
-            ),
+            observed_at=calendar.session_close_at(trade_dates[index]),
             source="akshare_tencent_qfq",
             fetched_at=now,
         )
@@ -131,7 +144,7 @@ def seed_pattern(session, symbol="300502"):
     registry = ProviderRegistry()
     registry.register(PatternProvider())
     router = DataHubRouter(session, registry)
-    history = router.get_history(symbol, start, date.today())
+    history = router.get_history(symbol, trade_dates[0], latest)
     replace_market_series(
         session,
         router,
@@ -146,12 +159,25 @@ def seed_pattern(session, symbol="300502"):
 
 
 def benchmark_rows(direction="up"):
-    start = date.today() - timedelta(days=79)
+    now = shanghai_now()
+    calendar = get_trading_calendar()
+    latest = calendar.latest_completed_session(now)
+    trade_dates = []
+    candidate = latest
+    while len(trade_dates) < 80:
+        try:
+            calendar.session_close_at(candidate)
+        except ValueError:
+            candidate -= timedelta(days=1)
+            continue
+        trade_dates.append(candidate)
+        candidate -= timedelta(days=1)
+    trade_dates.reverse()
     rows = []
-    for index in range(80):
+    for index, trade_date in enumerate(trade_dates):
         close = 100 + index if direction == "up" else 200 - index * 1.2
-        rows.append({"date": start + timedelta(days=index), "close": close, "volume": 1000})
-    return {"rows": rows, "source": "测试指数", "fetched_at": datetime.now()}
+        rows.append({"date": trade_date, "close": close, "volume": 1000})
+    return {"rows": rows, "source": "测试指数", "fetched_at": now}
 
 
 class QuoteScenarioProvider(DataProvider):
@@ -179,7 +205,7 @@ class QuoteScenarioProvider(DataProvider):
         return {"status": "healthy"}
 
     def get_quote(self, symbol):
-        now = datetime.now()
+        now = shanghai_now()
         if self.quote_type == "latest_close":
             calendar = get_trading_calendar()
             now = calendar.session_close_at(calendar.latest_completed_session())
@@ -230,7 +256,7 @@ class BindingScenarioProvider(DataProvider):
 
     def get_quote(self, symbol):
         self._check()
-        now = datetime.now()
+        now = shanghai_now()
         return Quote(
             symbol=symbol,
             name="binding-test",
@@ -245,10 +271,24 @@ class BindingScenarioProvider(DataProvider):
 
     def get_history(self, symbol, start, end):
         self._check()
+        now = shanghai_now()
+        calendar = get_trading_calendar()
+        latest = min(end, calendar.latest_completed_session(now))
+        trade_dates = []
+        candidate = latest
+        while len(trade_dates) < 260:
+            try:
+                calendar.session_close_at(candidate)
+            except ValueError:
+                candidate -= timedelta(days=1)
+                continue
+            trade_dates.append(candidate)
+            candidate -= timedelta(days=1)
+        trade_dates.reverse()
         return [
             DailyBar(
                 symbol=symbol,
-                trade_date=end - timedelta(days=259 - offset),
+                trade_date=trade_date,
                 open=self.close,
                 high=self.close + Decimal("0.1"),
                 low=self.close - Decimal("0.1"),
@@ -257,27 +297,39 @@ class BindingScenarioProvider(DataProvider):
                 adjustment="qfq",
                 price_unit="CNY",
                 volume_unit="share",
-                observed_at=datetime.combine(
-                    end - timedelta(days=259 - offset), datetime.min.time()
-                ),
+                observed_at=calendar.session_close_at(trade_date),
                 source=self.metadata.provider_id,
-                fetched_at=datetime.now(),
+                fetched_at=now,
             )
-            for offset in range(260)
+            for trade_date in trade_dates
         ]
 
     def _series(self, end):
+        now = shanghai_now()
+        calendar = get_trading_calendar()
+        latest = min(end, calendar.latest_completed_session(now))
+        trade_dates = []
+        candidate = latest
+        while len(trade_dates) < 80:
+            try:
+                calendar.session_close_at(candidate)
+            except ValueError:
+                candidate -= timedelta(days=1)
+                continue
+            trade_dates.append(candidate)
+            candidate -= timedelta(days=1)
+        trade_dates.reverse()
         return {
             "rows": [
                 {
-                    "date": end - timedelta(days=79 - offset),
+                    "date": trade_date,
                     "close": self.close,
                     "volume": Decimal("1000"),
                 }
-                for offset in range(80)
+                for trade_date in trade_dates
             ],
             "source": self.metadata.provider_id,
-            "fetched_at": datetime.now(),
+            "fetched_at": now,
         }
 
     def get_index_history(self, symbol, start, end):
@@ -301,6 +353,7 @@ class PatternRefreshProvider(BindingScenarioProvider):
         return super().get_quote(symbol)
 
     def get_history(self, symbol, start, end):
+        fetched_at = shanghai_now()
         return [
             DailyBar(
                 symbol=symbol,
@@ -313,9 +366,12 @@ class PatternRefreshProvider(BindingScenarioProvider):
                 adjustment=row.adjustment,
                 price_unit=row.price_unit,
                 volume_unit=row.volume_unit,
-                observed_at=row.observed_at,
+                observed_at=to_shanghai_aware(
+                    row.observed_at,
+                    naive_is_shanghai=True,
+                ),
                 source=self.metadata.provider_id,
-                fetched_at=datetime.now(),
+                fetched_at=fetched_at,
             )
             for row in self.rows
         ]
@@ -1113,6 +1169,75 @@ def test_active_session_fresh_realtime_quote_can_confirm(
     assert session.query(TradePlan).filter_by(
         analysis_run_id=analyzed["run_id"]
     ).count() == 1
+
+
+def _patch_market_clock(monkeypatch, instant):
+    shanghai_instant = instant.astimezone(SHANGHAI_TZ)
+    monkeypatch.setattr(
+        "app.data_hub.trading_calendar.shanghai_now", lambda: shanghai_instant
+    )
+    monkeypatch.setattr("app.data_hub.router.shanghai_now", lambda: shanghai_instant)
+    monkeypatch.setattr(
+        "app.data_hub.effective_quality.shanghai_now", lambda: shanghai_instant
+    )
+    monkeypatch.setattr(
+        "app.providers.akshare_provider.shanghai_now", lambda: shanghai_instant
+    )
+    monkeypatch.setattr("app.services.plan_freeze.shanghai_now", lambda: instant)
+    monkeypatch.setattr(
+        "app.services.one_click_pipeline.shanghai_today",
+        lambda: shanghai_instant.date(),
+    )
+    monkeypatch.setattr(__name__ + ".shanghai_now", lambda: shanghai_instant)
+
+
+def test_freeze_market_validation_uses_shanghai_clock(
+    client, session, monkeypatch
+):
+    utc_morning = datetime(2026, 7, 24, 2, 0, tzinfo=timezone.utc)
+    _patch_market_clock(monkeypatch, utc_morning)
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    evaluated_at_values = []
+    from app.services import plan_freeze
+
+    resolver = plan_freeze.resolve_market_quality_binding
+
+    def capture_clock(db, binding, *, evaluated_at=None):
+        evaluated_at_values.append(evaluated_at)
+        return resolver(db, binding, evaluated_at=evaluated_at)
+
+    monkeypatch.setattr(plan_freeze, "resolve_market_quality_binding", capture_clock)
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 201, response.text
+    assert evaluated_at_values
+    assert all(
+        value.astimezone(SHANGHAI_TZ)
+        == datetime(2026, 7, 24, 10, 0, tzinfo=SHANGHAI_TZ)
+        for value in evaluated_at_values
+    )
+
+
+def test_confirm_at_utc_0200_is_treated_as_shanghai_morning(
+    client, session, monkeypatch
+):
+    utc_morning = datetime(2026, 7, 24, 2, 0, tzinfo=timezone.utc)
+    _patch_market_clock(monkeypatch, utc_morning)
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 201, response.text
+
+
+def test_confirm_at_utc_0700_is_treated_as_shanghai_close(
+    client, session, monkeypatch
+):
+    utc_morning = datetime(2026, 7, 24, 2, 0, tzinfo=timezone.utc)
+    _patch_market_clock(monkeypatch, utc_morning)
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    utc_close = datetime(2026, 7, 24, 7, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.services.plan_freeze.shanghai_now", lambda: utc_close)
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MARKET_BINDING_NOT_EXECUTABLE"
 
 
 def _research_evidence(analyzed):

@@ -25,7 +25,10 @@ from app.data_hub.market_subjects import (
 )
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter, request_fingerprint
-from app.data_hub.trading_calendar import get_trading_calendar
+from app.data_hub.trading_calendar import (
+    get_trading_calendar,
+    shanghai_now,
+)
 from app.domain.quality import DataQualityStatus
 from app.domain.quality_subject import SubjectRef, canonical_semantic_key
 from app.models import (
@@ -122,10 +125,22 @@ class MarketStub(DataProvider):
 
     def get_history(self, symbol: str, start: date, end: date) -> list[DailyBar]:
         self._fail_if_requested("get_history")
+        calendar = get_trading_calendar()
+        fetched_at = shanghai_now()
+        latest = min(end, calendar.latest_completed_session(fetched_at))
+        trade_dates = []
+        candidate = latest
+        while len(trade_dates) < self.row_count:
+            try:
+                calendar.session_close_at(candidate)
+            except ValueError:
+                candidate -= timedelta(days=1)
+                continue
+            trade_dates.append(candidate)
+            candidate -= timedelta(days=1)
+        trade_dates.reverse()
         rows = []
-        for offset in range(self.row_count):
-            trade_date = end - timedelta(days=self.row_count - 1 - offset)
-            observed_at = datetime.combine(trade_date, datetime.min.time())
+        for trade_date in trade_dates:
             rows.append(
                 DailyBar(
                     symbol=symbol,
@@ -138,9 +153,9 @@ class MarketStub(DataProvider):
                     adjustment=self.adjustment,
                     price_unit="CNY",
                     volume_unit="share",
-                    observed_at=observed_at,
+                    observed_at=calendar.session_close_at(trade_date),
                     source=self.provider_id,
-                    fetched_at=datetime.now(),
+                    fetched_at=fetched_at,
                 )
             )
         return rows
@@ -154,19 +169,31 @@ class MarketStub(DataProvider):
         return self._series_payload(end)
 
     def _series_payload(self, end: date) -> dict:
+        calendar = get_trading_calendar()
+        fetched_at = shanghai_now()
+        latest = min(end, calendar.latest_completed_session(fetched_at))
+        trade_dates = []
+        candidate = latest
+        while len(trade_dates) < self.series_row_count:
+            try:
+                calendar.session_close_at(candidate)
+            except ValueError:
+                candidate -= timedelta(days=1)
+                continue
+            trade_dates.append(candidate)
+            candidate -= timedelta(days=1)
+        trade_dates.reverse()
         return {
             "rows": [
                 {
-                    "date": end - timedelta(
-                        days=self.series_row_count - 1 - offset
-                    ),
+                    "date": trade_date,
                     "close": self.daily_close,
                     "volume": Decimal("10000"),
                 }
-                for offset in range(self.series_row_count)
+                for trade_date in trade_dates
             ],
             "source": self.provider_id,
-            "fetched_at": datetime.now(),
+            "fetched_at": fetched_at,
         }
 
 
@@ -258,6 +285,7 @@ def _persist_mapping_series(
     adjustment: str,
 ) -> list[MarketDailyBar]:
     payload = result.require_value()
+    calendar = get_trading_calendar()
     stored = []
     for row in payload["rows"]:
         close = Decimal(str(row["close"]))
@@ -272,7 +300,7 @@ def _persist_mapping_series(
             adjustment=adjustment,
             price_unit="CNY",
             volume_unit="share",
-            observed_at=datetime.combine(row["date"], datetime.min.time()),
+            observed_at=calendar.session_close_at(row["date"]),
             quality_status=result.quality_status.value,
             quality_record_id=result.quality_record_id,
             source=payload["source"],
@@ -2049,8 +2077,8 @@ def test_canonical_series_row_normalizes_decimal_and_timezone(session):
         original,
         open=original.open.quantize(Decimal("0.0000")),
         high=original.high.quantize(Decimal("0.0000")),
-        observed_at=original.observed_at.replace(tzinfo=timezone.utc),
-        fetched_at=original.fetched_at.replace(tzinfo=timezone.utc),
+        observed_at=original.observed_at.astimezone(timezone.utc),
+        fetched_at=original.fetched_at.astimezone(timezone.utc),
     )
     assert canonical_series_row(equivalent) == canonical_series_row(original)
 

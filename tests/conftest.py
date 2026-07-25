@@ -25,7 +25,15 @@ def deterministic_legacy_market_session(request, monkeypatch):
     D.1 contract tests inject their own clock and exercise the production
     validators without this compatibility fixture.
     """
-    if request.path.name == "test_market_time_contracts.py":
+    real_clock_tests = {
+        "test_freeze_market_validation_uses_shanghai_clock",
+        "test_confirm_at_utc_0200_is_treated_as_shanghai_morning",
+        "test_confirm_at_utc_0700_is_treated_as_shanghai_close",
+    }
+    if (
+        request.path.name == "test_market_time_contracts.py"
+        or request.node.name in real_clock_tests
+    ):
         yield
         return
 

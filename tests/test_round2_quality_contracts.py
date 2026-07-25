@@ -14,6 +14,7 @@ from app.data_hub.market_subjects import stock_daily_subject
 from app.data_hub.quality import canonical_digest, policy_for
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
+from app.data_hub.trading_calendar import get_trading_calendar, shanghai_now
 from app.domain.models import DecisionPackage
 from app.models import (
     CompanyAnnouncement,
@@ -58,7 +59,7 @@ class ContractProvider:
 
     def get_quote(self, symbol):
         price = self.overrides.get("quote", "10.82")
-        now = datetime.now()
+        now = shanghai_now()
         return Quote(
             symbol=symbol,
             name="test",
@@ -73,10 +74,20 @@ class ContractProvider:
 
     def get_history(self, symbol, start, end):
         close = Decimal(self.overrides.get("daily", "10.82"))
+        now = shanghai_now()
+        calendar = get_trading_calendar()
+        latest = min(end, calendar.latest_completed_session(now))
+        trade_dates = []
+        candidate = latest
+        while len(trade_dates) < 260:
+            if calendar.is_session(candidate):
+                trade_dates.append(candidate)
+            candidate -= timedelta(days=1)
+        trade_dates.reverse()
         return [
             DailyBar(
                 symbol=symbol,
-                trade_date=date.today() - timedelta(days=259 - index),
+                trade_date=trade_date,
                 open=close,
                 high=close + Decimal("0.1"),
                 low=close - Decimal("0.1"),
@@ -85,14 +96,11 @@ class ContractProvider:
                 adjustment="qfq",
                 price_unit="CNY",
                 volume_unit="share",
-                observed_at=datetime.combine(
-                    date.today() - timedelta(days=259 - index),
-                    datetime.min.time(),
-                ),
+                observed_at=calendar.session_close_at(trade_date),
                 source=self.provider_id,
-                fetched_at=datetime.now(),
+                fetched_at=now,
             )
-            for index in range(260)
+            for trade_date in trade_dates
         ]
 
     def company_profile(self, symbol):
@@ -284,15 +292,23 @@ def test_market_sync_preserves_stale_quality_in_cache(client, session, monkeypat
 
     def stale_history(symbol, start, end):
         rows = original_history(symbol, start, end)
+        calendar = get_trading_calendar()
+        trade_dates = []
+        candidate = rows[-1].trade_date - timedelta(days=10)
+        while len(trade_dates) < len(rows):
+            if calendar.is_session(candidate):
+                trade_dates.append(candidate)
+            candidate -= timedelta(days=1)
+        trade_dates.reverse()
         return [
             DailyBar(
                 **{
                     **row.__dict__,
-                    "trade_date": row.trade_date - timedelta(days=10),
-                    "observed_at": row.observed_at - timedelta(days=10),
+                    "trade_date": trade_date,
+                    "observed_at": calendar.session_close_at(trade_date),
                 }
             )
-            for row in rows
+            for row, trade_date in zip(rows, trade_dates, strict=True)
         ]
 
     stale.get_history = stale_history
@@ -376,10 +392,12 @@ def test_different_announcement_business_content_conflicts(session):
 
 
 def test_akshare_and_tushare_daily_use_same_adjustment_contract():
+    provider = AKShareProvider(now_fn=shanghai_now)
+    completed = provider.calendar.latest_completed_session(shanghai_now())
     frame = pd.DataFrame(
-        [{"日期": date.today(), "开盘": 10, "最高": 11, "最低": 9, "收盘": 10.5, "成交量": 1}]
+        [{"日期": completed, "开盘": 10, "最高": 11, "最低": 9, "收盘": 10.5, "成交量": 1}]
     )
-    bar = AKShareProvider._history_rows(
+    bar = provider._history_rows(
         frame,
         "300502",
         {"date": "日期", "open": "开盘", "high": "最高", "low": "最低", "close": "收盘", "volume": "成交量"},

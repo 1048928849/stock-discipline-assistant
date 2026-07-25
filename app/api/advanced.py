@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.data_hub.contracts import ProviderUnavailableError
 from app.data_hub.market_subjects import stock_daily_subject
+from app.data_hub.trading_calendar import shanghai_today
 from app.database import get_db
 from app.errors import AppError
 from app.models import (
@@ -310,8 +311,9 @@ def market_sync(
     provider = build_data_hub(db)
     try:
         quote_result = provider.get_quote(symbol)
+        market_day = shanghai_today()
         history_result = provider.get_history(
-            symbol, date.today() - timedelta(days=days), date.today()
+            symbol, market_day - timedelta(days=days), market_day
         )
         # Acquisition audit survives a later rollback of business cache writes.
         db.commit()

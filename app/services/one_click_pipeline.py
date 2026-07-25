@@ -17,6 +17,7 @@ from app.data_hub.market_subjects import (
     stock_daily_subject,
 )
 from app.data_hub.router import DataHubRouter
+from app.data_hub.trading_calendar import shanghai_today
 from app.domain.package_builder import build_decision_package
 from app.errors import AppError
 from app.models import (
@@ -157,7 +158,7 @@ def _sync_stock(
         )
     try:
         history_result = provider.get_history(
-            symbol, date.today() - timedelta(days=900), date.today()
+            symbol, shanghai_today() - timedelta(days=900), shanghai_today()
         )
         # Keep acquisition audit durable while cache replacement remains rollbackable.
         db.commit()
@@ -479,7 +480,9 @@ def _market_assessment(db: Session, provider: DataHubRouter) -> tuple[dict, dict
         )
     try:
         history_result = provider.get_index_history(
-            "csi000300", date.today() - timedelta(days=240), date.today()
+            "csi000300",
+            shanghai_today() - timedelta(days=240),
+            shanghai_today(),
         )
         # Preserve the acquisition audit before starting the replace transaction.
         db.commit()
@@ -805,7 +808,9 @@ def _sector_assessment(
         )
     try:
         history_result = provider.get_sector_history(
-            board_name, date.today() - timedelta(days=240), date.today()
+            board_name,
+            shanghai_today() - timedelta(days=240),
+            shanghai_today(),
         )
         # Preserve the acquisition audit before starting the replace transaction.
         db.commit()

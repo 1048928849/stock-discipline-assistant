@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pandas as pd
@@ -13,19 +13,24 @@ from app.data_hub.contracts import (
     Quote,
     validate_daily_bar_contract,
 )
+from app.data_hub.effective_quality import EffectiveQualityResolver
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
 from app.data_hub.trading_calendar import (
     SHANGHAI_TZ,
     TradingPhase,
     XSHGTradingCalendar,
+    shanghai_now,
+    to_shanghai_aware,
 )
 from app.domain.quality import DataQualityStatus
-from app.models import DataProviderCallLog
+from app.domain.quality_subject import EffectiveQualityRequest, SubjectRef
+from app.models import DataProviderCallLog, MarketDailyBar
 from app.providers.akshare_provider import AKShareProvider
 from app.providers.external_http_provider import ProfessionalMarketApiProvider
 from app.providers.tushare_provider import TushareProvider
 from app.services.market_cache import persist_market_quote, resolve_cached_quote
+from app.services.one_click_pipeline import _sync_stock
 
 
 MORNING = datetime(2026, 7, 24, 10, 0, tzinfo=SHANGHAI_TZ)
@@ -355,13 +360,14 @@ def test_tushare_history_is_explicitly_unadjusted():
     )
 
 
-def _professional():
+def _professional(now=MORNING):
     return ProfessionalMarketApiProvider(
         Settings(
             professional_market_api_enabled=True,
             professional_market_api_url="https://example.test",
             professional_market_api_key="secret",
-        )
+        ),
+        now_fn=lambda: now,
     )
 
 
@@ -474,7 +480,9 @@ def _bar(day, **changes):
         "adjustment": "qfq",
         "price_unit": "CNY",
         "volume_unit": "share",
-        "observed_at": datetime.combine(day, datetime.min.time()),
+        "observed_at": datetime.combine(
+            day, datetime.min.time(), tzinfo=SHANGHAI_TZ
+        ).replace(hour=15),
         "source": "test",
         "fetched_at": MORNING,
     }
@@ -495,7 +503,11 @@ def _bar(day, **changes):
 def test_daily_bar_contract_rejects_semantic_mismatch(bars):
     with pytest.raises(ProviderUnavailableError):
         validate_daily_bar_contract(
-            bars, capability="market.daily.qfq", expected_symbol="300502"
+            bars,
+            capability="market.daily.qfq",
+            expected_symbol="300502",
+            evaluated_at=MORNING,
+            calendar=XSHGTradingCalendar(),
         )
 
 
@@ -517,7 +529,7 @@ def _persist_active_realtime_quote(session, observed_at=MORNING):
     return result
 
 
-def test_realtime_quote_becomes_non_executable_at_lunch(session):
+def test_realtime_cache_expires_at_lunch_with_real_calendar(session):
     _persist_active_realtime_quote(session)
     lunch = datetime(2026, 7, 24, 12, 0, tzinfo=SHANGHAI_TZ)
     selected = resolve_cached_quote(
@@ -530,7 +542,7 @@ def test_realtime_quote_becomes_non_executable_at_lunch(session):
     assert selected.effective_quality.effective_quality == DataQualityStatus.STALE
 
 
-def test_realtime_quote_becomes_non_executable_after_close(session):
+def test_realtime_cache_expires_after_close_with_real_calendar(session):
     _persist_active_realtime_quote(session)
     close = datetime(2026, 7, 24, 15, 0, tzinfo=SHANGHAI_TZ)
     selected = resolve_cached_quote(
@@ -615,3 +627,372 @@ def test_bound_realtime_quote_is_executable_during_active_session(session):
     )
     assert binding_selection.executable is True
     assert binding_selection.quality_record_id == result.quality_record_id
+
+
+def _validate_daily(bars, evaluated_at):
+    validate_daily_bar_contract(
+        bars,
+        capability="market.daily.qfq",
+        expected_symbol="300502",
+        evaluated_at=evaluated_at,
+        calendar=XSHGTradingCalendar(),
+    )
+
+
+def test_shanghai_now_is_timezone_aware():
+    current = shanghai_now()
+    assert current.tzinfo == SHANGHAI_TZ
+    assert current.utcoffset() == timedelta(hours=8)
+
+
+def test_utc_instant_converts_to_shanghai_session():
+    utc_morning = datetime(2026, 7, 24, 2, 0, tzinfo=timezone.utc)
+    converted = to_shanghai_aware(utc_morning)
+    assert converted == MORNING
+    assert XSHGTradingCalendar().market_phase(utc_morning) == TradingPhase.MORNING_SESSION
+
+
+def test_router_default_clock_does_not_depend_on_host_timezone(session, monkeypatch):
+    utc_morning = datetime(2026, 7, 24, 2, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr("app.data_hub.router.shanghai_now", lambda: utc_morning)
+    router = DataHubRouter(session, ProviderRegistry())
+    assert router._now() == MORNING
+
+
+def test_effective_quality_default_clock_uses_shanghai(session, monkeypatch):
+    monkeypatch.setattr("app.data_hub.effective_quality.shanghai_now", lambda: MORNING)
+    request = EffectiveQualityRequest(
+        capability="market.quote.realtime",
+        subject=SubjectRef(
+            subject_type="stock",
+            subject_id="300502",
+            semantic_key="realtime/CNY",
+        ),
+    )
+    result = EffectiveQualityResolver(session).resolve(request)
+    assert result.evaluated_at == MORNING
+
+
+def test_verified_market_result_does_not_mix_naive_and_aware_times(session):
+    result = _router(
+        session,
+        MORNING,
+        QuoteProvider("verified-a", _quote()),
+        QuoteProvider("verified-b", _quote(), priority=2),
+    ).get_quote("300502")
+    assert result.quality_status == DataQualityStatus.VERIFIED
+
+
+def _assert_current_day_daily_bar_is_rejected(evaluated_at):
+    with pytest.raises(ProviderUnavailableError):
+        _validate_daily(
+            [_bar(date(2026, 7, 24), fetched_at=evaluated_at)], evaluated_at
+        )
+
+
+def test_morning_current_day_daily_bar_is_rejected():
+    _assert_current_day_daily_bar_is_rejected(MORNING)
+
+
+def test_lunch_current_day_daily_bar_is_rejected():
+    _assert_current_day_daily_bar_is_rejected(
+        datetime(2026, 7, 24, 12, 0, tzinfo=SHANGHAI_TZ)
+    )
+
+
+def test_after_close_current_day_daily_bar_is_accepted():
+    evaluated_at = datetime(2026, 7, 24, 15, 1, tzinfo=SHANGHAI_TZ)
+    _validate_daily([_bar(date(2026, 7, 24), fetched_at=evaluated_at)], evaluated_at)
+
+
+def test_previous_completed_daily_bar_is_accepted():
+    _validate_daily([_bar(date(2026, 7, 23))], MORNING)
+
+
+def test_daily_observed_at_must_equal_session_close():
+    with pytest.raises(ProviderUnavailableError):
+        _validate_daily(
+            [_bar(date(2026, 7, 23), observed_at=MORNING.replace(day=23))], MORNING
+        )
+
+
+def test_daily_trade_date_must_be_exchange_session():
+    saturday = date(2026, 7, 25)
+    with pytest.raises(ProviderUnavailableError):
+        _validate_daily(
+            [
+                _bar(
+                    saturday,
+                    observed_at=datetime(2026, 7, 25, 15, tzinfo=SHANGHAI_TZ),
+                )
+            ],
+            datetime(2026, 7, 27, 10, tzinfo=SHANGHAI_TZ),
+        )
+
+
+def test_daily_batch_rejects_mixed_sources():
+    with pytest.raises(ProviderUnavailableError):
+        _validate_daily(
+            [
+                _bar(date(2026, 7, 22), source="a"),
+                _bar(date(2026, 7, 23), source="b"),
+            ],
+            MORNING,
+        )
+
+
+def test_daily_batch_rejects_mixed_timezone_semantics():
+    utc_close = datetime(2026, 7, 22, 7, tzinfo=timezone.utc)
+    utc_fetch = datetime(2026, 7, 24, 2, tzinfo=timezone.utc)
+    with pytest.raises(ProviderUnavailableError):
+        _validate_daily(
+            [
+                _bar(date(2026, 7, 22), observed_at=utc_close, fetched_at=utc_fetch),
+                _bar(date(2026, 7, 23)),
+            ],
+            MORNING,
+        )
+
+
+def test_daily_batch_rejects_mixed_fetched_times():
+    with pytest.raises(ProviderUnavailableError):
+        _validate_daily(
+            [
+                _bar(date(2026, 7, 22)),
+                _bar(date(2026, 7, 23), fetched_at=MORNING + timedelta(seconds=2)),
+            ],
+            MORNING + timedelta(seconds=2),
+        )
+
+
+def test_daily_rejects_future_fetched_at():
+    with pytest.raises(ProviderUnavailableError):
+        _validate_daily(
+            [_bar(date(2026, 7, 23), fetched_at=MORNING + timedelta(minutes=1))],
+            MORNING,
+        )
+
+
+def test_realtime_rejects_future_fetched_at(session):
+    result = _router(
+        session,
+        MORNING,
+        QuoteProvider(
+            "future-fetch",
+            _quote(observed_at=MORNING, fetched_at=MORNING + timedelta(minutes=1)),
+        ),
+    ).get_quote("300502")
+    assert result.quality_status == DataQualityStatus.MISSING
+
+
+def test_latest_close_rejects_future_fetched_at(session):
+    result = _router(
+        session,
+        MORNING,
+        QuoteProvider(
+            "future-fetch",
+            _quote(
+                quote_type="latest_close",
+                observed_at=datetime(2026, 7, 23, 15, tzinfo=SHANGHAI_TZ),
+                fetched_at=MORNING + timedelta(minutes=1),
+            ),
+        ),
+    ).get_latest_close("300502")
+    assert result.quality_status == DataQualityStatus.MISSING
+
+
+def _history_frame(*days):
+    return pd.DataFrame(
+        [
+            {
+                "date": day.isoformat(),
+                "open": 10,
+                "high": 11,
+                "low": 9,
+                "close": 10,
+                "volume": 100,
+            }
+            for day in days
+        ]
+    )
+
+
+def _akshare_history_rows(provider, *days):
+    return provider._history_rows(
+        _history_frame(*days),
+        "300502",
+        {
+            "date": "date",
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "volume": "volume",
+        },
+        "akshare-test",
+    )
+
+
+def test_akshare_history_filters_or_rejects_incomplete_current_session():
+    provider = AKShareProvider(now_fn=lambda: MORNING)
+    rows = _akshare_history_rows(
+        provider, date(2026, 7, 23), date(2026, 7, 24)
+    )
+    assert [row.trade_date for row in rows] == [date(2026, 7, 23)]
+
+
+def test_akshare_history_uses_1500_observed_at():
+    row = _akshare_history_rows(
+        AKShareProvider(now_fn=lambda: MORNING), date(2026, 7, 23)
+    )[0]
+    assert row.observed_at == datetime(2026, 7, 23, 15, tzinfo=SHANGHAI_TZ)
+
+
+def test_akshare_history_fetched_at_is_shanghai_aware():
+    row = _akshare_history_rows(
+        AKShareProvider(now_fn=lambda: MORNING), date(2026, 7, 23)
+    )[0]
+    assert row.fetched_at == MORNING
+    assert row.fetched_at.tzinfo == SHANGHAI_TZ
+
+
+def test_akshare_benchmark_fetched_at_uses_shanghai_clock():
+    result = AKShareProvider(now_fn=lambda: MORNING)._benchmark_rows(
+        _history_frame(*[date(2026, 6, 1) + timedelta(days=index) for index in range(20)]),
+        "benchmark-test",
+    )
+    assert result["fetched_at"] == MORNING
+
+
+def test_professional_quote_rejects_naive_timestamp():
+    provider = _professional()
+    provider._get = lambda *_args, **_kwargs: {
+        "symbol": "300502",
+        "price": 10,
+        "quote_type": "realtime",
+        "observed_at": "2026-07-24T10:00:00",
+        "fetched_at": "2026-07-24T10:00:00",
+        "price_unit": "CNY",
+    }
+    with pytest.raises(ProviderUnavailableError):
+        provider.get_quote("300502")
+
+
+def test_professional_quote_accepts_utc_timestamp_and_normalizes():
+    provider = _professional()
+    provider._get = lambda *_args, **_kwargs: {
+        "symbol": "300502",
+        "price": 10,
+        "quote_type": "realtime",
+        "observed_at": "2026-07-24T02:00:00+00:00",
+        "fetched_at": "2026-07-24T02:00:00+00:00",
+        "price_unit": "CNY",
+    }
+    quote = provider.get_quote("300502")
+    assert quote.observed_at == MORNING
+    assert quote.fetched_at == MORNING
+
+
+def test_professional_quote_rejects_future_fetched_at(session):
+    provider = _professional()
+    provider._get = lambda *_args, **_kwargs: {
+        "symbol": "300502",
+        "price": 10,
+        "quote_type": "realtime",
+        "observed_at": MORNING.isoformat(),
+        "fetched_at": (MORNING + timedelta(minutes=1)).isoformat(),
+        "price_unit": "CNY",
+    }
+    result = _router(session, MORNING, provider).get_quote("300502")
+    assert result.quality_status == DataQualityStatus.MISSING
+
+
+def test_professional_history_rejects_naive_fetched_at():
+    _assert_professional_history_rejected(
+        [_history_row(fetched_at="2026-07-24T10:00:00")]
+    )
+
+
+def test_professional_history_rejects_incomplete_session():
+    provider = _professional(MORNING)
+    provider._get = lambda *_args, **_kwargs: {
+        "rows": [
+            _history_row(
+                date="2026-07-24",
+                fetched_at=MORNING.isoformat(),
+            )
+        ]
+    }
+    with pytest.raises(ProviderUnavailableError):
+        provider.get_history("300502", date(2026, 7, 23), date(2026, 7, 24))
+
+
+def test_professional_history_uses_session_close_when_observed_at_omitted():
+    provider = _professional(MORNING)
+    provider._get = lambda *_args, **_kwargs: {"rows": [_history_row()]}
+    bar = provider.get_history("300502", date(2026, 7, 23), date(2026, 7, 23))[0]
+    assert bar.observed_at == datetime(2026, 7, 23, 15, tzinfo=SHANGHAI_TZ)
+
+
+class CompletedSessionProvider(DataProvider):
+    metadata = ProviderMetadata(
+        provider_id="completed-session-test",
+        supported_capabilities=(
+            "market.daily.qfq",
+            "market.quote.realtime",
+        ),
+        priority=1,
+        realtime_supported=True,
+    )
+
+    def __init__(self, now):
+        self.now = now
+        self.calendar = XSHGTradingCalendar()
+
+    def health_check(self, probe=False):
+        return {"status": "healthy"}
+
+    def get_history(self, symbol, start, end):
+        trade_dates = []
+        candidate = self.now.date()
+        while len(trade_dates) < 260:
+            if self.calendar.is_session(candidate):
+                trade_dates.append(candidate)
+            candidate -= timedelta(days=1)
+        trade_dates.reverse()
+        return [
+            _bar(
+                trade_date,
+                fetched_at=self.now,
+                source=self.metadata.provider_id,
+            )
+            for trade_date in trade_dates
+        ]
+
+    def get_quote(self, symbol):
+        return _quote(observed_at=self.now, fetched_at=self.now)
+
+
+def _sync_stock_at(session, now):
+    provider = CompletedSessionProvider(now)
+    router = _router(session, now, provider)
+    return _sync_stock(session, "300502", router, refresh=True)
+
+
+def test_one_click_morning_analysis_never_uses_partial_current_daily_bar(session):
+    step, _ = _sync_stock_at(session, MORNING)
+    assert step["status"] == "failed"
+    assert session.query(MarketDailyBar).count() == 0
+
+
+def test_one_click_after_close_can_use_completed_current_daily_bar(session):
+    after_close = datetime(2026, 7, 24, 15, 1, tzinfo=SHANGHAI_TZ)
+    step, context = _sync_stock_at(session, after_close)
+    latest = (
+        session.query(MarketDailyBar)
+        .order_by(MarketDailyBar.trade_date.desc())
+        .first()
+    )
+    assert step["status"] == "success"
+    assert context["data_date"] == "2026-07-24"
+    assert latest.trade_date == date(2026, 7, 24)

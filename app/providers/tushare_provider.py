@@ -16,9 +16,11 @@ from app.data_hub.contracts import (
     Quote,
 )
 from app.data_hub.trading_calendar import (
-    SHANGHAI_TZ,
     TradingCalendar,
     get_trading_calendar,
+    shanghai_now,
+    shanghai_today,
+    to_shanghai_aware,
 )
 
 
@@ -39,7 +41,7 @@ class TushareProvider(
     ):
         self.settings = settings
         self.calendar = calendar or get_trading_calendar()
-        self.now_fn = now_fn or (lambda: datetime.now(SHANGHAI_TZ))
+        self.now_fn = now_fn or shanghai_now
         self.metadata = ProviderMetadata(
             provider_id="tushare",
             supported_capabilities=(
@@ -93,17 +95,19 @@ class TushareProvider(
         if not probe:
             return {"status": "configured", "message": "凭据已配置，尚未主动探测"}
         try:
-            rows = self._pro().trade_cal(exchange="SSE", start_date=date.today().strftime("%Y%m%d"))
+            rows = self._pro().trade_cal(
+                exchange="SSE", start_date=shanghai_today().strftime("%Y%m%d")
+            )
             return {"status": "healthy", "message": f"健康检查成功，返回{len(rows)}行"}
         except Exception as exc:
             return {"status": "unhealthy", "message": f"{type(exc).__name__}: {str(exc)[:160]}"}
 
     def get_quote(self, symbol: str) -> Quote:
-        fetched_at = self.now_fn()
-        if fetched_at.tzinfo is None:
-            fetched_at = fetched_at.replace(tzinfo=SHANGHAI_TZ)
-        else:
-            fetched_at = fetched_at.astimezone(SHANGHAI_TZ)
+        raw_fetched_at = self.now_fn()
+        fetched_at = to_shanghai_aware(
+            raw_fetched_at,
+            naive_is_shanghai=raw_fetched_at.tzinfo is None,
+        )
         expected_session = self.calendar.latest_completed_session(fetched_at)
         frame = self._pro().daily(
             ts_code=self._code(symbol),
@@ -140,7 +144,11 @@ class TushareProvider(
             end_date=end.strftime("%Y%m%d"),
         )
         rows = []
-        fetched_at = self.now_fn()
+        raw_fetched_at = self.now_fn()
+        fetched_at = to_shanghai_aware(
+            raw_fetched_at,
+            naive_is_shanghai=raw_fetched_at.tzinfo is None,
+        )
         for row in reversed(self._records(frame)):
             rows.append(
                 DailyBar(
@@ -180,7 +188,15 @@ class TushareProvider(
         ]
         if not rows:
             raise ProviderUnavailableError("Tushare未返回指数数据")
-        return {"rows": rows, "source": "Tushare/index_daily", "fetched_at": datetime.now()}
+        raw_fetched_at = self.now_fn()
+        return {
+            "rows": rows,
+            "source": "Tushare/index_daily",
+            "fetched_at": to_shanghai_aware(
+                raw_fetched_at,
+                naive_is_shanghai=raw_fetched_at.tzinfo is None,
+            ),
+        }
 
     def get_sector_history(self, industry: str, start: date, end: date) -> dict:
         raise ProviderUnavailableError("Tushare行业名称需要先映射指数代码，当前免费配置安全跳过")

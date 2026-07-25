@@ -15,9 +15,11 @@ from app.data_hub.contracts import (
     Quote,
 )
 from app.data_hub.trading_calendar import (
-    SHANGHAI_TZ,
     TradingCalendar,
     get_trading_calendar,
+    shanghai_now,
+    shanghai_today,
+    to_shanghai_aware,
 )
 
 
@@ -43,7 +45,7 @@ class AKShareProvider(
         self.retries = max(1, retries)
         self.timeout = timeout
         self.calendar = calendar or get_trading_calendar()
-        self.now_fn = now_fn or (lambda: datetime.now(SHANGHAI_TZ))
+        self.now_fn = now_fn or shanghai_now
         self.metadata = ProviderMetadata(
             provider_id="akshare",
             supported_capabilities=(
@@ -127,11 +129,11 @@ class AKShareProvider(
         if rows.empty:
             raise ProviderUnavailableError(f"{api_name} 未找到股票代码 {symbol}")
         row = rows.iloc[0]
-        fetched_at = self.now_fn()
-        if fetched_at.tzinfo is None:
-            fetched_at = fetched_at.replace(tzinfo=SHANGHAI_TZ)
-        else:
-            fetched_at = fetched_at.astimezone(SHANGHAI_TZ)
+        raw_fetched_at = self.now_fn()
+        fetched_at = to_shanghai_aware(
+            raw_fetched_at,
+            naive_is_shanghai=raw_fetched_at.tzinfo is None,
+        )
         if self.calendar.is_realtime_session(fetched_at):
             # Spot endpoints expose no exchange timestamp. During an active
             # session, request completion is the synchronous snapshot time.
@@ -209,8 +211,8 @@ class AKShareProvider(
                 errors.append(str(exc))
         raise ProviderUnavailableError("实时行情全部数据源失败：" + "；".join(errors))
 
-    @staticmethod
     def _history_rows(
+        self,
         frame,
         symbol: str,
         columns: dict[str, str],
@@ -222,13 +224,21 @@ class AKShareProvider(
             raise ProviderUnavailableError(
                 f"{source} 返回结构变化，缺少字段：{required - set(frame.columns)}"
             )
-        fetched_at = datetime.now()
+        raw_fetched_at = self.now_fn()
+        fetched_at = to_shanghai_aware(
+            raw_fetched_at,
+            naive_is_shanghai=raw_fetched_at.tzinfo is None,
+        )
+        latest_completed = self.calendar.latest_completed_session(fetched_at)
         rows = []
         for _, row in frame.iterrows():
+            trade_date = date.fromisoformat(str(row[columns["date"]])[:10])
+            if trade_date > latest_completed:
+                continue
             rows.append(
                 DailyBar(
                     symbol=symbol,
-                    trade_date=date.fromisoformat(str(row[columns["date"]])[:10]),
+                    trade_date=trade_date,
                     open=Decimal(str(row[columns["open"]])),
                     high=Decimal(str(row[columns["high"]])),
                     low=Decimal(str(row[columns["low"]])),
@@ -237,10 +247,7 @@ class AKShareProvider(
                     adjustment="qfq",
                     price_unit="CNY",
                     volume_unit="share",
-                    observed_at=datetime.combine(
-                        date.fromisoformat(str(row[columns["date"]])[:10]),
-                        datetime.min.time(),
-                    ),
+                    observed_at=self.calendar.session_close_at(trade_date),
                     source=source,
                     fetched_at=fetched_at,
                 )
@@ -330,8 +337,7 @@ class AKShareProvider(
                 errors.append(str(exc))
         raise ProviderUnavailableError("前复权历史行情全部数据源失败：" + "；".join(errors))
 
-    @staticmethod
-    def _benchmark_rows(frame, source: str) -> dict:
+    def _benchmark_rows(self, frame, source: str) -> dict:
         aliases = {
             "date": ("日期", "date"),
             "close": ("收盘", "close"),
@@ -354,7 +360,15 @@ class AKShareProvider(
         if len(rows) < 20:
             raise ProviderUnavailableError(f"{source} 历史数据不足20个交易日")
         rows.sort(key=lambda item: str(item["date"]))
-        return {"rows": rows, "source": source, "fetched_at": datetime.now()}
+        raw_fetched_at = self.now_fn()
+        return {
+            "rows": rows,
+            "source": source,
+            "fetched_at": to_shanghai_aware(
+                raw_fetched_at,
+                naive_is_shanghai=raw_fetched_at.tzinfo is None,
+            ),
+        }
 
     def get_index_history(self, symbol: str, start: date, end: date) -> dict:
         errors = []
@@ -481,7 +495,9 @@ class AKShareProvider(
             profile = self._records(frame, 1)[0]
             try:
                 industry = self._ak().stock_industry_change_cninfo(
-                    symbol=symbol, start_date="19900101", end_date=date.today().strftime("%Y%m%d")
+                    symbol=symbol,
+                    start_date="19900101",
+                    end_date=shanghai_today().strftime("%Y%m%d"),
                 )
                 if not industry.empty:
                     import pandas as pd

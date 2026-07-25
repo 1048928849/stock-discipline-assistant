@@ -155,6 +155,18 @@ def _shanghai_datetime(value: datetime, field: str) -> datetime:
     return value.astimezone(SHANGHAI_TZ)
 
 
+def _aware_shanghai_datetime(value: datetime, field: str) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ProviderUnavailableError(
+            f"market contract requires timezone-aware {field}"
+        )
+    return value.astimezone(SHANGHAI_TZ)
+
+
+def _timezone_semantic(value: datetime) -> str:
+    return str(getattr(value.tzinfo, "key", None) or value.tzinfo)
+
+
 def validate_quote_contract(
     quote: Quote,
     *,
@@ -180,6 +192,8 @@ def validate_quote_contract(
         raise ProviderUnavailableError("quote contract observed_at is after fetched_at")
     if observed > current + _FUTURE_TIME_TOLERANCE:
         raise ProviderUnavailableError("quote contract observed_at is in the future")
+    if fetched > current + _FUTURE_TIME_TOLERANCE:
+        raise ProviderUnavailableError("quote contract fetched_at is in the future")
 
     if capability == "market.quote.realtime":
         if quote.quote_type != "realtime":
@@ -225,6 +239,8 @@ def validate_daily_bar_contract(
     *,
     capability: str,
     expected_symbol: str,
+    evaluated_at: datetime,
+    calendar: TradingCalendar,
 ) -> None:
     expected_adjustment = {
         "market.daily.qfq": "qfq",
@@ -236,7 +252,12 @@ def validate_daily_bar_contract(
         )
     if not isinstance(bars, list) or not bars:
         raise ProviderUnavailableError("daily contract requires a non-empty list")
+    current = _aware_shanghai_datetime(evaluated_at, "evaluated_at")
+    latest_completed = calendar.latest_completed_session(current)
     dates: list[date] = []
+    sources: set[str] = set()
+    timezone_semantics: set[tuple[str, str]] = set()
+    fetched_times: list[datetime] = []
     for bar in bars:
         if not isinstance(bar, DailyBar):
             raise ProviderUnavailableError("daily contract requires DailyBar rows")
@@ -248,10 +269,28 @@ def validate_daily_bar_contract(
             raise ProviderUnavailableError("daily contract adjustment mismatch")
         if bar.price_unit != "CNY" or bar.volume_unit != "share":
             raise ProviderUnavailableError("daily contract unit mismatch")
-        observed = _shanghai_datetime(bar.observed_at, "observed_at")
-        fetched = _shanghai_datetime(bar.fetched_at, "fetched_at")
-        if observed.date() != bar.trade_date:
-            raise ProviderUnavailableError("daily contract observed_at date mismatch")
+        observed = _aware_shanghai_datetime(bar.observed_at, "observed_at")
+        fetched = _aware_shanghai_datetime(bar.fetched_at, "fetched_at")
+        timezone_semantics.add(
+            (
+                _timezone_semantic(bar.observed_at),
+                _timezone_semantic(bar.fetched_at),
+            )
+        )
+        try:
+            expected_close = calendar.session_close_at(bar.trade_date)
+        except ValueError as exc:
+            raise ProviderUnavailableError(
+                "daily contract trade_date is not an exchange session"
+            ) from exc
+        if bar.trade_date > latest_completed:
+            raise ProviderUnavailableError(
+                "daily contract contains an incomplete exchange session"
+            )
+        if observed != expected_close:
+            raise ProviderUnavailableError(
+                "daily contract observed_at must equal official session close"
+            )
         prices = (bar.open, bar.high, bar.low, bar.close)
         if not all(isinstance(value, Decimal) for value in (*prices, bar.volume)):
             raise ProviderUnavailableError("daily contract requires decimal values")
@@ -265,9 +304,19 @@ def validate_daily_bar_contract(
             raise ProviderUnavailableError("daily contract volume is negative")
         if observed > fetched + _FUTURE_TIME_TOLERANCE:
             raise ProviderUnavailableError("daily contract observed_at is after fetched_at")
+        if fetched > current + _FUTURE_TIME_TOLERANCE:
+            raise ProviderUnavailableError("daily contract fetched_at is in the future")
         if not bar.source:
             raise ProviderUnavailableError("daily contract requires source lineage")
         dates.append(bar.trade_date)
+        sources.add(bar.source)
+        fetched_times.append(fetched)
+    if len(sources) != 1:
+        raise ProviderUnavailableError("daily contract source mismatch")
+    if len(timezone_semantics) != 1:
+        raise ProviderUnavailableError("daily contract timezone semantics mismatch")
+    if max(fetched_times) - min(fetched_times) > _FUTURE_TIME_TOLERANCE:
+        raise ProviderUnavailableError("daily contract fetched_at mismatch")
     if dates != sorted(set(dates)):
         raise ProviderUnavailableError(
             "daily contract trade_date must be unique and increasing"

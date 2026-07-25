@@ -8,7 +8,7 @@ from app.data_hub.contracts import DailyBar, DataProvider, ProviderMetadata, Quo
 from app.data_hub.market_subjects import stock_daily_subject
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
-from app.data_hub.trading_calendar import get_trading_calendar
+from app.data_hub.trading_calendar import get_trading_calendar, shanghai_now
 from app.models import (
     CompanyProfile,
     DataQualityRecord,
@@ -80,8 +80,7 @@ class GeneratorMarketProvider(DataProvider):
 
 
 def seed_pattern(session, symbol="300502", state="ready", price=None):
-    now = datetime.now()
-    start = date.today() - timedelta(days=309)
+    now = shanghai_now()
     rows = []
     for index in range(260):
         close = 5 + index * 0.019
@@ -102,11 +101,20 @@ def seed_pattern(session, symbol="300502", state="ready", price=None):
     else:
         rows.extend([(10.02, 10.15, 9.9, 100.0)] * 3)
     # 让最后一根始终落在今天，满足新鲜度检查。
-    start = date.today() - timedelta(days=len(rows) - 1)
+    calendar = get_trading_calendar()
+    latest_session = calendar.latest_completed_session(now)
+    trade_dates = []
+    candidate = latest_session
+    while len(trade_dates) < len(rows):
+        if calendar.is_session(candidate):
+            trade_dates.append(candidate)
+        candidate -= timedelta(days=1)
+    trade_dates.reverse()
+    start = trade_dates[0]
     bars = [
         DailyBar(
             symbol=symbol,
-            trade_date=start + timedelta(days=index),
+            trade_date=trade_dates[index],
             open=Decimal(str(close - 0.03)),
             high=Decimal(str(high)),
             low=Decimal(str(low)),
@@ -115,9 +123,7 @@ def seed_pattern(session, symbol="300502", state="ready", price=None):
             adjustment="qfq",
             price_unit="CNY",
             volume_unit="share",
-            observed_at=datetime.combine(
-                start + timedelta(days=index), datetime.min.time()
-            ),
+            observed_at=calendar.session_close_at(trade_dates[index]),
             source="akshare_tencent_qfq",
             fetched_at=now,
         )
@@ -138,7 +144,7 @@ def seed_pattern(session, symbol="300502", state="ready", price=None):
     registry = ProviderRegistry()
     registry.register(GeneratorMarketProvider(bars, quote))
     router = DataHubRouter(session, registry)
-    history_result = router.get_history(symbol, start, date.today())
+    history_result = router.get_history(symbol, start, latest_session)
     replace_market_series(
         session,
         router,
@@ -309,17 +315,27 @@ def seed_governed_analysis(session, monkeypatch):
         end=end,
     )
     session.commit()
+    now = shanghai_now()
+    calendar = get_trading_calendar()
+    latest_session = calendar.latest_completed_session(now)
+    trade_dates = []
+    candidate = latest_session
+    while len(trade_dates) < 80:
+        if calendar.is_session(candidate):
+            trade_dates.append(candidate)
+        candidate -= timedelta(days=1)
+    trade_dates.reverse()
     rows = {
         "rows": [
             {
-                "date": date.today() - timedelta(days=79 - index),
+                "date": trade_date,
                 "close": 100 + index,
                 "volume": 1000 + index,
             }
-            for index in range(80)
+            for index, trade_date in enumerate(trade_dates)
         ],
         "source": "test",
-        "fetched_at": datetime.now(),
+        "fetched_at": now,
     }
     monkeypatch.setattr(
         "app.providers.akshare_provider.AKShareProvider.get_index_history",
