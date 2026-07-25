@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.domain.quality import DataQualityStatus
 
 
-SubjectType = Literal["stock", "index", "sector"]
+SubjectType = Literal["stock", "index", "sector", "market"]
 QualityKey = tuple[str, SubjectType, str, str, int | None]
 
 

@@ -8,6 +8,20 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
+PRODUCT_TABLES = {
+    "market_intraday_bars",
+    "market_turnover_snapshots",
+    "market_breadth_snapshots",
+    "market_amount_snapshots",
+    "industry_market_snapshots",
+    "industry_constituent_snapshots",
+    "concepts",
+    "company_concepts",
+    "industry_chains",
+    "industry_chain_nodes",
+    "company_chain_positions",
+    "mapping_evidence",
+}
 
 
 def _database_url(path: Path) -> str:
@@ -177,3 +191,39 @@ def test_0011_research_lineage_roundtrip(tmp_path):
         }
     assert {"subject_type", "subject_id", "semantic_key", "supersedes_record_id"} <= columns
     assert "data_quality_subject_heads" in tables
+
+
+def test_0012_product_tables_upgrade_and_downgrade(tmp_path):
+    database = tmp_path / "product-data-roundtrip.db"
+    _alembic(database, "upgrade", "20260725_0011")
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        for table in PRODUCT_TABLES:
+            connection.execute(f'DROP TABLE IF EXISTS "{table}"')
+        connection.commit()
+    _alembic(database, "upgrade", "head")
+    with sqlite3.connect(database) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        intraday_fks = list(
+            connection.execute("PRAGMA foreign_key_list(market_intraday_bars)")
+        )
+    assert PRODUCT_TABLES <= tables
+    assert any(
+        row[2] == "data_quality_records" and row[3] == "quality_record_id"
+        for row in intraday_fks
+    )
+    _alembic(database, "downgrade", "20260725_0011")
+    with sqlite3.connect(database) as connection:
+        remaining = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert not PRODUCT_TABLES & remaining
+    _alembic(database, "upgrade", "head")

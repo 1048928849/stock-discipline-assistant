@@ -18,7 +18,7 @@ lineage, Evidence, package hashing, and freeze semantics remain authoritative.
 | `market.industry.daily` | `industry/{industry}` | `daily/unadjusted/CNY/point` | `IndustryMarketSnapshot` |
 | `market.industry.constituents` | `industry/{industry}` | `constituents/current` | `IndustryConstituentSnapshot` |
 | `fundamental.profile` | `stock/{symbol}` | `profile` | `CompanyProfile` |
-| `fundamental.financials` | `stock/{symbol}` | `financials` | existing financial tables |
+| `fundamental.statements` | `stock/{symbol}` | `financials` | existing financial tables |
 | `announcement.catalog` | `stock/{symbol}` | `catalog/{start}/{end}` | `CompanyAnnouncement` |
 | `company.concepts` | `stock/{symbol}` | `concepts/current` | `CompanyConcept` |
 | `company.industry_chain` | `stock/{symbol}` | `industry-chain/current` | `CompanyChainPosition` |

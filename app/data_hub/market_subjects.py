@@ -58,6 +58,63 @@ def stock_daily_subject(
     )
 
 
+def stock_intraday_subject(symbol: str) -> SubjectRef:
+    return SubjectRef(
+        subject_type="stock",
+        subject_id=symbol,
+        semantic_key="60m/qfq/CNY/share",
+    )
+
+
+def stock_turnover_subject(symbol: str) -> SubjectRef:
+    return SubjectRef(
+        subject_type="stock",
+        subject_id=symbol,
+        semantic_key="daily/ratio",
+    )
+
+
+def market_breadth_subject() -> SubjectRef:
+    return SubjectRef(
+        subject_type="market",
+        subject_id="CN-A",
+        semantic_key="daily/all-a",
+    )
+
+
+def market_amount_subject() -> SubjectRef:
+    return SubjectRef(
+        subject_type="market",
+        subject_id="CN-A",
+        semantic_key="daily/CNY",
+    )
+
+
+def industry_constituents_subject(industry: str) -> SubjectRef:
+    base = sector_daily_subject(industry, "unadjusted", "CNY", "share")
+    return SubjectRef(
+        subject_type=base.subject_type,
+        subject_id=base.subject_id,
+        semantic_key="constituents/current",
+    )
+
+
+def company_concepts_subject(symbol: str) -> SubjectRef:
+    return SubjectRef(
+        subject_type="stock",
+        subject_id=symbol,
+        semantic_key="concepts/current",
+    )
+
+
+def company_industry_chain_subject(symbol: str) -> SubjectRef:
+    return SubjectRef(
+        subject_type="stock",
+        subject_id=symbol,
+        semantic_key="industry-chain/current",
+    )
+
+
 def index_daily_subject(
     index_id: str,
     adjustment: str,
@@ -103,8 +160,15 @@ def sector_daily_subject(
 
 
 __all__ = [
+    "company_concepts_subject",
+    "company_industry_chain_subject",
     "index_daily_subject",
+    "industry_constituents_subject",
+    "market_amount_subject",
+    "market_breadth_subject",
     "sector_daily_subject",
     "stock_daily_subject",
+    "stock_intraday_subject",
     "stock_quote_subject",
+    "stock_turnover_subject",
 ]

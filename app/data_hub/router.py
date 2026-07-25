@@ -13,15 +13,23 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
 from app.data_hub.contracts import (
+    IntradayBar,
     ProviderUnavailableError,
     validate_daily_bar_contract,
     validate_quote_contract,
 )
 from app.data_hub.market_subjects import (
+    company_concepts_subject,
+    company_industry_chain_subject,
     index_daily_subject,
+    industry_constituents_subject,
+    market_amount_subject,
+    market_breadth_subject,
     sector_daily_subject,
     stock_daily_subject,
+    stock_intraday_subject,
     stock_quote_subject,
+    stock_turnover_subject,
 )
 from app.data_hub.research_subjects import (
     announcement_catalog_subject,
@@ -65,10 +73,21 @@ MARKET_SUBJECT_CAPABILITIES = frozenset(
         "market.daily.unadjusted",
         "market.index_daily",
         "market.sector_daily",
+        "market.intraday.60m",
+        "market.turnover.daily",
+        "market.breadth.daily",
+        "market.amount.daily",
+        "market.industry.daily",
+        "market.industry.constituents",
     }
 )
 RESEARCH_SUBJECT_CAPABILITIES = frozenset(
-    {"fundamental.profile", "announcement.catalog"}
+    {
+        "fundamental.profile",
+        "announcement.catalog",
+        "company.concepts",
+        "company.industry_chain",
+    }
 )
 CallResultKey = tuple[str, str, str, str, str, str]
 
@@ -349,8 +368,13 @@ class DataHubRouter:
         if capability.startswith("announcement."):
             return fetched_at
         if isinstance(value, list):
-            if value and hasattr(value[-1], "trade_date"):
-                return max(item.observed_at for item in value)
+            structured_times = [
+                item.observed_at
+                for item in value
+                if isinstance(getattr(item, "observed_at", None), (datetime, date))
+            ]
+            if structured_times:
+                return max(structured_times)
             candidates = []
             for row in value:
                 if not isinstance(row, dict):
@@ -426,12 +450,23 @@ class DataHubRouter:
             if subject is not None
             else []
         )
-        if len(semantic_parts) == 2:
+        if len(semantic_parts) == 2 and semantic_parts[0] in {
+            "realtime",
+            "latest_close",
+        }:
             price_unit = price_unit or semantic_parts[1]
-        elif len(semantic_parts) == 3:
+        elif len(semantic_parts) == 3 and semantic_parts[0] in {
+            "qfq",
+            "hfq",
+            "unadjusted",
+        }:
             adjustment = adjustment or semantic_parts[0]
             price_unit = price_unit or semantic_parts[1]
             volume_unit = volume_unit or semantic_parts[2]
+        elif len(semantic_parts) == 4 and semantic_parts[0] == "60m":
+            adjustment = adjustment or semantic_parts[1]
+            price_unit = price_unit or semantic_parts[2]
+            volume_unit = volume_unit or semantic_parts[3]
         return adjustment, price_unit, volume_unit
 
     @staticmethod
@@ -1165,6 +1200,136 @@ class DataHubRouter:
             subject=subject,
             cache_loader=cache_loader,
             validator=lambda value: bool(value and len(value.get("rows", [])) >= 20),
+        )
+
+    def get_intraday_60m(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        cache_loader=None,
+    ):
+        subject = stock_intraday_subject(symbol)
+        return self.invoke(
+            "market.intraday.60m",
+            "get_intraday_60m",
+            symbol,
+            start,
+            end,
+            symbol=symbol,
+            subject=subject,
+            cache_loader=cache_loader,
+            validator=lambda value: isinstance(value, list)
+            and bool(value)
+            and all(
+                isinstance(item, IntradayBar)
+                and item.completed
+                and item.bar_start.tzinfo is not None
+                and item.bar_end.tzinfo is not None
+                and item.bar_start < item.bar_end <= end
+                for item in value
+            ),
+        )
+
+    def get_turnover_daily(
+        self, symbol: str, start: date, end: date, cache_loader=None
+    ):
+        return self.invoke(
+            "market.turnover.daily",
+            "get_turnover_daily",
+            symbol,
+            start,
+            end,
+            symbol=symbol,
+            subject=stock_turnover_subject(symbol),
+            cache_loader=cache_loader,
+            validator=lambda value: isinstance(value, list) and bool(value),
+        )
+
+    def get_market_breadth(self, day: date, cache_loader=None):
+        return self.invoke(
+            "market.breadth.daily",
+            "get_market_breadth",
+            day,
+            symbol="CN-A",
+            subject=market_breadth_subject(),
+            cache_loader=cache_loader,
+            validator=lambda value: isinstance(value, list) and len(value) == 1,
+        )
+
+    def get_market_amount(self, day: date, cache_loader=None):
+        return self.invoke(
+            "market.amount.daily",
+            "get_market_amount",
+            day,
+            symbol="CN-A",
+            subject=market_amount_subject(),
+            cache_loader=cache_loader,
+            validator=lambda value: isinstance(value, list) and len(value) == 1,
+        )
+
+    def get_market_amount_history(
+        self, start: date, end: date, cache_loader=None
+    ):
+        return self.invoke(
+            "market.amount.daily",
+            "get_market_amount_history",
+            start,
+            end,
+            symbol="CN-A",
+            subject=market_amount_subject(),
+            cache_loader=cache_loader,
+            validator=lambda value: isinstance(value, list) and bool(value),
+        )
+
+    def get_industry_daily(
+        self, industry: str, start: date, end: date, cache_loader=None
+    ):
+        subject = sector_daily_subject(industry, "unadjusted", "CNY", "share")
+        return self.invoke(
+            "market.industry.daily",
+            "get_industry_daily",
+            industry,
+            start,
+            end,
+            symbol=subject.subject_id,
+            subject=subject,
+            cache_loader=cache_loader,
+            validator=lambda value: isinstance(value, list) and bool(value),
+        )
+
+    def get_industry_constituents(self, industry: str, cache_loader=None):
+        subject = industry_constituents_subject(industry)
+        return self.invoke(
+            "market.industry.constituents",
+            "get_industry_constituents",
+            industry,
+            symbol=subject.subject_id,
+            subject=subject,
+            cache_loader=cache_loader,
+            validator=lambda value: isinstance(value, list) and bool(value),
+        )
+
+    def company_concepts(self, symbol: str, cache_loader=None):
+        return self.invoke(
+            "company.concepts",
+            "company_concepts",
+            symbol,
+            symbol=symbol,
+            subject=company_concepts_subject(symbol),
+            cache_loader=cache_loader,
+            validator=lambda value: isinstance(value, list) and bool(value),
+        )
+
+    def company_industry_chain(self, symbol: str, cache_loader=None):
+        return self.invoke(
+            "company.industry_chain",
+            "company_industry_chain",
+            symbol,
+            symbol=symbol,
+            subject=company_industry_chain_subject(symbol),
+            cache_loader=cache_loader,
+            validator=lambda value: isinstance(value, list) and bool(value),
         )
 
     def company_profile(self, symbol: str, cache_loader=None):

@@ -170,6 +170,230 @@ class MarketDailyBar(Base):
     fetched_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
 
 
+class MarketIntradayBar(Base):
+    __tablename__ = "market_intraday_bars"
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol", "bar_start", "adjustment", name="uq_intraday_symbol_start_adjustment"
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    bar_start: Mapped[datetime] = mapped_column(PRECISE_DATETIME, index=True)
+    bar_end: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    open: Mapped[Decimal] = mapped_column(PRICE)
+    high: Mapped[Decimal] = mapped_column(PRICE)
+    low: Mapped[Decimal] = mapped_column(PRICE)
+    close: Mapped[Decimal] = mapped_column(PRICE)
+    volume: Mapped[Decimal] = mapped_column(Numeric(24, 4))
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(24, 4))
+    turnover_rate: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    adjustment: Mapped[str] = mapped_column(String(20), default="qfq")
+    price_unit: Mapped[str] = mapped_column(String(20), default="CNY")
+    volume_unit: Mapped[str] = mapped_column(String(20), default="share")
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    source: Mapped[str] = mapped_column(String(80))
+    fetched_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    quality_record_id: Mapped[int] = mapped_column(
+        ForeignKey("data_quality_records.id"), nullable=False, index=True
+    )
+
+
+class MarketTurnoverSnapshot(Base):
+    __tablename__ = "market_turnover_snapshots"
+    __table_args__ = (
+        UniqueConstraint("symbol", "trade_date", name="uq_turnover_symbol_date"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    turnover_rate: Mapped[Decimal] = mapped_column(Numeric(12, 6))
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(24, 4))
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    source: Mapped[str] = mapped_column(String(80))
+    fetched_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    quality_record_id: Mapped[int] = mapped_column(
+        ForeignKey("data_quality_records.id"), nullable=False, index=True
+    )
+
+
+class MarketBreadthSnapshot(Base):
+    __tablename__ = "market_breadth_snapshots"
+    __table_args__ = (
+        UniqueConstraint("market_id", "trade_date", name="uq_breadth_market_date"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    market_id: Mapped[str] = mapped_column(String(20), default="CN-A")
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    advancing: Mapped[int] = mapped_column(Integer)
+    declining: Mapped[int] = mapped_column(Integer)
+    unchanged: Mapped[int] = mapped_column(Integer)
+    limit_up: Mapped[int] = mapped_column(Integer)
+    limit_down: Mapped[int] = mapped_column(Integer)
+    new_highs: Mapped[int | None] = mapped_column(Integer)
+    new_lows: Mapped[int | None] = mapped_column(Integer)
+    median_change_pct: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    above_ma20_ratio: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    above_ma50_ratio: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    source: Mapped[str] = mapped_column(String(80))
+    fetched_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    quality_record_id: Mapped[int] = mapped_column(
+        ForeignKey("data_quality_records.id"), nullable=False, index=True
+    )
+
+
+class MarketAmountSnapshot(Base):
+    __tablename__ = "market_amount_snapshots"
+    __table_args__ = (
+        UniqueConstraint("market_id", "trade_date", name="uq_amount_market_date"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    market_id: Mapped[str] = mapped_column(String(20), default="CN-A")
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(24, 4))
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    source: Mapped[str] = mapped_column(String(80))
+    fetched_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    quality_record_id: Mapped[int] = mapped_column(
+        ForeignKey("data_quality_records.id"), nullable=False, index=True
+    )
+
+
+class IndustryMarketSnapshot(Base):
+    __tablename__ = "industry_market_snapshots"
+    __table_args__ = (
+        UniqueConstraint("industry_key", "trade_date", name="uq_industry_market_date"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    industry_key: Mapped[str] = mapped_column(String(20), index=True)
+    industry_name: Mapped[str] = mapped_column(String(200), index=True)
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    change_pct: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(24, 4))
+    amount_share: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    advance_ratio: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    limit_up_count: Mapped[int | None] = mapped_column(Integer)
+    leader_strength: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    new_high_ratio: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    source: Mapped[str] = mapped_column(String(80))
+    fetched_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    quality_record_id: Mapped[int] = mapped_column(
+        ForeignKey("data_quality_records.id"), nullable=False, index=True
+    )
+
+
+class IndustryConstituentSnapshot(Base):
+    __tablename__ = "industry_constituent_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "industry_key", "symbol", "snapshot_date", name="uq_industry_member_date"
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    industry_key: Mapped[str] = mapped_column(String(20), index=True)
+    industry_name: Mapped[str] = mapped_column(String(200), index=True)
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    name: Mapped[str] = mapped_column(String(100))
+    weight: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    snapshot_date: Mapped[date] = mapped_column(Date, index=True)
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    source: Mapped[str] = mapped_column(String(80))
+    fetched_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    quality_record_id: Mapped[int] = mapped_column(
+        ForeignKey("data_quality_records.id"), nullable=False, index=True
+    )
+
+
+class Concept(Base):
+    __tablename__ = "concepts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True)
+    source: Mapped[str] = mapped_column(String(80))
+    quality_record_id: Mapped[int] = mapped_column(
+        ForeignKey("data_quality_records.id"), nullable=False, index=True
+    )
+
+
+class CompanyConcept(Base):
+    __tablename__ = "company_concepts"
+    __table_args__ = (
+        UniqueConstraint("symbol", "concept_id", name="uq_company_concept"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    concept_id: Mapped[int] = mapped_column(ForeignKey("concepts.id"), index=True)
+    relevance: Mapped[str] = mapped_column(String(40))
+    evidence_summary: Mapped[str | None] = mapped_column(Text)
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    quality_record_id: Mapped[int] = mapped_column(
+        ForeignKey("data_quality_records.id"), nullable=False, index=True
+    )
+
+
+class IndustryChain(Base):
+    __tablename__ = "industry_chains"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True)
+    source: Mapped[str] = mapped_column(String(80))
+    quality_record_id: Mapped[int] = mapped_column(
+        ForeignKey("data_quality_records.id"), nullable=False, index=True
+    )
+
+
+class IndustryChainNode(Base):
+    __tablename__ = "industry_chain_nodes"
+    __table_args__ = (
+        UniqueConstraint("chain_id", "name", name="uq_industry_chain_node"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chain_id: Mapped[int] = mapped_column(ForeignKey("industry_chains.id"), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    stage: Mapped[str] = mapped_column(String(40))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    quality_record_id: Mapped[int] = mapped_column(
+        ForeignKey("data_quality_records.id"), nullable=False, index=True
+    )
+
+
+class CompanyChainPosition(Base):
+    __tablename__ = "company_chain_positions"
+    __table_args__ = (
+        UniqueConstraint("symbol", "node_id", name="uq_company_chain_position"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("industry_chain_nodes.id"), index=True)
+    relevance: Mapped[str] = mapped_column(String(40))
+    primary_products: Mapped[list | None] = mapped_column(JSON)
+    revenue_relevance: Mapped[str] = mapped_column(String(40), default="unknown")
+    core_level: Mapped[str | None] = mapped_column(String(40))
+    substitutability: Mapped[str | None] = mapped_column(String(40))
+    competitive_position: Mapped[str | None] = mapped_column(String(80))
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    quality_record_id: Mapped[int] = mapped_column(
+        ForeignKey("data_quality_records.id"), nullable=False, index=True
+    )
+
+
+class MappingEvidence(Base):
+    __tablename__ = "mapping_evidence"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    evidence_key: Mapped[str] = mapped_column(String(64), unique=True)
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    mapping_type: Mapped[str] = mapped_column(String(30), index=True)
+    source_name: Mapped[str] = mapped_column(String(100))
+    source_url: Mapped[str | None] = mapped_column(String(1000))
+    excerpt: Mapped[str] = mapped_column(Text)
+    raw_data: Mapped[dict | None] = mapped_column(JSON)
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    quality_record_id: Mapped[int] = mapped_column(
+        ForeignKey("data_quality_records.id"), nullable=False, index=True
+    )
+
+
 class MarketSourceLog(Base):
     __tablename__ = "market_source_logs"
     id: Mapped[int] = mapped_column(primary_key=True)

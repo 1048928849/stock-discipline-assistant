@@ -44,6 +44,93 @@ class DailyBar:
 
 
 @dataclass(frozen=True)
+class IntradayBar:
+    symbol: str
+    trade_date: date
+    bar_start: datetime
+    bar_end: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
+    amount: Decimal | None
+    turnover_rate: Decimal | None
+    adjustment: Literal["qfq"]
+    price_unit: str
+    volume_unit: str
+    observed_at: datetime
+    source: str
+    fetched_at: datetime
+    completed: bool
+
+
+@dataclass(frozen=True)
+class TurnoverDaily:
+    symbol: str
+    trade_date: date
+    turnover_rate: Decimal
+    amount: Decimal | None
+    observed_at: datetime
+    source: str
+    fetched_at: datetime
+
+
+@dataclass(frozen=True)
+class MarketBreadthDaily:
+    trade_date: date
+    advancing: int
+    declining: int
+    unchanged: int
+    limit_up: int
+    limit_down: int
+    new_highs: int | None
+    new_lows: int | None
+    median_change_pct: Decimal | None
+    above_ma20_ratio: Decimal | None
+    above_ma50_ratio: Decimal | None
+    observed_at: datetime
+    source: str
+    fetched_at: datetime
+
+
+@dataclass(frozen=True)
+class MarketAmountDaily:
+    trade_date: date
+    total_amount: Decimal
+    observed_at: datetime
+    source: str
+    fetched_at: datetime
+
+
+@dataclass(frozen=True)
+class IndustryDaily:
+    industry: str
+    trade_date: date
+    change_pct: Decimal | None
+    amount: Decimal | None
+    amount_share: Decimal | None
+    advance_ratio: Decimal | None
+    limit_up_count: int | None
+    leader_strength: Decimal | None
+    new_high_ratio: Decimal | None
+    observed_at: datetime
+    source: str
+    fetched_at: datetime
+
+
+@dataclass(frozen=True)
+class IndustryConstituent:
+    industry: str
+    symbol: str
+    name: str
+    weight: Decimal | None
+    observed_at: datetime
+    source: str
+    fetched_at: datetime
+
+
+@dataclass(frozen=True)
 class ProviderMetadata:
     provider_id: str
     supported_capabilities: tuple[str, ...]

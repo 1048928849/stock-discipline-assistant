@@ -1,5 +1,5 @@
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Callable
 
@@ -7,12 +7,18 @@ from app.data_hub.contracts import (
     AnnouncementProvider,
     DailyBar,
     FundamentalDataProvider,
+    IndustryConstituent,
+    IndustryDaily,
     IndustryConceptProvider,
+    IntradayBar,
+    MarketAmountDaily,
+    MarketBreadthDaily,
     MarketDataProvider,
     NewsProvider,
     ProviderMetadata,
     ProviderUnavailableError,
     Quote,
+    TurnoverDaily,
 )
 from app.data_hub.trading_calendar import (
     TradingCalendar,
@@ -52,6 +58,12 @@ class AKShareProvider(
                 "market.quote.realtime",
                 "market.quote.latest_close",
                 "market.daily.qfq",
+                "market.intraday.60m",
+                "market.turnover.daily",
+                "market.breadth.daily",
+                "market.amount.daily",
+                "market.industry.daily",
+                "market.industry.constituents",
                 "market.index_daily",
                 "market.sector_daily",
                 "market.symbols",
@@ -63,6 +75,8 @@ class AKShareProvider(
                 "announcement.catalog",
                 "announcement.daily",
                 "industry.membership",
+                "company.concepts",
+                "company.industry_chain",
                 "news.company",
             ),
             enabled=True,
@@ -115,6 +129,29 @@ class AKShareProvider(
                 if attempt < self.retries:
                     time.sleep(0.3 * attempt)
         raise RuntimeError("；".join(errors))
+
+    @staticmethod
+    def _column(frame, *names: str) -> str:
+        selected = next((name for name in names if name in frame.columns), None)
+        if selected is None:
+            raise ProviderUnavailableError(
+                f"AKShare response is missing one of the required columns: {names}"
+            )
+        return selected
+
+    @staticmethod
+    def _optional_decimal(value) -> Decimal | None:
+        if value in (None, "", "-"):
+            return None
+        try:
+            result = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        return result if result.is_finite() else None
+
+    def _aware_now(self) -> datetime:
+        raw = self.now_fn()
+        return to_shanghai_aware(raw, naive_is_shanghai=raw.tzinfo is None)
 
     def _quote_from_frame(
         self, frame, symbol: str, source: str, api_name: str
@@ -337,6 +374,254 @@ class AKShareProvider(
                 errors.append(str(exc))
         raise ProviderUnavailableError("前复权历史行情全部数据源失败：" + "；".join(errors))
 
+    def get_intraday_60m(
+        self, symbol: str, start: datetime, end: datetime
+    ) -> list[IntradayBar]:
+        fetched_at = self._aware_now()
+        start_at = to_shanghai_aware(start, naive_is_shanghai=start.tzinfo is None)
+        end_at = to_shanghai_aware(end, naive_is_shanghai=end.tzinfo is None)
+        try:
+            frame = self._retry(
+                "eastmoney-60m",
+                lambda: self._ak().stock_zh_a_hist_min_em(
+                    symbol=symbol,
+                    start_date=start_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    end_date=end_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    period="60",
+                    adjust="qfq",
+                ),
+            )
+            time_column = self._column(frame, "\u65f6\u95f4", "datetime", "date")
+            open_column = self._column(frame, "\u5f00\u76d8", "open")
+            close_column = self._column(frame, "\u6536\u76d8", "close")
+            high_column = self._column(frame, "\u6700\u9ad8", "high")
+            low_column = self._column(frame, "\u6700\u4f4e", "low")
+            volume_column = self._column(frame, "\u6210\u4ea4\u91cf", "volume")
+            amount_column = next(
+                (name for name in ("\u6210\u4ea4\u989d", "amount") if name in frame.columns),
+                None,
+            )
+            turnover_column = next(
+                (name for name in ("\u6362\u624b\u7387", "turnover") if name in frame.columns),
+                None,
+            )
+            rows = []
+            for _, raw in frame.iterrows():
+                parsed = datetime.fromisoformat(str(raw[time_column]).replace("Z", "+00:00"))
+                bar_end = to_shanghai_aware(parsed, naive_is_shanghai=parsed.tzinfo is None)
+                if bar_end.time().isoformat(timespec="minutes") not in {
+                    "10:30",
+                    "11:30",
+                    "14:00",
+                    "15:00",
+                }:
+                    continue
+                if bar_end > fetched_at or bar_end > end_at:
+                    continue
+                rows.append(
+                    IntradayBar(
+                        symbol=symbol,
+                        trade_date=bar_end.date(),
+                        bar_start=bar_end - timedelta(hours=1),
+                        bar_end=bar_end,
+                        open=Decimal(str(raw[open_column])),
+                        high=Decimal(str(raw[high_column])),
+                        low=Decimal(str(raw[low_column])),
+                        close=Decimal(str(raw[close_column])),
+                        volume=Decimal(str(raw[volume_column])),
+                        amount=(
+                            self._optional_decimal(raw[amount_column])
+                            if amount_column
+                            else None
+                        ),
+                        turnover_rate=(
+                            self._optional_decimal(raw[turnover_column])
+                            if turnover_column
+                            else None
+                        ),
+                        adjustment="qfq",
+                        price_unit="CNY",
+                        volume_unit="share",
+                        observed_at=bar_end,
+                        source="akshare_eastmoney_60m_qfq",
+                        fetched_at=fetched_at,
+                        completed=True,
+                    )
+                )
+        except Exception as exc:
+            raise ProviderUnavailableError(
+                f"60-minute bars are unavailable: {type(exc).__name__}"
+            ) from exc
+        if not rows:
+            raise ProviderUnavailableError("no completed 60-minute bars are available")
+        rows.sort(key=lambda item: item.bar_start)
+        return rows
+
+    def get_turnover_daily(
+        self, symbol: str, start: date, end: date
+    ) -> list[TurnoverDaily]:
+        fetched_at = self._aware_now()
+        try:
+            frame = self._retry(
+                "eastmoney-turnover",
+                lambda: self._ak().stock_zh_a_hist(
+                    symbol=symbol,
+                    period="daily",
+                    start_date=start.strftime("%Y%m%d"),
+                    end_date=end.strftime("%Y%m%d"),
+                    adjust="qfq",
+                    timeout=self.timeout,
+                ),
+            )
+            date_column = self._column(frame, "\u65e5\u671f", "date")
+            turnover_column = self._column(frame, "\u6362\u624b\u7387", "turnover")
+            amount_column = next(
+                (name for name in ("\u6210\u4ea4\u989d", "amount") if name in frame.columns),
+                None,
+            )
+            latest_completed = self.calendar.latest_completed_session(fetched_at)
+            rows = []
+            for _, raw in frame.iterrows():
+                trade_date = date.fromisoformat(str(raw[date_column])[:10])
+                if trade_date > latest_completed:
+                    continue
+                turnover = self._optional_decimal(raw[turnover_column])
+                if turnover is None:
+                    continue
+                rows.append(
+                    TurnoverDaily(
+                        symbol=symbol,
+                        trade_date=trade_date,
+                        turnover_rate=turnover,
+                        amount=(
+                            self._optional_decimal(raw[amount_column])
+                            if amount_column
+                            else None
+                        ),
+                        observed_at=self.calendar.session_close_at(trade_date),
+                        source="akshare_eastmoney_daily",
+                        fetched_at=fetched_at,
+                    )
+                )
+        except Exception as exc:
+            raise ProviderUnavailableError(
+                f"daily turnover is unavailable: {type(exc).__name__}"
+            ) from exc
+        if not rows:
+            raise ProviderUnavailableError("daily turnover returned no completed sessions")
+        rows.sort(key=lambda item: item.trade_date)
+        return rows
+
+    def _completed_spot_frame(self, day: date):
+        fetched_at = self._aware_now()
+        if day != self.calendar.latest_completed_session(fetched_at):
+            raise ProviderUnavailableError(
+                "spot market aggregates only support the latest completed session"
+            )
+        if self.calendar.is_realtime_session(fetched_at):
+            raise ProviderUnavailableError(
+                "incomplete current-session aggregates are not formal daily data"
+            )
+        frame = self._retry("eastmoney-a-share-spot", self._ak().stock_zh_a_spot_em)
+        return frame, fetched_at
+
+    def get_market_breadth(self, day: date) -> list[MarketBreadthDaily]:
+        frame, fetched_at = self._completed_spot_frame(day)
+        change_column = self._column(frame, "\u6da8\u8dcc\u5e45", "change_pct")
+        values = [
+            value
+            for raw in frame[change_column].tolist()
+            if (value := self._optional_decimal(raw)) is not None
+        ]
+        if not values:
+            raise ProviderUnavailableError("market breadth has no valid change values")
+        ordered = sorted(values)
+        middle = len(ordered) // 2
+        median = (
+            ordered[middle]
+            if len(ordered) % 2
+            else (ordered[middle - 1] + ordered[middle]) / Decimal("2")
+        )
+        return [
+            MarketBreadthDaily(
+                trade_date=day,
+                advancing=sum(value > 0 for value in values),
+                declining=sum(value < 0 for value in values),
+                unchanged=sum(value == 0 for value in values),
+                limit_up=sum(value >= Decimal("9.8") for value in values),
+                limit_down=sum(value <= Decimal("-9.8") for value in values),
+                new_highs=None,
+                new_lows=None,
+                median_change_pct=median,
+                above_ma20_ratio=None,
+                above_ma50_ratio=None,
+                observed_at=self.calendar.session_close_at(day),
+                source="akshare_eastmoney_a_spot",
+                fetched_at=fetched_at,
+            )
+        ]
+
+    def get_market_amount(self, day: date) -> list[MarketAmountDaily]:
+        frame, fetched_at = self._completed_spot_frame(day)
+        amount_column = self._column(frame, "\u6210\u4ea4\u989d", "amount")
+        values = [
+            value
+            for raw in frame[amount_column].tolist()
+            if (value := self._optional_decimal(raw)) is not None
+        ]
+        if not values:
+            raise ProviderUnavailableError("market amount has no valid values")
+        return [
+            MarketAmountDaily(
+                trade_date=day,
+                total_amount=sum(values, Decimal("0")),
+                observed_at=self.calendar.session_close_at(day),
+                source="akshare_eastmoney_a_spot",
+                fetched_at=fetched_at,
+            )
+        ]
+
+    def get_market_amount_history(
+        self, start: date, end: date
+    ) -> list[MarketAmountDaily]:
+        fetched_at = self._aware_now()
+        series: list[dict[date, Decimal]] = []
+        for symbol in ("sh000001", "sz399001"):
+            try:
+                frame = self._retry(
+                    f"eastmoney-index-amount-{symbol}",
+                    lambda symbol=symbol: self._ak().stock_zh_index_daily_em(symbol=symbol),
+                )
+                date_column = self._column(frame, "\u65e5\u671f", "date")
+                amount_column = self._column(frame, "\u6210\u4ea4\u989d", "amount")
+                values = {}
+                for _, raw in frame.iterrows():
+                    trade_date = date.fromisoformat(str(raw[date_column])[:10])
+                    amount = self._optional_decimal(raw[amount_column])
+                    if start <= trade_date <= end and amount is not None:
+                        values[trade_date] = amount
+                series.append(values)
+            except Exception as exc:
+                raise ProviderUnavailableError(
+                    f"market amount history is unavailable: {type(exc).__name__}"
+                ) from exc
+        dates = sorted(set(series[0]) & set(series[1]))
+        latest_completed = self.calendar.latest_completed_session(fetched_at)
+        rows = [
+            MarketAmountDaily(
+                trade_date=trade_date,
+                total_amount=series[0][trade_date] + series[1][trade_date],
+                observed_at=self.calendar.session_close_at(trade_date),
+                source="akshare_eastmoney_sh_sz_indices",
+                fetched_at=fetched_at,
+            )
+            for trade_date in dates
+            if trade_date <= latest_completed
+        ]
+        if not rows:
+            raise ProviderUnavailableError("market amount history returned no completed rows")
+        return rows
+
     def _benchmark_rows(self, frame, source: str) -> dict:
         aliases = {
             "date": ("日期", "date"),
@@ -415,6 +700,135 @@ class AKShareProvider(
             return self._benchmark_rows(frame, f"AKShare/东方财富行业板块 {industry}")
         except Exception as exc:
             raise ProviderUnavailableError(f"行业指数数据暂不可用：{exc}") from exc
+
+    def get_industry_daily(
+        self, industry: str, start: date, end: date
+    ) -> list[IndustryDaily]:
+        fetched_at = self._aware_now()
+        try:
+            frame = self._retry(
+                "eastmoney-industry-daily",
+                lambda: self._ak().stock_board_industry_hist_em(
+                    symbol=industry,
+                    start_date=start.strftime("%Y%m%d"),
+                    end_date=end.strftime("%Y%m%d"),
+                    period="daily",
+                    adjust="",
+                ),
+            )
+            date_column = self._column(frame, "\u65e5\u671f", "date")
+            change_column = next(
+                (name for name in ("\u6da8\u8dcc\u5e45", "change_pct") if name in frame.columns),
+                None,
+            )
+            amount_column = next(
+                (name for name in ("\u6210\u4ea4\u989d", "amount") if name in frame.columns),
+                None,
+            )
+            latest_completed = self.calendar.latest_completed_session(fetched_at)
+            rows = []
+            for _, raw in frame.iterrows():
+                trade_date = date.fromisoformat(str(raw[date_column])[:10])
+                if trade_date > latest_completed:
+                    continue
+                rows.append(
+                    IndustryDaily(
+                        industry=industry,
+                        trade_date=trade_date,
+                        change_pct=(
+                            self._optional_decimal(raw[change_column])
+                            if change_column
+                            else None
+                        ),
+                        amount=(
+                            self._optional_decimal(raw[amount_column])
+                            if amount_column
+                            else None
+                        ),
+                        amount_share=None,
+                        advance_ratio=None,
+                        limit_up_count=None,
+                        leader_strength=None,
+                        new_high_ratio=None,
+                        observed_at=self.calendar.session_close_at(trade_date),
+                        source="akshare_eastmoney_industry",
+                        fetched_at=fetched_at,
+                    )
+                )
+        except Exception as exc:
+            raise ProviderUnavailableError(
+                f"industry daily data is unavailable: {type(exc).__name__}"
+            ) from exc
+        if not rows:
+            raise ProviderUnavailableError("industry daily data returned no rows")
+        rows.sort(key=lambda item: item.trade_date)
+        return rows
+
+    def get_industry_constituents(
+        self, industry: str
+    ) -> list[IndustryConstituent]:
+        fetched_at = self._aware_now()
+        try:
+            frame = self._retry(
+                "eastmoney-industry-members",
+                lambda: self._ak().stock_board_industry_cons_em(symbol=industry),
+            )
+            symbol_column = self._column(frame, "\u4ee3\u7801", "symbol", "code")
+            name_column = self._column(frame, "\u540d\u79f0", "name")
+            weight_column = next(
+                (name for name in ("\u6743\u91cd", "weight") if name in frame.columns),
+                None,
+            )
+            rows = [
+                IndustryConstituent(
+                    industry=industry,
+                    symbol=str(raw[symbol_column]).zfill(6),
+                    name=str(raw[name_column]),
+                    weight=(
+                        self._optional_decimal(raw[weight_column])
+                        if weight_column
+                        else None
+                    ),
+                    observed_at=fetched_at,
+                    source="akshare_eastmoney_industry_members",
+                    fetched_at=fetched_at,
+                )
+                for _, raw in frame.iterrows()
+            ]
+        except Exception as exc:
+            raise ProviderUnavailableError(
+                f"industry constituents are unavailable: {type(exc).__name__}"
+            ) from exc
+        if not rows:
+            raise ProviderUnavailableError("industry constituents returned no rows")
+        return rows
+
+    def company_concepts(self, symbol: str) -> list[dict]:
+        payload = self.company_industry_concepts(symbol)
+        concepts = payload.get("concepts") or []
+        if not concepts:
+            raise ProviderUnavailableError(
+                "AKShare has no authoritative company concept membership for this symbol"
+            )
+        fetched_at = self._aware_now()
+        return [
+            {
+                "concept": item["name"],
+                "relevance": "INSUFFICIENT_EVIDENCE",
+                "evidence_summary": item.get("evidence"),
+                "source": payload.get("source", "AKShare"),
+                "observed_at": fetched_at,
+                "fetched_at": fetched_at,
+            }
+            for item in concepts
+            if item.get("name")
+        ]
+
+    def company_industry_chain(self, symbol: str) -> list[dict]:
+        del symbol
+        raise ProviderUnavailableError(
+            "AKShare does not provide authoritative industry-chain positions"
+        )
 
     @staticmethod
     def _records(frame, limit: int = 500) -> list[dict]:
