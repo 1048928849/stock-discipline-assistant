@@ -298,6 +298,9 @@ def _sync_stock(
                     fallback_used=True,
                     source=cached.source,
                     data_time=latest.fetched_at.isoformat(),
+                    observed_at=cached.observed_at.isoformat()
+                    if cached.observed_at
+                    else None,
                     quality_status=cached.effective_quality.effective_quality.value,
                     quality_record_id=cached.quality_record_id,
                     **effective_quality_metadata(cached.effective_quality),
@@ -484,6 +487,9 @@ def _market_assessment(db: Session, provider: DataHubRouter) -> tuple[dict, dict
                 fallback_used=True,
                 source=cached.source,
                 data_time=cached.bars[-1].fetched_at.isoformat(),
+                observed_at=cached.observed_at.isoformat()
+                if cached.observed_at
+                else None,
                 quality_status=cached.effective_quality.effective_quality.value,
                 quality_record_id=cached.quality_record_id,
                 **effective_quality_metadata(cached.effective_quality),
@@ -677,6 +683,9 @@ def _sector_assessment(
             fallback_used=True,
             source=cached.source,
             data_time=cached.bars[-1].fetched_at.isoformat(),
+            observed_at=cached.observed_at.isoformat()
+            if cached.observed_at
+            else None,
             quality_status=cached.effective_quality.effective_quality.value,
             quality_record_id=cached.quality_record_id,
             **effective_quality_metadata(cached.effective_quality),
@@ -770,6 +779,9 @@ def _sector_assessment(
                 fallback_used=True,
                 source=cached.source,
                 data_time=cached.bars[-1].fetched_at.isoformat(),
+                observed_at=cached.observed_at.isoformat()
+                if cached.observed_at
+                else None,
                 quality_status=cached.effective_quality.effective_quality.value,
                 quality_record_id=cached.quality_record_id,
                 **effective_quality_metadata(cached.effective_quality),

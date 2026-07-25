@@ -1,6 +1,7 @@
 from app.domain.models import (
     DecisionPackage,
     Evidence,
+    MarketQualityBinding,
     MarketSnapshot,
     ResearchClaim,
     ResearchDecision,
@@ -13,6 +14,7 @@ from app.domain.models import (
 __all__ = [
     "DecisionPackage",
     "Evidence",
+    "MarketQualityBinding",
     "MarketSnapshot",
     "ResearchClaim",
     "ResearchDecision",

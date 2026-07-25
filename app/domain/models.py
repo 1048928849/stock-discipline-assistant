@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -12,13 +12,59 @@ from pydantic import (
     ConfigDict,
     Field,
     model_validator,
+    field_validator,
 )
 
 from app.domain.quality import DataQualityStatus, worst_quality
+from app.domain.quality_subject import (
+    SubjectRef,
+    SubjectType,
+    canonical_semantic_key,
+)
+
+
+MARKET_EVIDENCE_CAPABILITIES: dict[str, str] = {
+    "stock_daily_bars": "market.daily.qfq",
+    "market_quote": "market.quote.realtime",
+    "benchmark_daily_bars": "market.index_daily",
+    "sector_daily_bars": "market.sector_daily",
+}
+MARKET_BINDING_REQUIRED_REASON = (
+    "required market Evidence is missing a quality binding"
+)
 
 
 class DomainModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class MarketQualityBinding(DomainModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    data_capability: str = Field(min_length=1, max_length=80)
+    subject_type: SubjectType
+    subject_id: str = Field(min_length=1, max_length=160)
+    semantic_key: str = Field(default="", max_length=200)
+    quality_record_id: int = Field(ge=1)
+    observed_at: datetime
+
+    @field_validator("semantic_key", mode="before")
+    @classmethod
+    def normalize_semantic_key(cls, value):
+        return canonical_semantic_key(value)
+
+    @model_validator(mode="after")
+    def validate_subject(self):
+        subject = SubjectRef(
+            subject_type=self.subject_type,
+            subject_id=self.subject_id,
+            semantic_key=self.semantic_key,
+        )
+        object.__setattr__(self, "subject_id", subject.subject_id)
+        object.__setattr__(
+            self, "semantic_key", canonical_semantic_key(subject.semantic_key)
+        )
+        return self
 
 
 class Evidence(DomainModel):
@@ -33,6 +79,7 @@ class Evidence(DomainModel):
     fetched_at: str | None = Field(default=None, max_length=80)
     cached_at: str | None = Field(default=None, max_length=80)
     quality_status: DataQualityStatus
+    market_quality_binding: MarketQualityBinding | None = None
     payload: dict[str, Any]
     is_primary: bool = False
     external_text_is_untrusted: bool = True
@@ -181,6 +228,11 @@ class DecisionPackage(DomainModel):
                 "observed_at": item.observed_at,
                 "fetched_at": item.fetched_at,
                 "cached_at": item.cached_at,
+                "market_quality_binding": (
+                    item.market_quality_binding.model_dump(mode="json")
+                    if item.market_quality_binding
+                    else None
+                ),
                 "payload": item.payload,
             }
             for item in sorted(self.evidence, key=lambda row: row.evidence_id)
@@ -221,6 +273,60 @@ class DecisionPackage(DomainModel):
             raise ValueError(
                 f"DecisionPackage missing required capabilities: {missing_capabilities}"
             )
+        market_bindings: dict[str, set[str]] = {}
+        missing_market_bindings = []
+        for item in self.evidence:
+            expected_data_capability = MARKET_EVIDENCE_CAPABILITIES.get(item.capability)
+            if not item.required or expected_data_capability is None:
+                continue
+            binding = item.market_quality_binding
+            if binding is None:
+                missing_market_bindings.append(item.evidence_id)
+                continue
+            if binding.data_capability != expected_data_capability:
+                raise ValueError(
+                    "market Evidence binding data_capability does not match capability"
+                )
+            if item.observed_at is None:
+                raise ValueError("market Evidence binding requires observed_at")
+            try:
+                evidence_observed_at = datetime.fromisoformat(
+                    item.observed_at.replace("Z", "+00:00")
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "market Evidence observed_at must be an ISO datetime"
+                ) from exc
+            binding_observed_at = binding.observed_at
+            if evidence_observed_at.tzinfo is not None:
+                evidence_observed_at = evidence_observed_at.astimezone(
+                    timezone.utc
+                ).replace(tzinfo=None)
+            if binding_observed_at.tzinfo is not None:
+                binding_observed_at = binding_observed_at.astimezone(
+                    timezone.utc
+                ).replace(tzinfo=None)
+            if evidence_observed_at != binding_observed_at:
+                raise ValueError(
+                    "market Evidence observed_at does not match its quality binding"
+                )
+            serialized = json.dumps(
+                binding.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            market_bindings.setdefault(item.capability, set()).add(serialized)
+        if any(len(bindings) > 1 for bindings in market_bindings.values()):
+            raise ValueError(
+                "required market capability has multiple different quality bindings"
+            )
+        if missing_market_bindings:
+            if self.freeze_allowed:
+                raise ValueError(MARKET_BINDING_REQUIRED_REASON)
+            if MARKET_BINDING_REQUIRED_REASON not in self.blocked_reasons:
+                raise ValueError(
+                    "missing market binding must be included in blocked_reasons"
+                )
         required_statuses = [
             item.quality_status
             for item in self.evidence

@@ -7,6 +7,9 @@ from typing import Any
 from app.domain.models import (
     DecisionPackage,
     Evidence,
+    MARKET_BINDING_REQUIRED_REASON,
+    MARKET_EVIDENCE_CAPABILITIES,
+    MarketQualityBinding,
     MarketSnapshot,
     QualitySnapshotItem,
     ResearchClaim,
@@ -37,7 +40,14 @@ REQUIRED_CAPABILITIES = sorted(
 )
 
 
-def _step_quality(step: dict[str, Any]) -> DataQualityStatus:
+def _step_quality(step: dict[str, Any], capability: str) -> DataQualityStatus:
+    if capability in MARKET_EVIDENCE_CAPABILITIES:
+        effective = step.get("effective_quality") or step.get("quality_status")
+        return (
+            DataQualityStatus(effective)
+            if effective
+            else DataQualityStatus.MISSING
+        )
     explicit = step.get("quality_status")
     if explicit:
         return DataQualityStatus(explicit)
@@ -56,6 +66,21 @@ def _pipeline_evidence(step: dict[str, Any], symbol: str) -> Evidence:
     capability, required = STEP_CAPABILITIES.get(
         step["code"], (f"pipeline.{step['code']}", False)
     )
+    observed_at = step.get("observed_at") or step.get("data_time")
+    binding = None
+    data_capability = MARKET_EVIDENCE_CAPABILITIES.get(capability)
+    if data_capability and all(
+        step.get(field) is not None
+        for field in ("subject_type", "subject_id", "quality_record_id")
+    ) and observed_at:
+        binding = MarketQualityBinding(
+            data_capability=data_capability,
+            subject_type=step["subject_type"],
+            subject_id=step["subject_id"],
+            semantic_key=step.get("semantic_key"),
+            quality_record_id=step["quality_record_id"],
+            observed_at=observed_at,
+        )
     return Evidence(
         evidence_id=f"pipeline:{step['code']}",
         symbol=symbol,
@@ -63,10 +88,11 @@ def _pipeline_evidence(step: dict[str, Any], symbol: str) -> Evidence:
         required=required,
         category=step["code"],
         source_name=step.get("source") or "application_pipeline",
-        observed_at=step.get("observed_at") or step.get("data_time"),
+        observed_at=observed_at,
         fetched_at=step.get("fetched_at") or step.get("data_time"),
         cached_at=step.get("cached_at"),
-        quality_status=_step_quality(step),
+        quality_status=_step_quality(step, capability),
+        market_quality_binding=binding,
         payload={
             "name": step.get("name"),
             "detail": step.get("detail"),
@@ -287,6 +313,15 @@ def build_decision_package(
         blocked_reasons.append(f"required Evidence quality is {quality.value}")
     if not freeze_inputs_present:
         blocked_reasons.append("missing buy zone, hard stop, or market date")
+    missing_market_binding = any(
+        item.required
+        and item.capability in MARKET_EVIDENCE_CAPABILITIES
+        and item.market_quality_binding is None
+        for item in evidence
+    )
+    if missing_market_binding:
+        freeze_allowed = False
+        blocked_reasons.append(MARKET_BINDING_REQUIRED_REASON)
 
     optional_unavailable = sorted(
         {
