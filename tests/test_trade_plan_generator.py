@@ -12,6 +12,9 @@ from app.models import (
     CompanyAnnouncement,
     CompanyProfile,
     CompanyResearchRefresh,
+    DataQualityRecord,
+    MarketDailyBar,
+    MarketQuote,
 )
 from app.providers.llm_provider import OpenAICompatibleProvider
 from app.services.market_cache import persist_market_quote, replace_market_series
@@ -42,7 +45,24 @@ class GeneratorMarketProvider(DataProvider):
         realtime_supported=True,
     )
 
-    def __init__(self, bars, quote):
+    def __init__(
+        self,
+        bars,
+        quote,
+        *,
+        provider_id="generator-fixture",
+        priority=1,
+    ):
+        self.metadata = ProviderMetadata(
+            provider_id=provider_id,
+            supported_capabilities=(
+                "market.daily.qfq",
+                "market.quote.realtime",
+                "market.quote.latest_close",
+            ),
+            priority=priority,
+            realtime_supported=True,
+        )
         self.bars = bars
         self.quote = quote
 
@@ -143,6 +163,98 @@ def payload(account_id, symbol="300502", **changes):
     }
     result.update(changes)
     return result
+
+
+def _replace_quote_scenario(session, scenario: str, *, price="10.82"):
+    stored = session.query(MarketQuote).filter_by(symbol="300502").one_or_none()
+    if scenario == "stale":
+        stale_at = datetime.now() - timedelta(minutes=31)
+        stored.observed_at = stale_at
+        session.get(DataQualityRecord, stored.quality_record_id).observed_at = stale_at
+    elif scenario == "missing":
+        session.delete(stored)
+    elif scenario == "conflicted":
+        now = datetime.now()
+        first = Quote(
+            symbol="300502",
+            name="test company",
+            price=Decimal(price),
+            quote_type="realtime",
+            observed_at=now,
+            price_unit="CNY",
+            source="quote-a",
+            source_api="test",
+            fetched_at=now,
+        )
+        second = Quote(
+            symbol="300502",
+            name="test company",
+            price=Decimal("11.82"),
+            quote_type="realtime",
+            observed_at=now,
+            price_unit="CNY",
+            source="quote-b",
+            source_api="test",
+            fetched_at=now,
+        )
+        registry = ProviderRegistry()
+        registry.register(
+            GeneratorMarketProvider([], first, provider_id="quote-a", priority=1)
+        )
+        registry.register(
+            GeneratorMarketProvider([], second, provider_id="quote-b", priority=2)
+        )
+        DataHubRouter(session, registry).get_quote("300502")
+    elif scenario == "latest_close":
+        session.delete(stored)
+        session.flush()
+        now = datetime.now()
+        close = Quote(
+            symbol="300502",
+            name="test company",
+            price=Decimal(price),
+            quote_type="latest_close",
+            observed_at=now,
+            price_unit="CNY",
+            source="latest-close",
+            source_api="test",
+            fetched_at=now,
+        )
+        registry = ProviderRegistry()
+        registry.register(
+            GeneratorMarketProvider([], close, provider_id="latest-close")
+        )
+        router = DataHubRouter(session, registry)
+        persist_market_quote(session, router, router.get_latest_close("300502"))
+    else:
+        raise ValueError(scenario)
+    session.commit()
+
+
+def _holding_preview(client, session, scenario: str, **holding_changes):
+    account = create_account(client)
+    seed_pattern(session)
+    holding = {
+        "account_id": account["id"],
+        "symbol": "300502",
+        "name": "test company",
+        "quantity": 100,
+        "cost_price": 9,
+        "current_price": 10.82,
+        "sector": "test sector",
+        "stop_loss_price": 9.5,
+        "target_price": 10.7,
+        "price_source": "manual",
+        **holding_changes,
+    }
+    assert client.post("/api/v1/holdings", json=holding).status_code == 201
+    _replace_quote_scenario(session, scenario)
+    response = client.post(
+        "/api/v1/trade-plan-generator/preview",
+        json=payload(account["id"]),
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
 
 
 def seed_governed_analysis(session, monkeypatch):
@@ -399,6 +511,97 @@ def test_holding_confirmation_add_stop_reduction_and_industry_limit(client, sess
         "/api/v1/trade-plan-generator/holding-check", json=payload(account["id"])
     ).json()
     assert stopped["existing_position"]["hard_stop_triggered"] is True
+
+
+def test_direct_preview_stale_quote_skips_price_triggers(client, session):
+    preview = _holding_preview(client, session, "stale")
+    assert preview["current_price_quality"] == "STALE"
+    assert preview["current_price_executable"] is False
+    assert preview["price_trigger_evaluation_skipped"] is True
+    assert preview["existing_position"]["current_price"] is None
+
+
+def test_direct_preview_conflicted_quote_skips_price_triggers(client, session):
+    preview = _holding_preview(client, session, "conflicted")
+    assert preview["current_price_quality"] == "CONFLICTED"
+    assert preview["current_price_executable"] is False
+    assert preview["price_trigger_evaluation_skipped"] is True
+
+
+def test_direct_preview_missing_quote_skips_price_triggers(client, session):
+    preview = _holding_preview(client, session, "missing")
+    assert preview["current_price_quality"] == "MISSING"
+    assert preview["current_price_available"] is False
+    assert preview["price_trigger_evaluation_skipped"] is True
+
+
+def test_direct_preview_latest_close_does_not_trigger_realtime_rules(client, session):
+    preview = _holding_preview(client, session, "latest_close", stop_loss_price=11)
+    assert preview["current_price_quality"] == "MISSING"
+    assert preview["existing_position"]["current_price"] is None
+    assert preview["existing_position"]["hard_stop_triggered"] is False
+
+
+def test_holding_hard_stop_not_evaluated_with_untrusted_quote(client, session):
+    preview = _holding_preview(client, session, "conflicted", stop_loss_price=11)
+    assert preview["existing_position"]["hard_stop_triggered"] is False
+
+
+def test_holding_reduction_not_evaluated_with_untrusted_quote(client, session):
+    preview = _holding_preview(client, session, "stale", target_price=10)
+    assert preview["existing_position"]["first_reduction_triggered"] is False
+
+
+def test_holding_add_not_evaluated_with_untrusted_quote(client, session):
+    preview = _holding_preview(client, session, "missing", cost_price=8)
+    assert preview["existing_position"]["confirmation_add_allowed"] is False
+
+
+def test_preview_metadata_comes_from_selected_daily_lineage(client, session):
+    account = create_account(client)
+    seed_pattern(session)
+    selected = session.query(MarketDailyBar).order_by(MarketDailyBar.trade_date).all()
+    quality_record_id = selected[0].quality_record_id
+    preview = client.post(
+        "/api/v1/trade-plan-generator/preview", json=payload(account["id"])
+    ).json()
+    assert preview["market_data_quality_record_id"] == quality_record_id
+    assert preview["data_date"] == selected[-1].trade_date.isoformat()
+    assert preview["sources"][0]["name"] == selected[-1].source
+
+
+def test_invalid_newer_bar_lineage_does_not_change_preview_metadata(client, session):
+    account = create_account(client)
+    seed_pattern(session)
+    trusted = session.query(MarketDailyBar).order_by(MarketDailyBar.trade_date).all()
+    trusted_record_id = trusted[0].quality_record_id
+    session.add(
+        MarketDailyBar(
+            symbol="300502",
+            trade_date=date.today() + timedelta(days=1),
+            open=Decimal("20"),
+            high=Decimal("20"),
+            low=Decimal("20"),
+            close=Decimal("20"),
+            volume=Decimal("100"),
+            adjustment="qfq",
+            price_unit="CNY",
+            volume_unit="share",
+            observed_at=datetime.now(),
+            quality_status="SINGLE_SOURCE",
+            quality_record_id=None,
+            source="invalid-newer-row",
+            fetched_at=datetime.now(),
+        )
+    )
+    session.commit()
+
+    preview = client.post(
+        "/api/v1/trade-plan-generator/preview", json=payload(account["id"])
+    ).json()
+    assert preview["market_data_quality_record_id"] == trusted_record_id
+    assert preview["data_date"] == trusted[-1].trade_date.isoformat()
+    assert preview["sources"][0]["name"] != "invalid-newer-row"
 
 
 def evidence_package(symbol="300502"):

@@ -313,6 +313,8 @@ def market_sync(
         history_result = provider.get_history(
             symbol, date.today() - timedelta(days=days), date.today()
         )
+        # Acquisition audit survives a later rollback of business cache writes.
+        db.commit()
         try:
             quote = quote_result.require_trusted_value()
             bars = history_result.require_trusted_value()
@@ -365,8 +367,43 @@ def market_sync(
                 f"历史行情完整性检查失败，未写入数据库：{exc}"
             ) from exc
         persist_market_quote(db, provider, quote_result)
+        stored_quote = resolve_cached_quote(
+            db,
+            symbol=symbol,
+            capability="market.quote.realtime",
+        )
+        stored_series = resolve_cached_series(
+            db,
+            cache_symbol=subject.subject_id,
+            capability="market.daily.qfq",
+            subject=subject,
+            adjustment="qfq",
+            price_unit="CNY",
+            volume_unit="share",
+            min_rows=1,
+        )
+        blocked = [
+            selection
+            for selection in (stored_quote, stored_series)
+            if not selection.executable
+        ]
+        if blocked:
+            details = ", ".join(
+                f"{selection.effective_quality.capability}="
+                f"{selection.effective_quality.effective_quality.value}"
+                for selection in blocked
+            )
+            raise ProviderUnavailableError(
+                f"market sync blocked by effective quality: {details}"
+            )
+        selected_quote = stored_quote.value
+        selected_bars = stored_series.bars
+        if selected_quote is None or not selected_bars:
+            raise ProviderUnavailableError(
+                "market sync resolved executable data without persisted values"
+            )
         inserted = len(stored_bars)
-        history_sources = sorted({bar.source for bar in bars})
+        history_sources = sorted({bar.source for bar in selected_bars})
         db.add(
             MarketSourceLog(
                 source=" + ".join([quote.source, *history_sources]),
@@ -383,19 +420,35 @@ def market_sync(
         db.commit()
         return {
             "status": "success",
+            "executable": True,
             "quote": {
                 "symbol": symbol,
-                "price": str(quote.price),
-                "source": quote.source,
-                "source_api": quote.source_api,
-                "data_date": quote.fetched_at.date().isoformat(),
-                "updated_at": quote.fetched_at.isoformat(),
+                "price": str(selected_quote.price),
+                "source": selected_quote.source,
+                "source_api": selected_quote.source_api,
+                "data_date": selected_quote.fetched_at.date().isoformat(),
+                "updated_at": selected_quote.fetched_at.isoformat(),
                 "status": "success",
+                **effective_quality_metadata(stored_quote.effective_quality),
             },
             "bars_inserted": inserted,
             "history_source": history_sources[0],
-            "quote_quality_status": quote_result.quality_status.value,
-            "history_quality_status": history_result.quality_status.value,
+            "quote_quality_status": (
+                stored_quote.effective_quality.effective_quality.value
+            ),
+            "history_quality_status": (
+                stored_series.effective_quality.effective_quality.value
+            ),
+            "quote_quality": {
+                "capability": "market.quote.realtime",
+                "quality_record_id": stored_quote.quality_record_id,
+                **effective_quality_metadata(stored_quote.effective_quality),
+            },
+            "history_quality": {
+                "capability": "market.daily.qfq",
+                "quality_record_id": stored_series.quality_record_id,
+                **effective_quality_metadata(stored_series.effective_quality),
+            },
             "provider_observations": {
                 "quote": quote_result.provider_observations,
                 "history": history_result.provider_observations,
@@ -405,10 +458,11 @@ def market_sync(
             ),
             "fallback_used": quote_result.fallback_used or history_result.fallback_used,
             "cache_used": quote_result.cache_used or history_result.cache_used,
-            "data_date": bars[-1].trade_date.isoformat(),
+            "data_date": selected_bars[-1].trade_date.isoformat(),
             "updated_at": datetime.now().isoformat(),
         }
     except AppError:
+        db.rollback()
         job.status = "blocked"
         job.finished_at = datetime.now()
         db.commit()

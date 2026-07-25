@@ -11,13 +11,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.errors import AppError
-from app.data_hub.trading_calendar import get_trading_calendar
+from app.data_hub.market_subjects import stock_daily_subject
 from app.models import (
     Account,
     CompanyProfile,
     Holding,
-    MarketDailyBar,
-    MarketQuote,
     RuleVersion,
     TradePlan,
     TradePlanAIAnalysis,
@@ -26,6 +24,7 @@ from app.models import (
 from app.schemas_workflow import TradePlanPreviewRequest, TradePlanSaveRequest
 from app.services.technical import prepare_indicators
 from app.services.technical_snapshots import load_qfq_frame
+from app.services.market_cache import resolve_cached_quote, resolve_cached_series
 from app.services.workflow import ensure_default_rule_version
 
 
@@ -270,21 +269,34 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             Holding.account_id == request.account_id, Holding.symbol == request.symbol
         )
     )
-    latest_bar = db.scalar(
-        select(MarketDailyBar)
-        .where(MarketDailyBar.symbol == request.symbol)
-        .order_by(MarketDailyBar.trade_date.desc(), MarketDailyBar.fetched_at.desc())
+    daily_subject = stock_daily_subject(request.symbol, "qfq", "CNY", "share")
+    daily_selection = resolve_cached_series(
+        db,
+        cache_symbol=daily_subject.subject_id,
+        capability="market.daily.qfq",
+        subject=daily_subject,
+        adjustment="qfq",
+        price_unit="CNY",
+        volume_unit="share",
+        min_rows=250,
     )
-    quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == request.symbol))
+    quote_selection = resolve_cached_quote(
+        db,
+        symbol=request.symbol,
+        capability="market.quote.realtime",
+    )
+    latest_bar = daily_selection.bars[-1] if daily_selection.executable else None
+    quote_value = quote_selection.value
+    executable_quote = quote_value if quote_selection.executable else None
     holding = stored_holding
     if request.position_mode == "空仓":
         holding = None
     elif request.position_mode == "持仓" and request.holding_quantity and request.holding_cost_price:
         reference_price = (
-            quote.price
-            if quote
-            else latest_bar.close
-            if latest_bar
+            executable_quote.price
+            if executable_quote
+            else stored_holding.current_price
+            if stored_holding
             else request.holding_cost_price
         )
         holding = SimpleNamespace(
@@ -297,7 +309,11 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
         )
     missing = []
     try:
-        frame = load_qfq_frame(db, request.symbol)
+        frame = load_qfq_frame(
+            db,
+            request.symbol,
+            selection=daily_selection,
+        )
         pattern = _platform_pattern(frame, parameters)
     except ValueError as exc:
         frame, pattern = None, None
@@ -305,9 +321,7 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
     now = datetime.now()
     data_time = latest_bar.fetched_at.isoformat() if latest_bar else "数据不足"
     data_date = latest_bar.trade_date.isoformat() if latest_bar else None
-    stale = not latest_bar or get_trading_calendar().session_lag(
-        latest_bar.trade_date
-    ) > int(parameters["freshness_days"])
+    stale = not daily_selection.executable
     source = latest_bar.source if latest_bar else "数据不足"
     gates = []
     market_status = (
@@ -454,7 +468,7 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             gates.append(
                 _gate(code, name, "无法判断", "历史行情数据不足。", source, data_time, missing)
             )
-    current_price = float(quote.price) if quote else pattern["latest_close"] if pattern else None
+    current_price = float(executable_quote.price) if executable_quote else None
     stop = None
     stop_distance_pct = None
     entry_reference = None
@@ -692,7 +706,9 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
     ]
     preview = {
         "symbol": request.symbol,
-        "company_name": profile.name if profile else quote.name if quote else request.symbol,
+        "company_name": (
+            profile.name if profile else quote_value.name if quote_value else request.symbol
+        ),
         "status": final_status,
         "status_reason": reasons or ["全部关键闸门通过，只有触发条件实际出现时才允许按计划试错。"],
         "missing_conditions": sorted(
@@ -734,6 +750,19 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             if holding
             else "当前账户未持有该股票。",
         },
+        "current_price_available": quote_value is not None,
+        "current_price_executable": quote_selection.executable,
+        "current_price_quality": (
+            quote_selection.effective_quality.effective_quality.value
+        ),
+        "price_trigger_evaluation_skipped": not quote_selection.executable,
+        "price_trigger_blocking_reason": (
+            None if quote_selection.executable else quote_selection.blocking_reason
+        ),
+        "market_data_quality_record_id": daily_selection.quality_record_id,
+        "market_data_quality": (
+            daily_selection.effective_quality.effective_quality.value
+        ),
         "multi_timeframe": {
             "monthly": monthly,
             "weekly": weekly,

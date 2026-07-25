@@ -38,6 +38,7 @@ from app.services.one_click_pipeline import (
     _cached_quote_step,
     _market_assessment,
     _sector_assessment,
+    _sync_stock,
 )
 from app.services.market_cache import (
     mapping_series_bars,
@@ -1891,3 +1892,325 @@ def test_complete_mapping_refresh_replaces_existing_cache(session):
     assert len(stored) == 100
     assert {item.close for item in stored} == {Decimal("12.0000")}
     assert {item.quality_record_id for item in stored} == {new.quality_record_id}
+
+
+def _seed_index_cache(session, *, close="10"):
+    router, result, subject, bars = _index_refresh_fixture(
+        session, close=close, provider_id="trusted-index"
+    )
+    replace_market_series(
+        session, router, result, bars, subject=subject, min_rows=60
+    )
+    session.commit()
+    return subject, result
+
+
+def _add_index_conflict(session):
+    result = _router(
+        session,
+        MarketStub("index-a", series_row_count=100, daily_close="10"),
+        MarketStub(
+            "index-b", priority=20, series_row_count=100, daily_close="11"
+        ),
+    ).get_index_history(
+        "csi000300", date.today() - timedelta(days=240), date.today()
+    )
+    assert result.quality_status == DataQualityStatus.CONFLICTED
+    session.commit()
+
+
+def test_single_source_does_not_bypass_existing_index_conflict(session):
+    _seed_index_cache(session)
+    _add_index_conflict(session)
+    assessment, step = _market_assessment(
+        session,
+        _router(
+            session,
+            MarketStub("single-index", series_row_count=100, daily_close="12"),
+        ),
+    )
+    assert assessment["return_20d"] is None
+    assert step["status"] != "success"
+    assert step["executable"] is False
+
+
+def test_effective_conflict_cannot_return_success_step(session):
+    _seed_index_cache(session)
+    _add_index_conflict(session)
+    _, step = _market_assessment(
+        session,
+        _router(
+            session,
+            MarketStub("single-index", series_row_count=100, daily_close="12"),
+        ),
+    )
+    assert step["effective_quality"] == "CONFLICTED"
+    assert step["status"] != "success"
+
+
+def test_index_assessment_uses_selected_lineage_bars(session):
+    subject, trusted = _seed_index_cache(session, close="10")
+    assessment, step = _market_assessment(
+        session,
+        _router(session, MarketStub("offline", failures={"get_index_history"})),
+    )
+    assert assessment["close"] == 10.0
+    assert step["quality_record_id"] == trusted.quality_record_id
+    assert step["subject_id"] == subject.subject_id
+
+
+def test_stock_single_source_after_conflict_is_not_success(session):
+    trusted_router = _router(session, MarketStub("trusted", row_count=260))
+    trusted = trusted_router.get_history(
+        "300502", date.today() - timedelta(days=900), date.today()
+    )
+    _persist_daily(session, trusted_router, trusted)
+    conflict = _router(
+        session,
+        MarketStub("stock-a", row_count=260, daily_close="10"),
+        MarketStub(
+            "stock-b", priority=20, row_count=260, daily_close="11"
+        ),
+    ).get_history("300502", date.today() - timedelta(days=900), date.today())
+    assert conflict.quality_status == DataQualityStatus.CONFLICTED
+    session.commit()
+
+    step, _ = _sync_stock(
+        session,
+        "300502",
+        _router(session, MarketStub("single", row_count=260, daily_close="12")),
+        True,
+    )
+    assert step["status"] != "success"
+    assert step["executable"] is False
+
+
+def test_failed_effective_check_rolls_back_series_replacement(session):
+    trusted_router = _router(session, MarketStub("trusted", row_count=260))
+    trusted = trusted_router.get_history(
+        "300502", date.today() - timedelta(days=900), date.today()
+    )
+    _persist_daily(session, trusted_router, trusted)
+    _router(
+        session,
+        MarketStub("stock-a", row_count=260, daily_close="10"),
+        MarketStub(
+            "stock-b", priority=20, row_count=260, daily_close="11"
+        ),
+    ).get_history("300502", date.today() - timedelta(days=900), date.today())
+    session.commit()
+    _sync_stock(
+        session,
+        "300502",
+        _router(session, MarketStub("single", row_count=260, daily_close="12")),
+        True,
+    )
+    rows = session.scalars(
+        select(MarketDailyBar).where(MarketDailyBar.symbol == "300502")
+    ).all()
+    assert {item.quality_record_id for item in rows} == {trusted.quality_record_id}
+    assert {item.close for item in rows} == {Decimal("10.0000")}
+
+
+def test_market_sync_success_reports_effective_quality(client, session, monkeypatch):
+    router = _router(session, MarketStub("sync", row_count=260))
+    monkeypatch.setattr("app.api.advanced.build_data_hub", lambda db: router)
+    response = client.post("/api/v1/market/sync?symbol=300502&days=365")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["executable"] is True
+    assert body["quote_quality"]["effective_quality"] == "SINGLE_SOURCE"
+    assert body["history_quality"]["effective_quality"] == "SINGLE_SOURCE"
+
+
+def _market_sync_after_history_conflict(client, session, monkeypatch):
+    trusted_router = _router(session, MarketStub("trusted", row_count=260))
+    trusted = trusted_router.get_history(
+        "300502", date.today() - timedelta(days=365), date.today()
+    )
+    _persist_daily(session, trusted_router, trusted)
+    quote = trusted_router.get_quote("300502")
+    _persist_quote(session, trusted_router, quote)
+    _router(
+        session,
+        MarketStub("stock-a", row_count=260, daily_close="10"),
+        MarketStub(
+            "stock-b", priority=20, row_count=260, daily_close="11"
+        ),
+    ).get_history("300502", date.today() - timedelta(days=365), date.today())
+    session.commit()
+    refresh = _router(session, MarketStub("single", row_count=260, daily_close="12"))
+    monkeypatch.setattr("app.api.advanced.build_data_hub", lambda db: refresh)
+
+    response = client.post("/api/v1/market/sync?symbol=300502&days=365")
+    return response, trusted
+
+
+def test_market_sync_single_source_after_conflict_is_blocked(
+    client, session, monkeypatch
+):
+    response, trusted = _market_sync_after_history_conflict(
+        client, session, monkeypatch
+    )
+    assert response.status_code != 200
+    rows = session.scalars(
+        select(MarketDailyBar).where(MarketDailyBar.symbol == "300502")
+    ).all()
+    assert {item.quality_record_id for item in rows} == {trusted.quality_record_id}
+    assert {item.close for item in rows} == {Decimal("10.0000")}
+
+
+def _sector_refresh_after_conflict(session):
+    profile = _company_profile(session)
+    trusted_router = _router(
+        session, MarketStub("trusted-sector", series_row_count=100)
+    )
+    trusted = trusted_router.get_sector_history(
+        profile.industry, date.today() - timedelta(days=240), date.today()
+    )
+    subject = trusted.subject
+    bars = mapping_series_bars(
+        trusted.require_value(),
+        cache_symbol=subject.subject_id,
+        adjustment="unadjusted",
+    )
+    replace_market_series(
+        session, trusted_router, trusted, bars, subject=subject, min_rows=60
+    )
+    session.commit()
+    conflict = _router(
+        session,
+        MarketStub("sector-a", series_row_count=100, daily_close="10"),
+        MarketStub(
+            "sector-b", priority=20, series_row_count=100, daily_close="11"
+        ),
+    ).get_sector_history(
+        profile.industry, date.today() - timedelta(days=240), date.today()
+    )
+    assert conflict.quality_status == DataQualityStatus.CONFLICTED
+    session.commit()
+    assessment, step = _sector_assessment(
+        session,
+        _router(
+            session,
+            MarketStub("single-sector", series_row_count=100, daily_close="12"),
+        ),
+        profile,
+        {"return_20d": 0},
+        refresh=True,
+    )
+    return assessment, step, trusted
+
+
+def test_single_source_does_not_bypass_existing_sector_conflict(session):
+    _, step, _ = _sector_refresh_after_conflict(session)
+    assert step["status"] != "success"
+    assert step["effective_quality"] == "CONFLICTED"
+    assert step["executable"] is False
+
+
+def test_sector_assessment_uses_selected_lineage_bars(session):
+    profile = _company_profile(session)
+    router = _router(session, MarketStub("sector-selected", series_row_count=100))
+    result = router.get_sector_history(
+        profile.industry, date.today() - timedelta(days=240), date.today()
+    )
+    subject = result.subject
+    bars = mapping_series_bars(
+        result.require_value(),
+        cache_symbol=subject.subject_id,
+        adjustment="unadjusted",
+    )
+    replace_market_series(
+        session, router, result, bars, subject=subject, min_rows=60
+    )
+    session.commit()
+    assessment, step = _sector_assessment(
+        session,
+        _router(session, MarketStub("offline", failures={"get_sector_history"})),
+        profile,
+        {"return_20d": 0},
+    )
+    assert assessment["return_20d"] == 0.0
+    assert step["quality_record_id"] == result.quality_record_id
+    assert step["subject_id"] == subject.subject_id
+
+
+def test_stock_step_never_success_when_effective_quality_blocks(session):
+    trusted_router = _router(session, MarketStub("trusted", row_count=260))
+    trusted = trusted_router.get_history(
+        "300502", date.today() - timedelta(days=900), date.today()
+    )
+    _persist_daily(session, trusted_router, trusted)
+    _router(
+        session,
+        MarketStub("stock-a", row_count=260, daily_close="10"),
+        MarketStub(
+            "stock-b", priority=20, row_count=260, daily_close="11"
+        ),
+    ).get_history("300502", date.today() - timedelta(days=900), date.today())
+    session.commit()
+    step, _ = _sync_stock(
+        session,
+        "300502",
+        _router(session, MarketStub("single", row_count=260, daily_close="12")),
+        True,
+    )
+    assert step["effective_quality"] == "CONFLICTED"
+    assert step["executable"] is False
+    assert step["status"] != "success"
+
+
+def test_quote_step_and_rule_engine_share_same_effective_quality(session):
+    conflict = _router(
+        session,
+        MarketStub("quote-a", quote_price="10"),
+        MarketStub("quote-b", priority=20, quote_price="11"),
+    ).get_quote("300502")
+    assert conflict.quality_status == DataQualityStatus.CONFLICTED
+    session.commit()
+    step, context = _sync_stock(
+        session,
+        "300502",
+        _router(session, MarketStub("single", row_count=260, quote_price="12")),
+        True,
+    )
+    quote_step = context["quote_step"]
+    selected = resolve_cached_quote(
+        session, symbol="300502", capability="market.quote.realtime"
+    )
+    assert step["status"] == "success"
+    assert quote_step["status"] != "success"
+    assert quote_step["effective_quality"] == (
+        selected.effective_quality.effective_quality.value
+    )
+    assert quote_step["executable"] is selected.executable is False
+
+
+def test_market_sync_does_not_report_raw_quality_as_effective(
+    client, session, monkeypatch
+):
+    response, _ = _market_sync_after_history_conflict(
+        client, session, monkeypatch
+    )
+    latest = session.scalar(
+        select(DataQualityRecord)
+        .where(DataQualityRecord.capability == "market.daily.qfq")
+        .order_by(DataQualityRecord.id.desc())
+    )
+    assert latest.quality_status == "SINGLE_SOURCE"
+    assert response.status_code != 200
+
+
+def test_market_sync_effective_failure_preserves_previous_cache(
+    client, session, monkeypatch
+):
+    _, trusted = _market_sync_after_history_conflict(
+        client, session, monkeypatch
+    )
+    rows = session.scalars(
+        select(MarketDailyBar).where(MarketDailyBar.symbol == "300502")
+    ).all()
+    assert {item.quality_record_id for item in rows} == {trusted.quality_record_id}
+    assert {item.close for item in rows} == {Decimal("10.0000")}

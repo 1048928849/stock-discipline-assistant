@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.data_hub.contracts import ProviderUnavailableError
+from app.data_hub.contracts import ProviderUnavailableError, Quote
 from app.data_hub.market_subjects import (
     index_daily_subject,
     sector_daily_subject,
@@ -137,23 +137,22 @@ def _sync_stock(
         history_result = provider.get_history(
             symbol, date.today() - timedelta(days=900), date.today()
         )
-        if history_result.quality_status.blocks_execution:
-            db.commit()
+        # Keep acquisition audit durable while cache replacement remains rollbackable.
+        db.commit()
         bars = history_result.require_trusted_value()
         validate_series_for_persistence(bars, subject=subject, min_rows=250)
         quote_error = None
         quote_result = None
         try:
             quote_result = provider.get_quote(symbol)
+            db.commit()
             quote = quote_result.require_trusted_value()
         except ProviderUnavailableError as exc:
-            if quote_result and quote_result.quality_status.blocks_execution:
+            if quote_result:
                 db.commit()
             quote_error = str(exc)
             latest = bars[-1]
             old_quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == symbol))
-            from app.data_hub.contracts import Quote
-
             quote = Quote(
                 symbol=symbol,
                 name=old_quote.name if old_quote and old_quote.name else symbol,
@@ -173,9 +172,6 @@ def _sync_stock(
             subject=subject,
             min_rows=250,
         )
-        if quote_result is not None and not quote_result.quality_status.blocks_execution:
-            persist_market_quote(db, provider, quote_result)
-        db.commit()
         stored_history = resolve_cached_series(
             db,
             cache_symbol=subject.subject_id,
@@ -186,6 +182,44 @@ def _sync_stock(
             volume_unit="share",
             min_rows=250,
         )
+        if not stored_history.executable:
+            raise ProviderUnavailableError(
+                "stock history refresh blocked by effective quality: "
+                f"{stored_history.effective_quality.effective_quality.value} "
+                f"({stored_history.blocking_reason or 'not_executable'})"
+            )
+        db.commit()
+
+        if quote_result is not None:
+            try:
+                persist_market_quote(db, provider, quote_result)
+                candidate_quote = resolve_cached_quote(
+                    db,
+                    symbol=symbol,
+                    capability="market.quote.realtime",
+                )
+                if not candidate_quote.executable:
+                    raise ProviderUnavailableError(
+                        "quote refresh blocked by effective quality: "
+                        f"{candidate_quote.effective_quality.effective_quality.value} "
+                        f"({candidate_quote.blocking_reason or 'not_executable'})"
+                    )
+                db.commit()
+            except Exception as exc:
+                db.rollback()
+                quote_error = str(exc)
+                latest = stored_history.bars[-1]
+                quote = Quote(
+                    symbol=symbol,
+                    name=quote.name,
+                    price=latest.close,
+                    quote_type="latest_close",
+                    observed_at=latest.observed_at,
+                    price_unit=latest.price_unit,
+                    source=latest.source,
+                    source_api="history_latest_close",
+                    fetched_at=latest.fetched_at,
+                )
         stored_quote = resolve_cached_quote(
             db,
             symbol=symbol,
@@ -224,19 +258,19 @@ def _sync_stock(
                 + (f" 实时行情失败，使用最新收盘：{quote_error}" if quote_error else ""),
                 fallback_used=bool(quote_error) or history_result.fallback_used,
                 quality_status=stored_history.effective_quality.effective_quality.value,
-                observed_at=history_result.observed_at.isoformat()
-                if history_result.observed_at
+                observed_at=stored_history.observed_at.isoformat()
+                if stored_history.observed_at
                 else None,
-                fetched_at=history_result.fetched_at.isoformat(),
+                fetched_at=stored_history.bars[-1].fetched_at.isoformat(),
                 provider_observations=history_result.provider_observations,
-                source=bars[-1].source,
-                data_time=bars[-1].fetched_at.isoformat(),
+                source=stored_history.source,
+                data_time=stored_history.bars[-1].fetched_at.isoformat(),
                 quality_record_id=stored_history.quality_record_id,
                 **effective_quality_metadata(stored_history.effective_quality),
             ),
             {
-                "data_date": bars[-1].trade_date.isoformat(),
-                "source": bars[-1].source,
+                "data_date": stored_history.bars[-1].trade_date.isoformat(),
+                "source": stored_history.source,
                 "quote_step": quote_step,
             },
         )
@@ -361,8 +395,8 @@ def _market_assessment(db: Session, provider: DataHubRouter) -> tuple[dict, dict
         history_result = provider.get_index_history(
             "csi000300", date.today() - timedelta(days=240), date.today()
         )
-        if history_result.quality_status.blocks_execution:
-            db.commit()
+        # Preserve the acquisition audit before starting the replace transaction.
+        db.commit()
         history = history_result.require_value()
         bars = mapping_series_bars(
             history,
@@ -377,7 +411,6 @@ def _market_assessment(db: Session, provider: DataHubRouter) -> tuple[dict, dict
             subject=subject,
             min_rows=60,
         )
-        db.commit()
         current = resolve_cached_series(
             db,
             cache_symbol=subject.subject_id,
@@ -388,7 +421,22 @@ def _market_assessment(db: Session, provider: DataHubRouter) -> tuple[dict, dict
             volume_unit="share",
             min_rows=60,
         )
-        assessment = _series_assessment(history["rows"])
+        if not current.executable:
+            raise ProviderUnavailableError(
+                "index refresh blocked by effective quality: "
+                f"{current.effective_quality.effective_quality.value} "
+                f"({current.blocking_reason or 'not_executable'})"
+            )
+        db.commit()
+        rows = [
+            {
+                "date": item.trade_date,
+                "close": float(item.close),
+                "volume": float(item.volume),
+            }
+            for item in current.bars
+        ]
+        assessment = _series_assessment(rows)
         detail = (
             f"沪深300：20日涨跌 {assessment['return_20d']}%，"
             f"收盘 {assessment.get('close')}，MA20 {assessment.get('ma20')}，"
@@ -399,13 +447,13 @@ def _market_assessment(db: Session, provider: DataHubRouter) -> tuple[dict, dict
             "市场判断",
             "success" if assessment["state"] != "无法判断" else "partial",
             detail,
-            source=history["source"],
-            data_time=history["fetched_at"].isoformat(),
-            quality_status=history_result.quality_status.value,
-            observed_at=history_result.observed_at.isoformat()
-            if history_result.observed_at
+            source=current.source,
+            data_time=current.bars[-1].fetched_at.isoformat(),
+            quality_status=current.effective_quality.effective_quality.value,
+            observed_at=current.observed_at.isoformat()
+            if current.observed_at
             else None,
-            fetched_at=history_result.fetched_at.isoformat(),
+            fetched_at=current.bars[-1].fetched_at.isoformat(),
             provider_observations=history_result.provider_observations,
             quality_record_id=current.quality_record_id,
             **effective_quality_metadata(current.effective_quality),
@@ -637,8 +685,8 @@ def _sector_assessment(
         history_result = provider.get_sector_history(
             board_name, date.today() - timedelta(days=240), date.today()
         )
-        if history_result.quality_status.blocks_execution:
-            db.commit()
+        # Preserve the acquisition audit before starting the replace transaction.
+        db.commit()
         history = history_result.require_value()
         bars = mapping_series_bars(
             history,
@@ -653,7 +701,6 @@ def _sector_assessment(
             subject=subject,
             min_rows=60,
         )
-        db.commit()
         current = resolve_cached_series(
             db,
             cache_symbol=subject.subject_id,
@@ -664,20 +711,35 @@ def _sector_assessment(
             volume_unit="share",
             min_rows=60,
         )
-        result = _build_sector_assessment(profile, board_name, history["rows"], market)
+        if not current.executable:
+            raise ProviderUnavailableError(
+                "sector refresh blocked by effective quality: "
+                f"{current.effective_quality.effective_quality.value} "
+                f"({current.blocking_reason or 'not_executable'})"
+            )
+        db.commit()
+        rows = [
+            {
+                "date": item.trade_date,
+                "close": float(item.close),
+                "volume": float(item.volume),
+            }
+            for item in current.bars
+        ]
+        result = _build_sector_assessment(profile, board_name, rows, market)
         return result, _step(
             "industry_judgement",
             "行业判断",
             "success",
             f"{profile.industry}（行情代理板块：{board_name}）20日涨跌 {result['return_20d']}%，"
             f"相对沪深300 {result['relative_20d']}个百分点，判定为{result['state']}。",
-            source=history["source"],
-            data_time=history["fetched_at"].isoformat(),
-            quality_status=history_result.quality_status.value,
-            observed_at=history_result.observed_at.isoformat()
-            if history_result.observed_at
+            source=current.source,
+            data_time=current.bars[-1].fetched_at.isoformat(),
+            quality_status=current.effective_quality.effective_quality.value,
+            observed_at=current.observed_at.isoformat()
+            if current.observed_at
             else None,
-            fetched_at=history_result.fetched_at.isoformat(),
+            fetched_at=current.bars[-1].fetched_at.isoformat(),
             provider_observations=history_result.provider_observations,
             quality_record_id=current.quality_record_id,
             **effective_quality_metadata(current.effective_quality),
@@ -874,7 +936,9 @@ def _cached_quote_step(db: Session, symbol: str) -> dict:
 def _decision(preview: dict, position_mode: str) -> dict:
     holding = preview["existing_position"]
     if position_mode == "持仓":
-        if holding["hard_stop_triggered"] or preview.get("pattern", {}).get("platform_broken"):
+        if preview.get("price_trigger_evaluation_skipped"):
+            status, label = "WAIT", "等待可信实时价格"
+        elif holding["hard_stop_triggered"] or preview.get("pattern", {}).get("platform_broken"):
             status, label = "PLAN_INVALID_EXIT", "计划失效，需要退出"
         elif holding["first_reduction_triggered"]:
             status, label = "REDUCE", "建议减仓"

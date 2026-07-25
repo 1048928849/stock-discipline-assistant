@@ -6,24 +6,37 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.data_hub.market_subjects import stock_daily_subject
+from app.data_hub.contracts import ProviderUnavailableError
 from app.models import Holding, TechnicalSnapshot
 from app.services.data_sources import build_data_hub
-from app.services.market_cache import replace_market_series, resolve_cached_series
+from app.services.market_cache import (
+    CachedSeriesSelection,
+    replace_market_series,
+    resolve_cached_series,
+)
 from app.services.technical import analyze_frame, compare_states
 
 
-def load_qfq_frame(db: Session, symbol: str) -> pd.DataFrame:
+def load_qfq_frame(
+    db: Session,
+    symbol: str,
+    *,
+    selection: CachedSeriesSelection | None = None,
+) -> pd.DataFrame:
     subject = stock_daily_subject(symbol, "qfq", "CNY", "share")
-    selection = resolve_cached_series(
-        db,
-        cache_symbol=subject.subject_id,
-        capability="market.daily.qfq",
-        subject=subject,
-        adjustment="qfq",
-        price_unit="CNY",
-        volume_unit="share",
-        min_rows=250,
-    )
+    if selection is None:
+        selection = resolve_cached_series(
+            db,
+            cache_symbol=subject.subject_id,
+            capability="market.daily.qfq",
+            subject=subject,
+            adjustment="qfq",
+            price_unit="CNY",
+            volume_unit="share",
+            min_rows=250,
+        )
+    elif selection.subject != subject:
+        raise ValueError("qfq selection subject does not match requested symbol")
     if not selection.executable:
         reason = selection.blocking_reason or selection.structure_reason or "missing"
         quality = selection.effective_quality.effective_quality.value
@@ -102,8 +115,8 @@ def refresh_qfq_history(db: Session, symbol: str, days: int = 550) -> int:
     result = provider.get_history(
         symbol, date.today() - timedelta(days=days), date.today()
     )
-    if result.quality_status.blocks_execution:
-        db.commit()
+    # Keep the acquisition audit while allowing callers to roll back cache changes.
+    db.commit()
     bars = result.require_trusted_value()
     subject = stock_daily_subject(symbol, "qfq", "CNY", "share")
     stored = replace_market_series(
@@ -114,6 +127,22 @@ def refresh_qfq_history(db: Session, symbol: str, days: int = 550) -> int:
         subject=subject,
         min_rows=250,
     )
+    current = resolve_cached_series(
+        db,
+        cache_symbol=subject.subject_id,
+        capability="market.daily.qfq",
+        subject=subject,
+        adjustment="qfq",
+        price_unit="CNY",
+        volume_unit="share",
+        min_rows=250,
+    )
+    if not current.executable:
+        raise ProviderUnavailableError(
+            "qfq refresh blocked by effective quality: "
+            f"{current.effective_quality.effective_quality.value} "
+            f"({current.blocking_reason or 'not_executable'})"
+        )
     return len(stored)
 
 
