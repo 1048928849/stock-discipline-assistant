@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from app.data_hub.contracts import DataProvider, ProviderMetadata, ProviderUnavailableError
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.research_subjects import (
+    announcement_catalog_window,
     announcement_catalog_subject,
     company_profile_subject,
 )
@@ -31,6 +32,7 @@ from app.services.research_cache import (
     resolve_cached_company_profile,
 )
 from app.services.company_research import sync_company_research
+from app.services.one_click_pipeline import _research_inventory
 
 
 class ResearchProvider(DataProvider):
@@ -179,6 +181,85 @@ def test_different_announcement_windows_are_isolated():
         announcement_catalog_subject(
             "300502", date(2026, 7, 26), date(2026, 7, 25)
         )
+
+
+def test_announcement_catalog_window_uses_shanghai_business_date():
+    evaluated_at = datetime(2026, 7, 25, 9, 30, tzinfo=SHANGHAI_TZ)
+    start, end = announcement_catalog_window(evaluated_at=evaluated_at)
+    assert end == date(2026, 7, 25)
+    assert start == end - timedelta(days=3 * 366)
+
+
+def test_announcement_catalog_window_converts_utc_instant_to_shanghai_date():
+    start, end = announcement_catalog_window(
+        evaluated_at=datetime(2026, 7, 24, 16, 30, tzinfo=timezone.utc)
+    )
+    assert end == date(2026, 7, 25)
+    assert start == date(2023, 7, 23)
+
+
+def test_announcement_catalog_window_rejects_naive_evaluation_time():
+    with pytest.raises(ValueError, match="naive datetime"):
+        announcement_catalog_window(evaluated_at=datetime(2026, 7, 25, 9, 30))
+
+
+def test_announcement_catalog_window_does_not_read_host_timezone(monkeypatch):
+    evaluated_at = datetime(2026, 7, 25, 1, 30, tzinfo=timezone.utc)
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    first = announcement_catalog_window(evaluated_at=evaluated_at)
+    monkeypatch.setenv("TZ", "Asia/Tokyo")
+    second = announcement_catalog_window(evaluated_at=evaluated_at)
+    assert first == second
+    assert first[1] == date(2026, 7, 25)
+
+
+def test_different_business_days_create_different_announcement_subjects():
+    first_window = announcement_catalog_window(
+        evaluated_at=datetime(2026, 7, 25, 15, 59, tzinfo=timezone.utc)
+    )
+    second_window = announcement_catalog_window(
+        evaluated_at=datetime(2026, 7, 25, 16, 0, tzinfo=timezone.utc)
+    )
+    assert announcement_catalog_subject("300502", *first_window) != (
+        announcement_catalog_subject("300502", *second_window)
+    )
+
+
+def test_sync_and_inventory_reuse_exact_announcement_window_across_midnight(
+    session, monkeypatch
+):
+    analysis_started_at = datetime(2026, 7, 25, 23, 59, tzinfo=SHANGHAI_TZ)
+    next_day = analysis_started_at + timedelta(minutes=2)
+    router = _router_at(session, analysis_started_at)
+    sync_company_research(
+        session,
+        "300502",
+        provider=router,
+        include_documents=False,
+        evaluated_at=analysis_started_at,
+    )
+    monkeypatch.setattr(
+        "app.services.one_click_pipeline.shanghai_now", lambda: next_day
+    )
+    _, step = _research_inventory(
+        session, "300502", evaluated_at=analysis_started_at
+    )
+    expected_start, expected_end = announcement_catalog_window(
+        evaluated_at=analysis_started_at
+    )
+    binding = step["source_quality_binding"]
+    assert binding["semantic_key"] == (
+        f"catalog/{expected_start.isoformat()}/{expected_end.isoformat()}"
+    )
+    assert datetime.fromisoformat(step["data_time"]) == analysis_started_at
+    assert datetime.fromisoformat(step["observed_at"]).tzinfo is not None
+    assert all(
+        datetime.fromisoformat(binding[field]).tzinfo is None
+        for field in ("observed_at", "scan_start", "scan_end", "checked_at")
+    )
+    assert datetime.fromisoformat(step["observed_at"]).astimezone(
+        timezone.utc
+    ).replace(tzinfo=None) == datetime.fromisoformat(binding["observed_at"])
 
 
 def test_profile_router_rejects_missing_subject(session):

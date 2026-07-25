@@ -21,7 +21,14 @@ from app.models import (
     XPost,
 )
 from app.config import get_settings
+from app.data_hub.research_subjects import announcement_catalog_window
 from app.data_hub.router import DataHubRouter
+from app.data_hub.trading_calendar import (
+    shanghai_now,
+    to_shanghai_aware,
+    to_utc_storage_naive,
+    utc_storage_naive_to_aware,
+)
 from app.services.data_sources import ProviderResult, UnifiedDataService
 from app.services.research_cache import (
     persist_announcement_catalog,
@@ -388,9 +395,16 @@ def sync_company_research(
     symbol: str,
     provider=None,
     include_documents: bool = True,
+    evaluated_at: datetime | None = None,
 ) -> dict:
     provider = provider or UnifiedDataService(db)
-    fetched_at = datetime.now()
+    business_now = to_shanghai_aware(evaluated_at or shanghai_now())
+    business_day = business_now.date()
+    research_storage_now = to_utc_storage_naive(business_now)
+    fetched_at = research_storage_now
+    announcement_start, announcement_end = announcement_catalog_window(
+        evaluated_at=business_now
+    )
     sections = {}
     profile = None
     exact_calls: dict[str, ProviderResult] = {}
@@ -481,17 +495,16 @@ def sync_company_research(
         sections["financials"] = {"status": "unavailable", "message": str(exc)}
 
     try:
-        announcement_start = date.today() - timedelta(days=3 * 366)
-        announcement_end = date.today()
         announcement_call = provider.company_announcements(
             symbol, announcement_start, announcement_end
         )
+        if isinstance(provider, DataHubRouter):
+            exact_calls["announcements"] = announcement_call
         announcement_rows = _provider_value(announcement_call)
         inserted = 0
         document_resolution_attempts = 0
         resolved_documents = 0
         if isinstance(provider, DataHubRouter):
-            exact_calls["announcements"] = announcement_call
             persist_announcement_catalog(
                 db,
                 provider,
@@ -766,9 +779,9 @@ def sync_company_research(
                 )
         call = None
         if isinstance(provider, DataHubRouter):
-            call = exact_calls.get(section) or provider.calls.get(
-                capability_by_section[section]
-            )
+            call = exact_calls.get(section)
+            if call is None and section not in {"profile", "announcements"}:
+                call = provider.calls.get(capability_by_section[section])
         if (
             external_success
             and call
@@ -783,7 +796,9 @@ def sync_company_research(
                 result["conflict_fields"] = call.conflict_fields
                 result["normalized_digest"] = call.normalized_digest
                 if call.checked_at:
-                    result["checked_at"] = call.checked_at.isoformat()
+                    result["checked_at"] = to_shanghai_aware(
+                        call.checked_at
+                    ).isoformat()
             continue
         quality_status = (
             call.quality_status.value
@@ -793,7 +808,7 @@ def sync_company_research(
             else "MISSING"
         )
         checked_at = (
-            fetched_at
+            research_storage_now
             if section == "announcements" and external_success
             else existing.checked_at
             if section == "announcements" and existing
@@ -805,7 +820,9 @@ def sync_company_research(
             result["conflict_fields"] = call.conflict_fields
             result["normalized_digest"] = call.normalized_digest
         if checked_at:
-            result["checked_at"] = checked_at.isoformat()
+            result["checked_at"] = utc_storage_naive_to_aware(
+                checked_at
+            ).isoformat()
         values = {
             "status": result["status"],
             "provider_id": call.provider_id
@@ -816,16 +833,18 @@ def sync_company_research(
             else getattr(provider, "provider_id", provider.__class__.__name__),
             "row_count": row_count,
             "cache_used": cache_used,
-            "last_attempt_at": fetched_at,
-            "last_success_at": fetched_at
+            "last_attempt_at": research_storage_now,
+            "last_success_at": research_storage_now
             if external_success
             else (existing.last_success_at if existing else None),
             "data_date": (
-                date.today()
-                if row_count or (section == "announcements" and external_success)
-                else None
+                business_day
+                if external_success
+                and (row_count or section == "announcements")
+                else (existing.data_date if existing else None)
             ),
-            "stale_after": fetched_at + timedelta(hours=fresh_hours[section])
+            "stale_after": research_storage_now
+            + timedelta(hours=fresh_hours[section])
             if external_success
             else (existing.stale_after if existing else None),
             "quality_status": quality_status,
@@ -838,13 +857,41 @@ def sync_company_research(
                 if existing
                 else None
             ),
-            "fetched_at": call.fetched_at if call else fetched_at,
+            "fetched_at": (
+                DataHubRouter._as_datetime(call.fetched_at)
+                if call and external_success
+                else research_storage_now
+                if external_success
+                else existing.fetched_at
+                if existing
+                else None
+            ),
             "checked_at": checked_at,
-            "scan_start": call.fetched_at if call and section == "announcements" else None,
-            "scan_end": call.fetched_at if call and section == "announcements" else None,
-            "normalized_digest": call.normalized_digest if call else None,
-            "provider_observations": call.provider_observations if call else [],
-            "conflict_fields": call.conflict_fields if call else [],
+            "scan_start": datetime.combine(announcement_start, datetime.min.time())
+            if section == "announcements" and external_success
+            else existing.scan_start
+            if section == "announcements" and existing
+            else None,
+            "scan_end": datetime.combine(announcement_end, datetime.max.time())
+            if section == "announcements" and external_success
+            else existing.scan_end
+            if section == "announcements" and existing
+            else None,
+            "normalized_digest": call.normalized_digest
+            if call
+            else existing.normalized_digest
+            if existing
+            else None,
+            "provider_observations": call.provider_observations
+            if call
+            else existing.provider_observations
+            if existing
+            else [],
+            "conflict_fields": call.conflict_fields
+            if call
+            else existing.conflict_fields
+            if existing
+            else [],
             "error": result.get("message") if not external_success else None,
         }
         if existing is None:
@@ -859,7 +906,7 @@ def sync_company_research(
         if any(v["status"] != "success" for v in sections.values())
         else "success",
         "sections": sections,
-        "updated_at": fetched_at.isoformat(),
+        "updated_at": business_now.isoformat(),
     }
 
 
@@ -870,10 +917,12 @@ def refresh_company_research_if_needed(
     force: bool = False,
     include_documents: bool = False,
     data_service: UnifiedDataService | None = None,
+    evaluated_at: datetime | None = None,
 ) -> dict:
     """检查四类公司研究数据，新鲜则复用，过期则经统一Provider自动刷新。"""
     settings = get_settings()
-    now = datetime.now()
+    business_now = to_shanghai_aware(evaluated_at or shanghai_now())
+    research_storage_now = to_utc_storage_naive(business_now)
     latest = {
         "profile": db.scalar(
             select(func.max(CompanyProfile.fetched_at)).where(CompanyProfile.symbol == symbol)
@@ -903,7 +952,9 @@ def refresh_company_research_if_needed(
     stale = [
         name
         for name, updated in latest.items()
-        if force or updated is None or updated < now - timedelta(hours=limits[name])
+        if force
+        or updated is None
+        or updated < research_storage_now - timedelta(hours=limits[name])
     ]
     if stale:
         result = sync_company_research(
@@ -911,6 +962,7 @@ def refresh_company_research_if_needed(
             symbol,
             provider=data_service or UnifiedDataService(db),
             include_documents=include_documents,
+            evaluated_at=business_now,
         )
     else:
         result = {
@@ -920,13 +972,21 @@ def refresh_company_research_if_needed(
                 name: {
                     "status": "fresh",
                     "rows": 1,
-                    "updated_at": updated.isoformat() if updated else None,
+                    "updated_at": utc_storage_naive_to_aware(updated).isoformat()
+                    if updated
+                    else None,
                     "cache_used": False,
                 }
                 for name, updated in latest.items()
             },
-            "updated_at": now.isoformat(),
+            "updated_at": business_now.isoformat(),
         }
+    announcement_refresh = db.scalar(
+        select(CompanyResearchRefresh).where(
+            CompanyResearchRefresh.symbol == symbol,
+            CompanyResearchRefresh.section == "announcements",
+        )
+    )
     presence = {
         "profile": bool(
             db.scalar(select(CompanyProfile.id).where(CompanyProfile.symbol == symbol))
@@ -940,7 +1000,8 @@ def refresh_company_research_if_needed(
             db.scalar(
                 select(CompanyAnnouncement.id).where(CompanyAnnouncement.symbol == symbol)
             )
-        ),
+        )
+        or bool(announcement_refresh and announcement_refresh.last_success_at),
         "valuation": bool(
             db.scalar(
                 select(CompanyValuationSnapshot.id).where(
@@ -954,7 +1015,7 @@ def refresh_company_research_if_needed(
     ).all()
     return {
         **result,
-        "checked_at": now.isoformat(),
+        "checked_at": business_now.isoformat(),
         "refreshed_sections": stale,
         "missing_data": [name for name, available in presence.items() if not available],
         "freshness": [
@@ -962,10 +1023,16 @@ def refresh_company_research_if_needed(
                 "section": item.section,
                 "status": item.status,
                 "provider_id": item.provider_id,
-                "last_success_at": item.last_success_at.isoformat()
+                "last_success_at": utc_storage_naive_to_aware(
+                    item.last_success_at
+                ).isoformat()
                 if item.last_success_at
                 else None,
-                "stale_after": item.stale_after.isoformat() if item.stale_after else None,
+                "stale_after": utc_storage_naive_to_aware(
+                    item.stale_after
+                ).isoformat()
+                if item.stale_after
+                else None,
                 "cache_used": item.cache_used,
                 "row_count": item.row_count,
             }

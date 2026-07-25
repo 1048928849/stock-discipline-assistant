@@ -1,8 +1,21 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta
 
+from app.data_hub.trading_calendar import shanghai_now, to_shanghai_aware
 from app.domain.quality_subject import SubjectRef
+
+
+def announcement_catalog_window(
+    *,
+    evaluated_at: datetime | None = None,
+    lookback_days: int = 3 * 366,
+) -> tuple[date, date]:
+    if lookback_days < 0:
+        raise ValueError("announcement lookback_days must not be negative")
+    business_now = to_shanghai_aware(evaluated_at or shanghai_now())
+    end = business_now.date()
+    return end - timedelta(days=lookback_days), end
 
 
 def company_profile_subject(symbol: str) -> SubjectRef:
@@ -29,4 +42,8 @@ def announcement_catalog_subject(
     )
 
 
-__all__ = ["announcement_catalog_subject", "company_profile_subject"]
+__all__ = [
+    "announcement_catalog_subject",
+    "announcement_catalog_window",
+    "company_profile_subject",
+]

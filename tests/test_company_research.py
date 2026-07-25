@@ -1,9 +1,19 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+
+from app.data_hub.trading_calendar import SHANGHAI_TZ
+from app.models import (
+    CompanyAnnouncement,
+    CompanyFinancialPeriod,
+    CompanyProfile,
+    CompanyResearchRefresh,
+    CompanyValuationSnapshot,
+)
 
 from app.services.company_research import (
     build_company_report,
     classify_announcement,
     extract_report_evidence,
+    refresh_company_research_if_needed,
     sync_company_research,
 )
 
@@ -78,6 +88,7 @@ class FakeResearchProvider:
         return financial_fixture(symbol)
 
     def company_announcements(self, symbol, start, end):
+        self.announcement_window = (start, end)
         return [
             {
                 "公告标题": f"{symbol} 2025年年度报告",
@@ -130,6 +141,107 @@ class FakeResearchProvider:
             {"代码": "603083", "简称": "同行乙", "市盈率-TTM": 28, "市净率-MRQ": 3.2},
             {"代码": "600487", "简称": "同行丙", "市盈率-TTM": 31, "市净率-MRQ": 3.8},
         ]
+
+
+class FailIfCalledProvider(FakeResearchProvider):
+    def company_profile(self, symbol):
+        raise AssertionError("fresh Research cache must not refresh")
+
+
+def test_legacy_research_uses_injected_window_utc_storage_and_aware_output(session):
+    evaluated_at = datetime(2026, 7, 25, 9, 30, tzinfo=SHANGHAI_TZ)
+    provider = FakeResearchProvider()
+    result = sync_company_research(
+        session,
+        "300502",
+        provider=provider,
+        include_documents=False,
+        evaluated_at=evaluated_at,
+    )
+    expected_storage = datetime(2026, 7, 25, 1, 30)
+    expected_end = date(2026, 7, 25)
+    expected_start = expected_end - timedelta(days=3 * 366)
+    assert provider.announcement_window == (expected_start, expected_end)
+    assert datetime.fromisoformat(result["updated_at"]) == evaluated_at
+    assert session.query(CompanyProfile).one().fetched_at == expected_storage
+    assert all(
+        row.fetched_at == expected_storage
+        for model in (
+            CompanyFinancialPeriod,
+            CompanyAnnouncement,
+            CompanyValuationSnapshot,
+        )
+        for row in session.query(model).all()
+    )
+    refresh = session.query(CompanyResearchRefresh).filter_by(
+        symbol="300502", section="announcements"
+    ).one()
+    assert refresh.last_attempt_at == expected_storage
+    assert refresh.scan_start == datetime.combine(expected_start, datetime.min.time())
+    assert refresh.scan_end == datetime.combine(expected_end, datetime.max.time())
+    assert refresh.scan_start != refresh.fetched_at
+    for field in (
+        "last_attempt_at",
+        "last_success_at",
+        "stale_after",
+        "observed_at",
+        "fetched_at",
+        "checked_at",
+        "scan_start",
+        "scan_end",
+    ):
+        value = getattr(refresh, field)
+        assert value is None or value.tzinfo is None
+
+
+def test_research_refresh_schedule_compares_against_utc_naive_storage(session):
+    acquired_at = datetime(2026, 7, 25, 9, 30, tzinfo=SHANGHAI_TZ)
+    sync_company_research(
+        session,
+        "300502",
+        provider=FakeResearchProvider(),
+        include_documents=False,
+        evaluated_at=acquired_at,
+    )
+    session.add(
+        CompanyValuationSnapshot(
+            symbol="300502",
+            trade_date=acquired_at.date(),
+            source="test",
+            fetched_at=datetime(2026, 7, 25, 1, 30),
+        )
+    )
+    session.commit()
+    checked_at = acquired_at + timedelta(minutes=1)
+    result = refresh_company_research_if_needed(
+        session,
+        "300502",
+        data_service=FailIfCalledProvider(),
+        evaluated_at=checked_at.astimezone(timezone.utc),
+    )
+    assert result["status"] == "fresh"
+    assert result["refreshed_sections"] == []
+    assert datetime.fromisoformat(result["checked_at"]) == checked_at
+    assert all(
+        datetime.fromisoformat(item["updated_at"]).tzinfo is not None
+        for item in result["sections"].values()
+    )
+
+
+def test_refresh_propagates_same_business_instant_to_sync(session):
+    evaluated_at = datetime(2026, 7, 25, 1, 30, tzinfo=timezone.utc)
+    provider = FakeResearchProvider()
+    result = refresh_company_research_if_needed(
+        session,
+        "300502",
+        force=True,
+        data_service=provider,
+        evaluated_at=evaluated_at,
+    )
+    assert provider.announcement_window[1] == date(2026, 7, 25)
+    assert datetime.fromisoformat(result["updated_at"]) == evaluated_at.astimezone(
+        SHANGHAI_TZ
+    )
 
 
 def test_three_industries_build_complete_company_research(session):

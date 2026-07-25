@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta, timezone
+import inspect as python_inspect
 from decimal import Decimal
 from threading import Barrier, Lock, Thread
 
@@ -15,6 +16,7 @@ from app.data_hub.contracts import (
     Quote,
 )
 from app.data_hub.market_subjects import stock_daily_subject
+from app.data_hub.research_subjects import announcement_catalog_window
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
 from app.data_hub.trading_calendar import (
@@ -30,8 +32,10 @@ from app.domain.models import DecisionPackage, MARKET_EVIDENCE_CAPABILITIES
 from app.errors import AppError
 from app.models import (
     CompanyAnnouncement,
+    CompanyFinancialPeriod,
     CompanyProfile,
     CompanyResearchRefresh,
+    CompanyValuationSnapshot,
     DataQualityRecord,
     MarketDailyBar,
     MarketQuote,
@@ -458,14 +462,13 @@ def one_click_profile_router(session, mutation=lambda _router, _result: None):
     return OneClickMutatingProfileRouter(session, registry, mutation)
 
 
-def seed_profile(session):
+def seed_profile(session, *, evaluated_at=None):
     registry = ProviderRegistry()
     registry.register(SeedResearchProvider())
     router = DataHubRouter(session, registry)
     profile_result = router.company_profile("300502")
     persist_company_profile(session, router, profile_result)
-    start = date.today() - timedelta(days=3 * 366)
-    end = date.today()
+    start, end = announcement_catalog_window(evaluated_at=evaluated_at)
     announcement_result = router.company_announcements("300502", start, end)
     persist_announcement_catalog(
         session,
@@ -477,7 +480,35 @@ def seed_profile(session):
     session.commit()
 
 
-def seed_profile_with_research_times(session, profile_at, announcement_at):
+def seed_optional_research_cache(session, acquired_at):
+    stored_at = acquired_at.astimezone(timezone.utc).replace(tzinfo=None)
+    session.add(
+        CompanyFinancialPeriod(
+            symbol="300502",
+            report_date=acquired_at.date(),
+            period_label="test",
+            source="test",
+            fetched_at=stored_at,
+        )
+    )
+    session.add(
+        CompanyValuationSnapshot(
+            symbol="300502",
+            trade_date=acquired_at.date(),
+            source="test",
+            fetched_at=stored_at,
+        )
+    )
+    session.commit()
+
+
+def seed_profile_with_research_times(
+    session,
+    profile_at,
+    announcement_at,
+    *,
+    evaluated_at=None,
+):
     registry = ProviderRegistry()
     registry.register(SeedResearchProvider())
     profile_router = DataHubRouter(session, registry, now_fn=lambda: profile_at)
@@ -489,8 +520,9 @@ def seed_profile_with_research_times(session, profile_at, announcement_at):
         registry,
         now_fn=lambda: announcement_at,
     )
-    start = date.today() - timedelta(days=3 * 366)
-    end = date.today()
+    start, end = announcement_catalog_window(
+        evaluated_at=evaluated_at or announcement_at
+    )
     announcement_result = announcement_router.company_announcements(
         "300502",
         start,
@@ -779,7 +811,8 @@ def test_untrusted_execution_data_blocks_ready_and_plan_freeze(
     seed_profile(session)
     patch_benchmarks(monkeypatch)
 
-    def degraded_stock(db, symbol, provider, refresh):
+    def degraded_stock(db, symbol, provider, refresh, *, evaluated_at=None):
+        del evaluated_at
         return (
             {
                 "code": "market_data",
@@ -830,7 +863,8 @@ def test_direct_save_cannot_bypass_blocked_decision_package(
     seed_profile(session)
     patch_benchmarks(monkeypatch)
 
-    def missing_stock(db, symbol, provider, refresh):
+    def missing_stock(db, symbol, provider, refresh, *, evaluated_at=None):
+        del evaluated_at
         return (
             {
                 "code": "market_data",
@@ -1178,6 +1212,7 @@ def _analyze_with_research_near_boundaries(client, session, monkeypatch):
         session,
         profile_at=current - timedelta(days=30) + timedelta(minutes=1),
         announcement_at=current - timedelta(hours=24) + timedelta(minutes=1),
+        evaluated_at=current,
     )
     patch_benchmarks(monkeypatch)
     response = client.post(
@@ -1234,6 +1269,9 @@ def _patch_market_clock(monkeypatch, instant):
     monkeypatch.setattr(
         "app.data_hub.trading_calendar.shanghai_now", lambda: shanghai_instant
     )
+    monkeypatch.setattr(
+        "app.data_hub.research_subjects.shanghai_now", lambda: shanghai_instant
+    )
     monkeypatch.setattr("app.data_hub.router.shanghai_now", lambda: shanghai_instant)
     monkeypatch.setattr(
         "app.data_hub.effective_quality.shanghai_now", lambda: shanghai_instant
@@ -1242,10 +1280,6 @@ def _patch_market_clock(monkeypatch, instant):
         "app.providers.akshare_provider.shanghai_now", lambda: shanghai_instant
     )
     monkeypatch.setattr("app.services.plan_freeze.shanghai_now", lambda: instant)
-    monkeypatch.setattr(
-        "app.services.one_click_pipeline.shanghai_today",
-        lambda: shanghai_instant.date(),
-    )
     monkeypatch.setattr(
         "app.services.one_click_pipeline.shanghai_now", lambda: shanghai_instant
     )
@@ -1354,6 +1388,171 @@ def test_confirm_package_age_is_host_timezone_independent(
     session.commit()
     response = _confirm_bound_plan(client, analyzed)
     assert response.status_code == 201, response.text
+
+
+def test_one_click_propagates_one_analysis_started_at(
+    client, session, monkeypatch
+):
+    from app.services import one_click_pipeline
+
+    instant = datetime(2026, 7, 25, 1, 30, tzinfo=timezone.utc)
+    expected = instant.astimezone(SHANGHAI_TZ)
+    _patch_market_clock(monkeypatch, instant)
+    captured = {}
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    patch_benchmarks(monkeypatch)
+    real_refresh = one_click_pipeline.refresh_company_research_if_needed
+    real_inventory = one_click_pipeline._research_inventory
+    real_preview = one_click_pipeline.generate_trade_plan_preview
+
+    def capture_refresh(*args, evaluated_at=None, **kwargs):
+        captured["refresh"] = evaluated_at
+        return real_refresh(*args, evaluated_at=evaluated_at, **kwargs)
+
+    def capture_inventory(*args, evaluated_at=None, **kwargs):
+        captured["inventory"] = evaluated_at
+        return real_inventory(*args, evaluated_at=evaluated_at, **kwargs)
+
+    def capture_preview(*args, evaluated_at=None, **kwargs):
+        captured["preview"] = evaluated_at
+        return real_preview(*args, evaluated_at=evaluated_at, **kwargs)
+
+    monkeypatch.setattr(
+        one_click_pipeline, "refresh_company_research_if_needed", capture_refresh
+    )
+    monkeypatch.setattr(one_click_pipeline, "_research_inventory", capture_inventory)
+    monkeypatch.setattr(
+        one_click_pipeline, "generate_trade_plan_preview", capture_preview
+    )
+    response = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert captured == {
+        "refresh": expected,
+        "inventory": expected,
+        "preview": expected,
+    }
+
+
+def test_los_angeles_host_one_click_uses_shanghai_announcement_scope_and_confirms(
+    client, session, monkeypatch
+):
+    instant = datetime(2026, 7, 25, 1, 30, tzinfo=timezone.utc)
+    _patch_market_clock(monkeypatch, instant)
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    from app.services import one_click_pipeline
+
+    real_refresh = one_click_pipeline.refresh_company_research_if_needed
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    seed_optional_research_cache(session, instant)
+    patch_benchmarks(monkeypatch)
+    monkeypatch.setattr(
+        one_click_pipeline, "refresh_company_research_if_needed", real_refresh
+    )
+    response = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    )
+    assert response.status_code == 200, response.text
+    analyzed = response.json()
+    evidence = _research_evidence(analyzed)["announcements"]
+    binding = evidence["source_quality_binding"]
+    assert binding["semantic_key"].endswith("/2026-07-25")
+    assert datetime.fromisoformat(binding["scan_end"]).date() == date(2026, 7, 25)
+    assert all(
+        datetime.fromisoformat(value).tzinfo is not None
+        for value in (
+            evidence["observed_at"],
+            evidence["fetched_at"],
+        )
+    )
+    assert datetime.fromisoformat(evidence["observed_at"]).astimezone(
+        timezone.utc
+    ).replace(tzinfo=None) == datetime.fromisoformat(binding["observed_at"])
+    confirm = _confirm_bound_plan(client, analyzed)
+    assert confirm.status_code == 201, confirm.text
+
+
+def test_evidence_and_package_hashes_do_not_depend_on_host_timezone(
+    client, session, monkeypatch
+):
+    instant = datetime(2026, 7, 25, 1, 30, tzinfo=timezone.utc)
+    _patch_market_clock(monkeypatch, instant)
+    from app.services import one_click_pipeline
+
+    real_refresh = one_click_pipeline.refresh_company_research_if_needed
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    seed_optional_research_cache(session, instant)
+    patch_benchmarks(monkeypatch)
+    monkeypatch.setattr(
+        one_click_pipeline, "refresh_company_research_if_needed", real_refresh
+    )
+    payload = {
+        "symbol": "300502",
+        "position_mode": "空仓",
+        "account_id": account["id"],
+        "enable_ai": False,
+    }
+    first_response = client.post(
+        "/api/v1/trade-plan-generator/analyze", json=payload
+    )
+    assert first_response.status_code == 200, first_response.text
+    analyzed = first_response.json()
+    from app.domain.package_builder import build_decision_package
+
+    build_kwargs = {
+        "preview": analyzed["plan"],
+        "decision": analyzed["decision"],
+        "steps": [
+            step for step in analyzed["steps"] if step["code"] != "plan_output"
+        ],
+        "ai_result": analyzed["ai"],
+        "orchestrator_id": analyzed["decision_package"]["research_decision"][
+            "orchestrator"
+        ],
+    }
+    first_package = build_decision_package(**build_kwargs)
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    second_package = build_decision_package(**build_kwargs)
+    assert first_package.evidence_digest == second_package.evidence_digest
+    assert first_package.package_hash == second_package.package_hash
+
+
+def test_formal_announcement_chain_has_no_host_local_clock_calls():
+    from app.data_hub.research_subjects import announcement_catalog_window
+    from app.services.company_research import (
+        refresh_company_research_if_needed,
+        sync_company_research,
+    )
+    from app.services.one_click_pipeline import _research_inventory
+
+    for function in (
+        announcement_catalog_window,
+        sync_company_research,
+        refresh_company_research_if_needed,
+        _research_inventory,
+    ):
+        source = python_inspect.getsource(function)
+        assert "datetime.now(" not in source
+        assert "date.today(" not in source
 
 
 def test_missing_research_attempt_still_allows_fresh_bound_cache_near_boundary(

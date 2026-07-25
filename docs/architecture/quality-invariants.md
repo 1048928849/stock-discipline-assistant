@@ -146,6 +146,19 @@ Shanghai wall time, but it is only a secondary compatibility check for legacy
 packages with naive generation timestamps. Host timezone must not influence
 preview hashes, package hashes, expiry, or confirmation.
 
+One-click analysis captures one aware Shanghai `analysis_started_at`. The announcement
+catalog window, refresh scheduling, selector lookup, Evidence timestamps, preview timestamp,
+and package timestamp all receive that same instant. The canonical announcement window ends on
+the Shanghai business date and starts exactly `lookback_days` earlier; Subject construction,
+Router calls, persistence, selection, and source binding reuse the same dates even if execution
+crosses Shanghai midnight.
+
+Research persistence remains UTC naive. Public Research results and formal Evidence are
+converted to aware timestamps before serialization. Announcement `scan_start` and `scan_end`
+represent the exact requested date coverage and must never be replaced by request completion
+time. Host-local date and time functions cannot define an announcement scope or authoritative
+Research timestamp.
+
 If freshness expires after analysis, freeze must reject the package and require a new analysis.
 
 ## 5. New conflicts and old cache

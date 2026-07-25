@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, ROUND_FLOOR
 from types import SimpleNamespace
 
@@ -16,6 +16,7 @@ from app.data_hub.trading_calendar import (
     shanghai_now,
     shanghai_today,
     to_market_storage_naive,
+    to_shanghai_aware,
 )
 from app.models import (
     Account,
@@ -73,7 +74,11 @@ GENERATOR_RULES = {
 }
 
 
-def ensure_generator_rule_version(db: Session) -> RuleVersion:
+def ensure_generator_rule_version(
+    db: Session,
+    *,
+    effective_on: date | None = None,
+) -> RuleVersion:
     current = ensure_default_rule_version(db)
     if all(key in current.parameters for key in GENERATOR_PARAMETERS):
         return current
@@ -85,7 +90,7 @@ def ensure_generator_rule_version(db: Session) -> RuleVersion:
         parameters=parameters,
         rules={**current.rules, **GENERATOR_RULES},
         change_note="集中一键计划的账户、风险、分批仓位和市场降风险参数；旧计划保持原规则版本。",
-        effective_from=shanghai_today(),
+        effective_from=effective_on or shanghai_today(),
         active=True,
     )
     db.add(version)
@@ -262,11 +267,18 @@ def _preview_digest(preview: dict) -> str:
     ).hexdigest()
 
 
-def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -> dict:
+def generate_trade_plan_preview(
+    db: Session,
+    request: TradePlanPreviewRequest,
+    *,
+    evaluated_at: datetime | None = None,
+) -> dict:
     account = db.get(Account, request.account_id)
     if account is None:
         raise AppError(404, "ACCOUNT_NOT_FOUND", "账户不存在")
-    rule = ensure_generator_rule_version(db)
+    now = to_shanghai_aware(evaluated_at or shanghai_now())
+    current_date = now.date()
+    rule = ensure_generator_rule_version(db, effective_on=current_date)
     parameters = {**GENERATOR_PARAMETERS, **rule.parameters}
     profile = db.scalar(select(CompanyProfile).where(CompanyProfile.symbol == request.symbol))
     stored_holding = db.scalar(
@@ -323,8 +335,6 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
     except ValueError as exc:
         frame, pattern = None, None
         missing.append(str(exc))
-    now = shanghai_now()
-    current_date = shanghai_today()
     data_time = latest_bar.fetched_at.isoformat() if latest_bar else "数据不足"
     data_date = latest_bar.trade_date.isoformat() if latest_bar else None
     stale = not daily_selection.executable
