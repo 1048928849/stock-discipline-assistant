@@ -244,6 +244,63 @@ def test_refresh_propagates_same_business_instant_to_sync(session):
     )
 
 
+def test_legacy_announcements_normalize_unicode_url_and_preserve_raw_data(session):
+    class UnicodeUrlProvider(FakeResearchProvider):
+        def company_announcements(self, symbol, start, end):
+            self.announcement_window = (start, end)
+            return [
+                {
+                    "公告标题": "Unicode URL",
+                    "公告日期": end.isoformat(),
+                    "公告链接": "https://例子.测试/公告?q=你好",
+                    "目录来源": "legacy-test",
+                }
+            ]
+
+    result = sync_company_research(
+        session,
+        "300502",
+        provider=UnicodeUrlProvider(),
+        include_documents=False,
+        evaluated_at=datetime(2026, 7, 25, 9, 30, tzinfo=SHANGHAI_TZ),
+    )
+    stored = session.query(CompanyAnnouncement).one()
+    assert result["sections"]["announcements"]["status"] == "success"
+    assert stored.url.isascii()
+    assert stored.url.startswith("https://xn--fsqu00a.xn--0zwm56d/")
+    assert stored.raw_data["公告链接"] == "https://例子.测试/公告?q=你好"
+
+
+def test_legacy_invalid_url_does_not_leave_partial_announcements(session):
+    class InvalidSecondUrlProvider(FakeResearchProvider):
+        def company_announcements(self, symbol, start, end):
+            self.announcement_window = (start, end)
+            return [
+                {
+                    "公告标题": "valid",
+                    "公告日期": end.isoformat(),
+                    "公告链接": "https://example.test/valid",
+                    "目录来源": "legacy-test",
+                },
+                {
+                    "公告标题": "invalid",
+                    "公告日期": end.isoformat(),
+                    "公告链接": "ftp://example.test/invalid",
+                    "目录来源": "legacy-test",
+                },
+            ]
+
+    result = sync_company_research(
+        session,
+        "300502",
+        provider=InvalidSecondUrlProvider(),
+        include_documents=False,
+        evaluated_at=datetime(2026, 7, 25, 9, 30, tzinfo=SHANGHAI_TZ),
+    )
+    assert result["sections"]["announcements"]["status"] == "unavailable"
+    assert session.query(CompanyAnnouncement).count() == 0
+
+
 def test_three_industries_build_complete_company_research(session):
     provider = FakeResearchProvider()
     for symbol, (name, industry, _) in COMPANIES.items():

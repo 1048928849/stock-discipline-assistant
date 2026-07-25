@@ -2,6 +2,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import event
+from sqlalchemy.dialects import sqlite
 from sqlalchemy.exc import IntegrityError
 
 from app.data_hub.contracts import DataProvider, ProviderMetadata, ProviderUnavailableError
@@ -33,6 +34,7 @@ from app.services.research_cache import (
 )
 from app.services.company_research import sync_company_research
 from app.services.one_click_pipeline import _research_inventory
+from app.services.url_normalization import normalize_announcement_url
 
 
 class ResearchProvider(DataProvider):
@@ -151,6 +153,90 @@ def _persist_catalog(session, rows, start, end, provider_id="catalog-test"):
         session, router, result, start=start, end=end
     )
     return router, result, refresh
+
+
+def test_announcement_url_normalization_preserves_valid_ascii_url():
+    url = "https://example.test/path/to/report?q=1&lang=en#section"
+    assert normalize_announcement_url(f"  {url}  ") == url
+
+
+def test_sqlite_announcement_url_remains_varchar_1000():
+    compiled = CompanyAnnouncement.__table__.c.url.type.compile(
+        dialect=sqlite.dialect()
+    )
+    assert compiled == "VARCHAR(1000)"
+
+
+def test_announcement_url_normalization_encodes_idna_and_unicode_components():
+    normalized = normalize_announcement_url(
+        "https://例子.测试/公告 路径?q=你好#片段"
+    )
+    assert normalized.startswith("https://xn--fsqu00a.xn--0zwm56d/")
+    assert "%E5%85%AC%E5%91%8A%20%E8%B7%AF%E5%BE%84" in normalized
+    assert "q=%E4%BD%A0%E5%A5%BD" in normalized
+    assert normalized.isascii()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "",
+        "ftp://example.test/report",
+        "https:///missing-host",
+        "https://example.test:invalid/report",
+        "https://example.test:0/report",
+        "https://example.test/report\nheader",
+    ],
+)
+def test_invalid_announcement_urls_are_rejected(url):
+    with pytest.raises(ProviderUnavailableError, match="invalid announcement URL"):
+        normalize_announcement_url(url)
+
+
+def test_announcement_url_length_boundary():
+    prefix = "https://example.test/"
+    accepted = prefix + "a" * (1000 - len(prefix))
+    assert len(normalize_announcement_url(accepted)) == 1000
+    with pytest.raises(ProviderUnavailableError, match="exceeds 1000"):
+        normalize_announcement_url(accepted + "a")
+
+
+def test_unicode_announcement_url_preserves_raw_payload_and_digest(session):
+    start, end = date.today() - timedelta(days=30), date.today()
+    raw_url = "https://例子.测试/公告?q=你好"
+    row = _announcement_row(1, end, url=raw_url)
+    router = _catalog_router(session, [row])
+    result = router.company_announcements("300502", start, end)
+    original_digest = result.normalized_digest
+    refresh = persist_announcement_catalog(
+        session, router, result, start=start, end=end
+    )
+    stored = session.query(CompanyAnnouncement).one()
+    record = session.get(DataQualityRecord, result.quality_record_id)
+    assert refresh.row_count == 1
+    assert stored.url == normalize_announcement_url(raw_url)
+    assert stored.raw_data["公告链接"] == raw_url
+    assert result.value[0]["公告链接"] == raw_url
+    assert result.normalized_digest == original_digest == record.normalized_digest
+
+
+def test_normalized_duplicate_urls_are_rejected_before_delete(session):
+    start, end = date.today() - timedelta(days=30), date.today()
+    _seed_complete_catalog(session, start, end, count=2)
+    old_rows = [item.url for item in session.query(CompanyAnnouncement).order_by(CompanyAnnouncement.id)]
+    rows = [
+        _announcement_row(10, end, url="https://例子.测试/公告"),
+        _announcement_row(11, end, url="https://xn--fsqu00a.xn--0zwm56d/%E5%85%AC%E5%91%8A"),
+    ]
+    router = _catalog_router(session, rows, "normalized-duplicate")
+    result = router.company_announcements("300502", start, end)
+    with pytest.raises(ProviderUnavailableError, match="duplicate URLs"):
+        persist_announcement_catalog(session, router, result, start=start, end=end)
+    session.commit()
+    assert [
+        item.url for item in session.query(CompanyAnnouncement).order_by(CompanyAnnouncement.id)
+    ] == old_rows
+    assert session.get(DataQualityRecord, result.quality_record_id).persisted is False
 
 
 def test_company_profile_subject_is_stable():
