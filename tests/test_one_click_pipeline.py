@@ -1020,50 +1020,45 @@ def test_market_evidence_contains_exact_quality_binding(
         assert record.subject_id == binding["subject_id"]
 
 
-@pytest.mark.parametrize(
-    "test_capability",
-    list(MARKET_EVIDENCE_CAPABILITIES),
-)
-def test_confirm_revalidates_each_market_binding(
-    test_capability, client, session, monkeypatch
-):
-    analyzed = _analyze_bound_plan(client, session, monkeypatch)
-    assert _confirm_bound_plan(client, analyzed).status_code == 201
-
-
 def test_confirm_revalidates_stock_daily_binding(client, session, monkeypatch):
     analyzed = _analyze_bound_plan(client, session, monkeypatch)
-    assert _confirm_bound_plan(client, analyzed).status_code == 201
+    _rewrite_package_binding(
+        session, analyzed, "stock_daily_bars", subject_id="300503"
+    )
+    assert _confirm_bound_plan(client, analyzed).status_code == 422
 
 
 def test_confirm_revalidates_realtime_quote_binding(client, session, monkeypatch):
     analyzed = _analyze_bound_plan(client, session, monkeypatch)
-    assert _confirm_bound_plan(client, analyzed).status_code == 201
+    package = DecisionPackage.model_validate(analyzed["decision_package"])
+    binding = next(
+        item.market_quality_binding
+        for item in package.evidence
+        if item.capability == "market_quote"
+    )
+    _rewrite_package_binding(
+        session,
+        analyzed,
+        "market_quote",
+        observed_at=binding.observed_at + timedelta(seconds=1),
+    )
+    assert _confirm_bound_plan(client, analyzed).status_code == 422
 
 
 def test_confirm_revalidates_index_binding(client, session, monkeypatch):
     analyzed = _analyze_bound_plan(client, session, monkeypatch)
-    assert _confirm_bound_plan(client, analyzed).status_code == 201
+    _rewrite_package_binding(
+        session, analyzed, "benchmark_daily_bars", subject_id="CSI000905"
+    )
+    assert _confirm_bound_plan(client, analyzed).status_code == 422
 
 
 def test_confirm_revalidates_sector_binding(client, session, monkeypatch):
     analyzed = _analyze_bound_plan(client, session, monkeypatch)
-    assert _confirm_bound_plan(client, analyzed).status_code == 201
-
-
-@pytest.mark.parametrize(
-    "capability",
-    list(MARKET_EVIDENCE_CAPABILITIES),
-)
-def test_market_conflict_after_analysis_blocks_confirm(
-    capability, client, session, monkeypatch
-):
-    analyzed = _analyze_bound_plan(client, session, monkeypatch)
-    _add_market_conflict(session, capability)
-    response = _confirm_bound_plan(client, analyzed)
-    assert response.status_code == 422
-    assert response.json()["error"]["code"] == "MARKET_BINDING_NOT_EXECUTABLE"
-    assert session.query(TradePlan).count() == 0
+    _rewrite_package_binding(
+        session, analyzed, "sector_daily_bars", subject_id="f" * 64
+    )
+    assert _confirm_bound_plan(client, analyzed).status_code == 422
 
 
 def test_stock_daily_conflict_after_analysis_blocks_confirm(
@@ -1071,58 +1066,64 @@ def test_stock_daily_conflict_after_analysis_blocks_confirm(
 ):
     analyzed = _analyze_bound_plan(client, session, monkeypatch)
     _add_market_conflict(session, "stock_daily_bars")
-    assert _confirm_bound_plan(client, analyzed).status_code == 422
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MARKET_BINDING_NOT_EXECUTABLE"
+    assert session.query(TradePlan).count() == 0
 
 
 def test_quote_conflict_after_analysis_blocks_confirm(client, session, monkeypatch):
     analyzed = _analyze_bound_plan(client, session, monkeypatch)
     _add_market_conflict(session, "market_quote")
-    assert _confirm_bound_plan(client, analyzed).status_code == 422
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MARKET_BINDING_NOT_EXECUTABLE"
+    assert session.query(TradePlan).count() == 0
 
 
 def test_index_conflict_after_analysis_blocks_confirm(client, session, monkeypatch):
     analyzed = _analyze_bound_plan(client, session, monkeypatch)
     _add_market_conflict(session, "benchmark_daily_bars")
-    assert _confirm_bound_plan(client, analyzed).status_code == 422
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MARKET_BINDING_NOT_EXECUTABLE"
+    assert session.query(TradePlan).count() == 0
 
 
 def test_sector_conflict_after_analysis_blocks_confirm(client, session, monkeypatch):
     analyzed = _analyze_bound_plan(client, session, monkeypatch)
     _add_market_conflict(session, "sector_daily_bars")
-    assert _confirm_bound_plan(client, analyzed).status_code == 422
-
-
-@pytest.mark.parametrize(
-    "capability",
-    ["stock_daily_bars", "benchmark_daily_bars", "sector_daily_bars"],
-)
-def test_new_persisted_market_lineage_requires_reanalysis(
-    capability, client, session, monkeypatch
-):
-    analyzed = _analyze_bound_plan(client, session, monkeypatch)
-    _replace_bound_series(session, capability)
     response = _confirm_bound_plan(client, analyzed)
     assert response.status_code == 422
-    assert response.json()["error"]["code"] == "MARKET_BINDING_CHANGED"
+    assert response.json()["error"]["code"] == "MARKET_BINDING_NOT_EXECUTABLE"
     assert session.query(TradePlan).count() == 0
 
 
 def test_new_persisted_stock_lineage_requires_reanalysis(client, session, monkeypatch):
     analyzed = _analyze_bound_plan(client, session, monkeypatch)
     _replace_bound_series(session, "stock_daily_bars")
-    assert _confirm_bound_plan(client, analyzed).status_code == 422
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MARKET_BINDING_CHANGED"
+    assert session.query(TradePlan).count() == 0
 
 
 def test_new_persisted_index_lineage_requires_reanalysis(client, session, monkeypatch):
     analyzed = _analyze_bound_plan(client, session, monkeypatch)
     _replace_bound_series(session, "benchmark_daily_bars")
-    assert _confirm_bound_plan(client, analyzed).status_code == 422
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MARKET_BINDING_CHANGED"
+    assert session.query(TradePlan).count() == 0
 
 
 def test_new_persisted_sector_lineage_requires_reanalysis(client, session, monkeypatch):
     analyzed = _analyze_bound_plan(client, session, monkeypatch)
     _replace_bound_series(session, "sector_daily_bars")
-    assert _confirm_bound_plan(client, analyzed).status_code == 422
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MARKET_BINDING_CHANGED"
+    assert session.query(TradePlan).count() == 0
 
 
 def test_quote_naturally_ages_to_stale_before_confirm(client, session, monkeypatch):
