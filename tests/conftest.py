@@ -1,5 +1,6 @@
 import os
 
+os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
 os.environ["DATABASE_URL"] = "sqlite://"
 os.environ["SCHEDULER_ENABLED"] = "false"
 os.environ["LLM_PROVIDER"] = "openai_compatible"
