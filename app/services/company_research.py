@@ -23,6 +23,10 @@ from app.models import (
 from app.config import get_settings
 from app.data_hub.router import DataHubRouter
 from app.services.data_sources import ProviderResult, UnifiedDataService
+from app.services.research_cache import (
+    persist_announcement_catalog,
+    persist_company_profile,
+)
 
 
 PROFILE_URL = "http://www.cninfo.com.cn/new/commonUrl?url=data/stock/stockDetail"
@@ -389,10 +393,18 @@ def sync_company_research(
     fetched_at = datetime.now()
     sections = {}
     profile = None
+    exact_calls: dict[str, ProviderResult] = {}
 
     try:
-        raw_profile = _provider_value(provider.company_profile(symbol))
-        profile_source = _provider_source(provider, "fundamental.profile", "巨潮资讯公司概况")
+        profile_call = provider.company_profile(symbol)
+        raw_profile = _provider_value(profile_call)
+        if isinstance(provider, DataHubRouter):
+            exact_calls["profile"] = profile_call
+            profile_source = profile_call.provider_id
+        else:
+            profile_source = _provider_source(
+                provider, "fundamental.profile", "巨潮资讯公司概况"
+            )
         profile = db.scalar(select(CompanyProfile).where(CompanyProfile.symbol == symbol))
         values = {
             "name": str(raw_profile.get("A股简称") or raw_profile.get("公司名称") or symbol),
@@ -412,6 +424,8 @@ def sync_company_research(
         else:
             for key, value in values.items():
                 setattr(profile, key, value)
+        if isinstance(provider, DataHubRouter):
+            profile = persist_company_profile(db, provider, profile_call)
         if profile.main_business:
             _upsert_evidence(
                 db,
@@ -461,15 +475,28 @@ def sync_company_research(
         sections["financials"] = {"status": "unavailable", "message": str(exc)}
 
     try:
-        announcement_rows = _provider_value(
-            provider.company_announcements(
-                symbol, date.today() - timedelta(days=3 * 366), date.today()
-            )
+        announcement_start = date.today() - timedelta(days=3 * 366)
+        announcement_end = date.today()
+        announcement_call = provider.company_announcements(
+            symbol, announcement_start, announcement_end
         )
+        announcement_rows = _provider_value(announcement_call)
         inserted = 0
         document_resolution_attempts = 0
         resolved_documents = 0
-        for row in announcement_rows:
+        if isinstance(provider, DataHubRouter):
+            exact_calls["announcements"] = announcement_call
+            persist_announcement_catalog(
+                db,
+                provider,
+                announcement_call,
+                start=announcement_start,
+                end=announcement_end,
+            )
+            announcement_rows_to_persist = []
+        else:
+            announcement_rows_to_persist = announcement_rows
+        for row in announcement_rows_to_persist:
             title, published, url, catalog = _announcement_fields(row)
             if not url:
                 continue
@@ -720,7 +747,10 @@ def sync_company_research(
             result["status"] = "cache_fallback"
             result["cache_used"] = True
             row_count = cached_counts[section]
-            if isinstance(provider, DataHubRouter):
+            if isinstance(provider, DataHubRouter) and section not in {
+                "profile",
+                "announcements",
+            }:
                 provider.record_cache_fallback(
                     capability_by_section[section],
                     section,
@@ -728,16 +758,27 @@ def sync_company_research(
                     row_count,
                     str(result.get("message", "外部Provider失败")),
                 )
-        call = (
-            provider.calls.get(capability_by_section[section])
-            if isinstance(provider, DataHubRouter)
-            else None
-        )
-        if external_success and call and call.quality_status.value in {
-            "VERIFIED",
-            "SINGLE_SOURCE",
-        }:
+        call = None
+        if isinstance(provider, DataHubRouter):
+            call = exact_calls.get(section) or provider.calls.get(
+                capability_by_section[section]
+            )
+        if (
+            external_success
+            and call
+            and section not in exact_calls
+            and call.quality_status.value in {"VERIFIED", "SINGLE_SOURCE"}
+        ):
             provider.mark_persisted(call, cached_at=fetched_at)
+        if isinstance(provider, DataHubRouter) and section == "announcements":
+            if call:
+                result["quality_status"] = call.quality_status.value
+                result["provider_observations"] = call.provider_observations
+                result["conflict_fields"] = call.conflict_fields
+                result["normalized_digest"] = call.normalized_digest
+                if call.checked_at:
+                    result["checked_at"] = call.checked_at.isoformat()
+            continue
         quality_status = (
             call.quality_status.value
             if call

@@ -18,6 +18,10 @@ from app.data_hub.market_subjects import (
     stock_daily_subject,
     stock_quote_subject,
 )
+from app.data_hub.research_subjects import (
+    announcement_catalog_subject,
+    company_profile_subject,
+)
 from app.data_hub.quality import (
     DataQualityStatus,
     QualityObservation,
@@ -48,6 +52,9 @@ MARKET_SUBJECT_CAPABILITIES = frozenset(
         "market.index_daily",
         "market.sector_daily",
     }
+)
+RESEARCH_SUBJECT_CAPABILITIES = frozenset(
+    {"fundamental.profile", "announcement.catalog"}
 )
 CallResultKey = tuple[str, str, str, str, str, str]
 
@@ -151,6 +158,10 @@ class ProviderResult:
     operation: str = ""
     request_fingerprint: str = ""
     request_summary: dict[str, Any] = field(default_factory=dict)
+    scan_start: datetime | None = None
+    scan_end: datetime | None = None
+    checked_at: datetime | None = None
+    latest_content_at: datetime | None = None
 
     def require_value(
         self,
@@ -200,6 +211,12 @@ class ProviderResult:
             "semantic_key": self.subject.semantic_key if self.subject else None,
             "operation": self.operation,
             "request_fingerprint": self.request_fingerprint,
+            "scan_start": self.scan_start.isoformat() if self.scan_start else None,
+            "scan_end": self.scan_end.isoformat() if self.scan_end else None,
+            "checked_at": self.checked_at.isoformat() if self.checked_at else None,
+            "latest_content_at": (
+                self.latest_content_at.isoformat() if self.latest_content_at else None
+            ),
         }
 
 
@@ -518,8 +535,12 @@ class DataHubRouter:
 
     def _record_quality(self, result: ProviderResult, symbol: str | None) -> ProviderResult:
         now = datetime.now()
-        latest_content_at = None
-        if result.capability == "announcement.catalog" and isinstance(result.value, list):
+        latest_content_at = result.latest_content_at
+        if (
+            result.capability == "announcement.catalog"
+            and isinstance(result.value, list)
+            and latest_content_at is None
+        ):
             candidates = []
             for row in result.value:
                 if not isinstance(row, dict):
@@ -560,9 +581,9 @@ class DataHubRouter:
             cache_used=result.cache_used,
             trusted=result.quality_status in TRUSTED_QUALITY_STATUSES,
             persisted=False,
-            scan_start=result.fetched_at if result.capability == "announcement.catalog" else None,
-            scan_end=result.fetched_at if result.capability == "announcement.catalog" else None,
-            checked_at=result.fetched_at if result.capability == "announcement.catalog" else None,
+            scan_start=result.scan_start,
+            scan_end=result.scan_end,
+            checked_at=result.checked_at,
             latest_content_at=latest_content_at,
         )
         self.db.add(record)
@@ -572,6 +593,13 @@ class DataHubRouter:
         return result
 
     def mark_persisted(self, result: ProviderResult, cached_at: datetime | None = None) -> None:
+        record = self.validate_persistence_result(result)
+        record.persisted = True
+        record.cached_at = cached_at or datetime.now()
+        self.db.flush()
+
+    def validate_persistence_result(self, result: ProviderResult) -> DataQualityRecord:
+        """Validate exact Router lineage without mutating its persistence state."""
         if result.quality_record_id is None:
             raise ProviderUnavailableError("Provider result has no quality audit lineage")
         current = self.call_results.get(
@@ -608,9 +636,7 @@ class DataHubRouter:
             )
         if record.provider_id != result.provider_id:
             raise ProviderUnavailableError("Provider result provider does not match lineage")
-        record.persisted = True
-        record.cached_at = cached_at or datetime.now()
-        self.db.flush()
+        return record
 
     def _log(
         self,
@@ -652,6 +678,8 @@ class DataHubRouter:
         *args,
         symbol: str | None = None,
         subject: SubjectRef | None = None,
+        scan_start: datetime | None = None,
+        scan_end: datetime | None = None,
         cache_loader: Callable[[], Any] | None = None,
         validator: Callable[[Any], bool] | None = None,
         **kwargs,
@@ -659,6 +687,10 @@ class DataHubRouter:
         if capability in MARKET_SUBJECT_CAPABILITIES and subject is None:
             raise ProviderUnavailableError(
                 f"{capability} requires an explicit market subject"
+            )
+        if capability in RESEARCH_SUBJECT_CAPABILITIES and subject is None:
+            raise ProviderUnavailableError(
+                f"{capability} requires an explicit research subject"
             )
         fingerprint, request_summary = _request_identity(
             capability=capability,
@@ -767,6 +799,15 @@ class DataHubRouter:
             quality = assess_quality(observations, policy)
             fresh = [item for item in observations if not item.stale]
             selected = (fresh or observations)[0]
+            scan_completed_at = (
+                max(
+                    item.fetched_at
+                    for item in observations
+                    if item.fetched_at is not None
+                )
+                if capability == "announcement.catalog"
+                else None
+            )
             adjustment, price_unit, volume_unit = self._result_dimensions(
                 selected.value,
                 subject,
@@ -779,7 +820,7 @@ class DataHubRouter:
                 operation=operation,
                 request_fingerprint=fingerprint,
                 request_summary=request_summary,
-                observed_at=selected.observed_at,
+                observed_at=scan_completed_at or selected.observed_at,
                 fetched_at=selected.fetched_at or datetime.now(),
                 fallback_used=bool(errors) or selected.provider_id != observations[0].provider_id,
                 cache_used=False,
@@ -795,6 +836,9 @@ class DataHubRouter:
                 adjustment=adjustment,
                 price_unit=price_unit,
                 volume_unit=volume_unit,
+                scan_start=scan_start,
+                scan_end=scan_end,
+                checked_at=scan_completed_at,
             )
             result = self._record_quality(result, symbol)
             return self._remember_result(result)
@@ -835,6 +879,8 @@ class DataHubRouter:
                     quality_status=DataQualityStatus.STALE,
                     provider_observations=audit,
                     normalized_digest=digest,
+                    scan_start=scan_start,
+                    scan_end=scan_end,
                 )
                 (
                     result.adjustment,
@@ -873,6 +919,8 @@ class DataHubRouter:
             errors=errors,
             quality_status=DataQualityStatus.MISSING,
             provider_observations=audit,
+            scan_start=scan_start,
+            scan_end=scan_end,
         )
         (
             result.adjustment,
@@ -990,6 +1038,7 @@ class DataHubRouter:
             "company_profile",
             symbol,
             symbol=symbol,
+            subject=company_profile_subject(symbol),
             cache_loader=cache_loader,
             validator=lambda value: isinstance(value, dict) and bool(value),
         )
@@ -1006,6 +1055,7 @@ class DataHubRouter:
         )
 
     def company_announcements(self, symbol: str, start: date, end: date, cache_loader=None):
+        subject = announcement_catalog_subject(symbol, start, end)
         return self.invoke(
             "announcement.catalog",
             "company_announcements",
@@ -1013,6 +1063,9 @@ class DataHubRouter:
             start,
             end,
             symbol=symbol,
+            subject=subject,
+            scan_start=datetime.combine(start, datetime_time.min),
+            scan_end=datetime.combine(end, datetime_time.max),
             cache_loader=cache_loader,
             validator=lambda value: isinstance(value, list),
         )
