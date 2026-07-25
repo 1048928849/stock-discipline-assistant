@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -41,6 +44,7 @@ from app.services.one_click_pipeline import (
     _sync_stock,
 )
 from app.services.market_cache import (
+    canonical_series_row,
     mapping_series_bars,
     replace_market_series,
     resolve_cached_quote,
@@ -1759,6 +1763,23 @@ def _index_refresh_fixture(session, *, close: str, provider_id: str = "index"):
     return router, result, subject, bars
 
 
+def _list_refresh_fixture(
+    session,
+    *,
+    close: str = "10",
+    provider_id: str = "list-series",
+):
+    router = _router(
+        session,
+        MarketStub(provider_id, row_count=100, daily_close=close),
+    )
+    result = router.get_history(
+        "300502", date.today() - timedelta(days=365), date.today()
+    )
+    subject = stock_daily_subject("300502", "qfq", "CNY", "share")
+    return router, result, subject, list(result.require_value())
+
+
 def test_mapping_series_subset_is_rejected_before_delete(session):
     old_router, old, subject, old_bars = _index_refresh_fixture(
         session, close="10"
@@ -1892,6 +1913,166 @@ def test_complete_mapping_refresh_replaces_existing_cache(session):
     assert len(stored) == 100
     assert {item.close for item in stored} == {Decimal("12.0000")}
     assert {item.quality_record_id for item in stored} == {new.quality_record_id}
+
+
+def test_same_length_changed_close_is_rejected_before_delete(session):
+    router, result, subject, bars = _list_refresh_fixture(session)
+    tampered = [*bars]
+    tampered[0] = replace(tampered[0], close=tampered[0].close + Decimal("0.01"))
+    with pytest.raises(ProviderUnavailableError, match="content does not match"):
+        replace_market_series(
+            session, router, result, tampered, subject=subject, min_rows=60
+        )
+
+
+def test_same_length_changed_volume_is_rejected_before_delete(session):
+    router, result, subject, bars = _list_refresh_fixture(session)
+    tampered = [*bars]
+    tampered[0] = replace(tampered[0], volume=tampered[0].volume + Decimal("1"))
+    with pytest.raises(ProviderUnavailableError, match="content does not match"):
+        replace_market_series(
+            session, router, result, tampered, subject=subject, min_rows=60
+        )
+
+
+def test_same_length_changed_trade_date_is_rejected_before_delete(session):
+    router, result, subject, bars = _list_refresh_fixture(session)
+    tampered = [*bars]
+    tampered[0] = replace(
+        tampered[0], trade_date=tampered[0].trade_date - timedelta(days=1)
+    )
+    with pytest.raises(ProviderUnavailableError, match="content does not match"):
+        replace_market_series(
+            session, router, result, tampered, subject=subject, min_rows=60
+        )
+
+
+def test_same_length_changed_source_is_rejected_before_delete(session):
+    router, result, subject, bars = _list_refresh_fixture(session)
+    tampered = [replace(item, source="tampered-source") for item in bars]
+    with pytest.raises(ProviderUnavailableError, match="content does not match"):
+        replace_market_series(
+            session, router, result, tampered, subject=subject, min_rows=60
+        )
+
+
+def test_mapping_series_same_length_tampering_is_rejected(session):
+    router, result, subject, bars = _index_refresh_fixture(session, close="10")
+    tampered = [*bars]
+    tampered[0] = replace(
+        tampered[0],
+        open=Decimal("20"),
+        high=Decimal("20"),
+        low=Decimal("20"),
+        close=Decimal("20"),
+    )
+    with pytest.raises(ProviderUnavailableError, match="content does not match"):
+        replace_market_series(
+            session, router, result, tampered, subject=subject, min_rows=60
+        )
+
+
+def test_list_series_same_length_tampering_is_rejected(session):
+    router, result, subject, bars = _list_refresh_fixture(session)
+    tampered = [*bars]
+    tampered[-1] = replace(
+        tampered[-1], volume=tampered[-1].volume + Decimal("100")
+    )
+    with pytest.raises(ProviderUnavailableError, match="content does not match"):
+        replace_market_series(
+            session, router, result, tampered, subject=subject, min_rows=60
+        )
+
+
+def test_content_mismatch_preserves_existing_complete_cache(session):
+    old_router, old, subject, old_bars = _index_refresh_fixture(
+        session, close="8", provider_id="same-source"
+    )
+    replace_market_series(
+        session, old_router, old, old_bars, subject=subject, min_rows=60
+    )
+    session.commit()
+    new_router, new, _, new_bars = _index_refresh_fixture(
+        session, close="10", provider_id="same-source"
+    )
+    tampered = [
+        replace(
+            item,
+            open=Decimal("20"),
+            high=Decimal("20"),
+            low=Decimal("20"),
+            close=Decimal("20"),
+        )
+        for item in new_bars
+    ]
+
+    with pytest.raises(ProviderUnavailableError, match="content does not match"):
+        replace_market_series(
+            session, new_router, new, tampered, subject=subject, min_rows=60
+        )
+
+    stored = session.scalars(
+        select(MarketDailyBar).where(MarketDailyBar.symbol == subject.subject_id)
+    ).all()
+    assert len(stored) == 100
+    assert {item.quality_record_id for item in stored} == {old.quality_record_id}
+    assert {item.close for item in stored} == {Decimal("8.0000")}
+
+
+def test_content_mismatch_keeps_quality_record_unpersisted(session):
+    router, result, subject, bars = _list_refresh_fixture(session)
+    tampered = [replace(item, fetched_at=item.fetched_at + timedelta(seconds=1)) for item in bars]
+    with pytest.raises(ProviderUnavailableError, match="content does not match"):
+        replace_market_series(
+            session, router, result, tampered, subject=subject, min_rows=60
+        )
+    assert _quality_record(session, result).persisted is False
+
+
+def test_exact_provider_series_is_accepted(session):
+    router, result, subject, bars = _list_refresh_fixture(session)
+    stored = replace_market_series(
+        session, router, result, bars, subject=subject, min_rows=60
+    )
+    assert len(stored) == len(result.require_value()) == 100
+    assert _quality_record(session, result).persisted is True
+
+
+def test_canonical_series_row_normalizes_decimal_and_timezone(session):
+    _, _, _, bars = _list_refresh_fixture(session)
+    original = bars[0]
+    equivalent = replace(
+        original,
+        open=original.open.quantize(Decimal("0.0000")),
+        high=original.high.quantize(Decimal("0.0000")),
+        observed_at=original.observed_at.replace(tzinfo=timezone.utc),
+        fetched_at=original.fetched_at.replace(tzinfo=timezone.utc),
+    )
+    assert canonical_series_row(equivalent) == canonical_series_row(original)
+
+
+def test_test_environment_disables_numba_jit_by_default():
+    assert os.environ["NUMBA_DISABLE_JIT"] == "1"
+
+
+def test_explicit_numba_environment_is_not_overwritten():
+    environment = {**os.environ, "NUMBA_DISABLE_JIT": "0"}
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os, runpy; "
+            "runpy.run_path('tests/conftest.py'); "
+            "print(os.environ['NUMBA_DISABLE_JIT'])",
+        ],
+        cwd=os.getcwd(),
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert completed.stdout.strip().splitlines()[-1] == "0"
 
 
 def _seed_index_cache(session, *, close="10"):
