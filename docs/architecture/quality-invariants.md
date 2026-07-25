@@ -159,6 +159,13 @@ represent the exact requested date coverage and must never be replaced by reques
 time. Host-local date and time functions cannot define an announcement scope or authoritative
 Research timestamp.
 
+Announcement URLs are normalized only after Router quality and digest auditing. Persistence
+stores a full, collision-free ASCII URL while retaining the original Provider value in
+`raw_data`; MySQL uses `VARCHAR(1000) CHARACTER SET ascii COLLATE ascii_bin` so the complete
+`(symbol, url)` uniqueness constraint remains within InnoDB's index limit without prefixing.
+MySQL authority timestamps use `DATETIME(6)` to preserve exact lineage precision; market values
+remain Shanghai wall-time naive and Research values remain UTC naive, with no global time shift.
+
 If freshness expires after analysis, freeze must reject the package and require a new analysis.
 
 ## 5. New conflicts and old cache

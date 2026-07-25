@@ -17,7 +17,8 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # 所有表均由同一份 SQLAlchemy 元数据定义，确保 SQLite/MySQL 使用完全相同的结构。
+    # Logical schema comes from one metadata model; dialect-specific physical types may differ
+    # when they preserve the same business semantics (for example, MySQL index byte limits).
     original_tables = [
         table for name, table in Base.metadata.tables.items() if name != "technical_snapshots"
     ]

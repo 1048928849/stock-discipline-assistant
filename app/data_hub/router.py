@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Any, Callable
 
 from sqlalchemy import select
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
 from app.data_hub.contracts import (
@@ -579,6 +580,29 @@ class DataHubRouter:
         if subject is None:
             return
         semantic_key = canonical_semantic_key(subject.semantic_key)
+        stored_updated_at = self._as_datetime(
+            updated_at,
+            market_time=result.capability.startswith("market."),
+        )
+        if self.db.get_bind().dialect.name == "mysql":
+            statement = mysql_insert(DataQualitySubjectHead).values(
+                capability=result.capability,
+                subject_type=subject.subject_type,
+                subject_id=subject.subject_id,
+                semantic_key=semantic_key,
+                current_record_id=record.id,
+                generation=1,
+                updated_at=stored_updated_at,
+            )
+            self.db.execute(
+                statement.on_duplicate_key_update(
+                    current_record_id=record.id,
+                    generation=DataQualitySubjectHead.generation + 1,
+                    updated_at=stored_updated_at,
+                )
+            )
+            self.db.flush()
+            return
         head = self.db.scalar(
             select(DataQualitySubjectHead)
             .where(
@@ -590,10 +614,6 @@ class DataHubRouter:
             .with_for_update()
         )
         if head is None:
-            stored_updated_at = self._as_datetime(
-                updated_at,
-                market_time=result.capability.startswith("market."),
-            )
             self.db.add(
                 DataQualitySubjectHead(
                     capability=result.capability,
@@ -608,10 +628,7 @@ class DataHubRouter:
         else:
             head.current_record_id = record.id
             head.generation += 1
-            head.updated_at = self._as_datetime(
-                updated_at,
-                market_time=result.capability.startswith("market."),
-            )
+            head.updated_at = stored_updated_at
         self.db.flush()
 
     def _record_quality(self, result: ProviderResult, symbol: str | None) -> ProviderResult:

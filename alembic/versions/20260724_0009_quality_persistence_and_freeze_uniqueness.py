@@ -6,12 +6,16 @@ Revises: 20260723_0008
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects.mysql import DATETIME as MYSQL_DATETIME
 
 
 revision = "20260724_0009"
 down_revision = "20260723_0008"
 branch_labels = None
 depends_on = None
+
+
+PRECISE_DATETIME = sa.DateTime().with_variant(MYSQL_DATETIME(fsp=6), "mysql")
 
 
 def _inspector() -> sa.Inspector:
@@ -75,6 +79,20 @@ def _ensure_index(table: str, name: str, columns: list[str]) -> None:
 
 def _ensure_unique_constraint(table: str, name: str, columns: list[str]) -> None:
     if name not in _constraint_names(table):
+        table_ref = sa.table(table, *(sa.column(column) for column in columns))
+        selected = [table_ref.c[column] for column in columns]
+        duplicate = op.get_bind().execute(
+            sa.select(*selected, sa.func.count().label("duplicate_count"))
+            .where(*(column.is_not(None) for column in selected))
+            .group_by(*selected)
+            .having(sa.func.count() > 1)
+            .limit(1)
+        ).first()
+        if duplicate is not None:
+            raise RuntimeError(
+                f"cannot create {name}: duplicate {table} rows exist for "
+                f"({', '.join(columns)}); resolve duplicates without deleting plans"
+            )
         with op.batch_alter_table(table) as batch:
             batch.create_unique_constraint(name, columns)
 
@@ -106,9 +124,9 @@ def upgrade() -> None:
             sa.Column("symbol", sa.String(40)),
             sa.Column("capability", sa.String(80), nullable=False),
             sa.Column("quality_status", sa.String(20), nullable=False),
-            sa.Column("observed_at", sa.DateTime()),
-            sa.Column("fetched_at", sa.DateTime(), nullable=False),
-            sa.Column("cached_at", sa.DateTime()),
+            sa.Column("observed_at", PRECISE_DATETIME),
+            sa.Column("fetched_at", PRECISE_DATETIME, nullable=False),
+            sa.Column("cached_at", PRECISE_DATETIME),
             sa.Column("provider_id", sa.String(80), nullable=False),
             sa.Column("provider_observations", sa.JSON(), nullable=False),
             sa.Column("normalized_digest", sa.String(64)),
@@ -121,11 +139,16 @@ def upgrade() -> None:
             sa.Column("cache_used", sa.Boolean(), nullable=False, server_default=sa.false()),
             sa.Column("trusted", sa.Boolean(), nullable=False, server_default=sa.false()),
             sa.Column("persisted", sa.Boolean(), nullable=False, server_default=sa.false()),
-            sa.Column("scan_start", sa.DateTime()),
-            sa.Column("scan_end", sa.DateTime()),
-            sa.Column("checked_at", sa.DateTime()),
-            sa.Column("latest_content_at", sa.DateTime()),
-            sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
+            sa.Column("scan_start", PRECISE_DATETIME),
+            sa.Column("scan_end", PRECISE_DATETIME),
+            sa.Column("checked_at", PRECISE_DATETIME),
+            sa.Column("latest_content_at", PRECISE_DATETIME),
+            sa.Column(
+                "created_at",
+                PRECISE_DATETIME,
+                nullable=False,
+                server_default=sa.func.now(),
+            ),
         )
     for column in ("symbol", "capability", "quality_status", "trusted", "persisted"):
         _ensure_index(
@@ -139,7 +162,10 @@ def upgrade() -> None:
         [
             sa.Column("quote_type", sa.String(20), nullable=False, server_default="realtime"),
             sa.Column(
-                "observed_at", sa.DateTime(), nullable=False, server_default=sa.func.now()
+                "observed_at",
+                PRECISE_DATETIME,
+                nullable=False,
+                server_default=sa.func.now(),
             ),
             sa.Column("price_unit", sa.String(20), nullable=False, server_default="CNY"),
             sa.Column(
@@ -171,7 +197,10 @@ def upgrade() -> None:
             sa.Column("price_unit", sa.String(20), nullable=False, server_default="CNY"),
             sa.Column("volume_unit", sa.String(20), nullable=False, server_default="share"),
             sa.Column(
-                "observed_at", sa.DateTime(), nullable=False, server_default=sa.func.now()
+                "observed_at",
+                PRECISE_DATETIME,
+                nullable=False,
+                server_default=sa.func.now(),
             ),
             sa.Column(
                 "quality_status",
@@ -199,11 +228,11 @@ def upgrade() -> None:
         "company_research_refreshes",
         [
             sa.Column("quality_status", sa.String(20)),
-            sa.Column("observed_at", sa.DateTime()),
-            sa.Column("fetched_at", sa.DateTime()),
-            sa.Column("checked_at", sa.DateTime()),
-            sa.Column("scan_start", sa.DateTime()),
-            sa.Column("scan_end", sa.DateTime()),
+            sa.Column("observed_at", PRECISE_DATETIME),
+            sa.Column("fetched_at", PRECISE_DATETIME),
+            sa.Column("checked_at", PRECISE_DATETIME),
+            sa.Column("scan_start", PRECISE_DATETIME),
+            sa.Column("scan_end", PRECISE_DATETIME),
             sa.Column("normalized_digest", sa.String(64)),
             sa.Column("provider_observations", sa.JSON()),
             sa.Column("conflict_fields", sa.JSON()),

@@ -92,11 +92,13 @@ def downgrade() -> None:
             "ix_company_profiles_quality_record_id",
         ),
     ):
+        if _has_column(table):
+            existing_fk_name = _fk_name(table)
+            if existing_fk_name:
+                with op.batch_alter_table(table) as batch:
+                    batch.drop_constraint(existing_fk_name, type_="foreignkey")
         if _has_index(table, index_name):
             op.drop_index(index_name, table_name=table)
         if _has_column(table):
-            existing_fk_name = _fk_name(table)
             with op.batch_alter_table(table) as batch:
-                if existing_fk_name:
-                    batch.drop_constraint(existing_fk_name, type_="foreignkey")
                 batch.drop_column("quality_record_id")

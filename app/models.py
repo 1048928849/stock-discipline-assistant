@@ -15,6 +15,8 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy.dialects.mysql import DATETIME as MYSQL_DATETIME
+from sqlalchemy.dialects.mysql import VARCHAR as MYSQL_VARCHAR
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.database import Base
@@ -23,6 +25,11 @@ from app.domain.quality_subject import canonical_semantic_key
 
 MONEY = Numeric(20, 4)
 PRICE = Numeric(18, 4)
+PRECISE_DATETIME = DateTime().with_variant(MYSQL_DATETIME(fsp=6), "mysql")
+ANNOUNCEMENT_URL = String(1000).with_variant(
+    MYSQL_VARCHAR(1000, charset="ascii", collation="ascii_bin"),
+    "mysql",
+)
 
 
 class TimestampMixin:
@@ -123,7 +130,9 @@ class MarketQuote(TimestampMixin, Base):
     name: Mapped[str | None] = mapped_column(String(100))
     price: Mapped[Decimal] = mapped_column(PRICE)
     quote_type: Mapped[str] = mapped_column(String(20), default="realtime")
-    observed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    observed_at: Mapped[datetime] = mapped_column(
+        PRECISE_DATETIME, default=datetime.now
+    )
     price_unit: Mapped[str] = mapped_column(String(20), default="CNY")
     quality_status: Mapped[str] = mapped_column(String(20), default="SINGLE_SOURCE")
     quality_record_id: Mapped[int | None] = mapped_column(
@@ -131,7 +140,7 @@ class MarketQuote(TimestampMixin, Base):
     )
     source: Mapped[str] = mapped_column(String(50))
     source_api: Mapped[str] = mapped_column(String(100))
-    fetched_at: Mapped[datetime] = mapped_column(DateTime)
+    fetched_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
 
 
 class MarketDailyBar(Base):
@@ -150,13 +159,15 @@ class MarketDailyBar(Base):
     adjustment: Mapped[str] = mapped_column(String(20), default="qfq")
     price_unit: Mapped[str] = mapped_column(String(20), default="CNY")
     volume_unit: Mapped[str] = mapped_column(String(20), default="share")
-    observed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    observed_at: Mapped[datetime] = mapped_column(
+        PRECISE_DATETIME, default=datetime.now
+    )
     quality_status: Mapped[str] = mapped_column(String(20), default="SINGLE_SOURCE")
     quality_record_id: Mapped[int | None] = mapped_column(
         ForeignKey("data_quality_records.id"), index=True
     )
     source: Mapped[str] = mapped_column(String(50))
-    fetched_at: Mapped[datetime] = mapped_column(DateTime)
+    fetched_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
 
 
 class MarketSourceLog(Base):
@@ -202,9 +213,9 @@ class DataQualityRecord(Base):
         )
     )
     quality_status: Mapped[str] = mapped_column(String(20), index=True)
-    observed_at: Mapped[datetime | None] = mapped_column(DateTime)
-    fetched_at: Mapped[datetime] = mapped_column(DateTime)
-    cached_at: Mapped[datetime | None] = mapped_column(DateTime)
+    observed_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    fetched_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    cached_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
     provider_id: Mapped[str] = mapped_column(String(80))
     provider_observations: Mapped[list] = mapped_column(JSON, default=list)
     normalized_digest: Mapped[str | None] = mapped_column(String(64))
@@ -217,11 +228,13 @@ class DataQualityRecord(Base):
     cache_used: Mapped[bool] = mapped_column(Boolean, default=False)
     trusted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     persisted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
-    scan_start: Mapped[datetime | None] = mapped_column(DateTime)
-    scan_end: Mapped[datetime | None] = mapped_column(DateTime)
-    checked_at: Mapped[datetime | None] = mapped_column(DateTime)
-    latest_content_at: Mapped[datetime | None] = mapped_column(DateTime)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    scan_start: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    scan_end: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    checked_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    latest_content_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    created_at: Mapped[datetime] = mapped_column(
+        PRECISE_DATETIME, server_default=func.now()
+    )
 
     @validates("semantic_key")
     def normalize_semantic_key(self, _key: str, value: str | None) -> str:
@@ -259,7 +272,7 @@ class DataQualitySubjectHead(Base):
     )
     generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime,
+        PRECISE_DATETIME,
         nullable=False,
         server_default=func.now(),
         onupdate=func.now(),
@@ -391,7 +404,7 @@ class CompanyProfile(TimestampMixin, Base):
     source: Mapped[str] = mapped_column(String(100))
     source_url: Mapped[str | None] = mapped_column(String(500))
     raw_data: Mapped[dict | None] = mapped_column(JSON)
-    fetched_at: Mapped[datetime] = mapped_column(DateTime)
+    fetched_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
     quality_record_id: Mapped[int | None] = mapped_column(
         ForeignKey("data_quality_records.id"), nullable=True, index=True
     )
@@ -426,7 +439,7 @@ class CompanyFinancialPeriod(Base):
     source: Mapped[str] = mapped_column(String(100))
     source_url: Mapped[str | None] = mapped_column(String(500))
     raw_data: Mapped[dict | None] = mapped_column(JSON)
-    fetched_at: Mapped[datetime] = mapped_column(DateTime)
+    fetched_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
 
 
 class CompanyAnnouncement(Base):
@@ -440,7 +453,7 @@ class CompanyAnnouncement(Base):
     published_date: Mapped[date] = mapped_column(Date, index=True)
     catalog_source: Mapped[str] = mapped_column(String(100))
     exchange: Mapped[str] = mapped_column(String(30))
-    url: Mapped[str] = mapped_column(String(1000))
+    url: Mapped[str] = mapped_column(ANNOUNCEMENT_URL)
     source_document_url: Mapped[str | None] = mapped_column(String(1000))
     raw_data: Mapped[dict | None] = mapped_column(JSON)
     fetched_at: Mapped[datetime] = mapped_column(DateTime)
@@ -496,16 +509,16 @@ class CompanyResearchRefresh(Base):
     source_name: Mapped[str | None] = mapped_column(String(200))
     row_count: Mapped[int] = mapped_column(Integer, default=0)
     cache_used: Mapped[bool] = mapped_column(Boolean, default=False)
-    last_attempt_at: Mapped[datetime] = mapped_column(DateTime)
-    last_success_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_attempt_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    last_success_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
     data_date: Mapped[date | None] = mapped_column(Date)
-    stale_after: Mapped[datetime | None] = mapped_column(DateTime)
+    stale_after: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
     quality_status: Mapped[str | None] = mapped_column(String(20))
-    observed_at: Mapped[datetime | None] = mapped_column(DateTime)
-    fetched_at: Mapped[datetime | None] = mapped_column(DateTime)
-    checked_at: Mapped[datetime | None] = mapped_column(DateTime)
-    scan_start: Mapped[datetime | None] = mapped_column(DateTime)
-    scan_end: Mapped[datetime | None] = mapped_column(DateTime)
+    observed_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    fetched_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    checked_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    scan_start: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    scan_end: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
     normalized_digest: Mapped[str | None] = mapped_column(String(64))
     provider_observations: Mapped[list | None] = mapped_column(JSON)
     conflict_fields: Mapped[list | None] = mapped_column(JSON)

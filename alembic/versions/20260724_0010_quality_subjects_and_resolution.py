@@ -6,12 +6,16 @@ Revises: 20260724_0009
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects.mysql import DATETIME as MYSQL_DATETIME
 
 
 revision = "20260724_0010"
 down_revision = "20260724_0009"
 branch_labels = None
 depends_on = None
+
+
+PRECISE_DATETIME = sa.DateTime().with_variant(MYSQL_DATETIME(fsp=6), "mysql")
 
 
 def _inspector() -> sa.Inspector:
@@ -149,7 +153,7 @@ def upgrade() -> None:
             sa.Column("generation", sa.Integer(), nullable=False, server_default="1"),
             sa.Column(
                 "updated_at",
-                sa.DateTime(),
+                PRECISE_DATETIME,
                 nullable=False,
                 server_default=sa.func.now(),
             ),
@@ -188,6 +192,14 @@ def downgrade() -> None:
     if _inspector().has_table("data_quality_subject_heads"):
         op.drop_table("data_quality_subject_heads")
 
+    constraints = _constraint_names("data_quality_records")
+    if "fk_data_quality_records_supersedes_record" in constraints:
+        with op.batch_alter_table("data_quality_records") as batch:
+            batch.drop_constraint(
+                "fk_data_quality_records_supersedes_record",
+                type_="foreignkey",
+            )
+
     if "ix_data_quality_records_supersedes_record_id" in _index_names(
         "data_quality_records"
     ):
@@ -203,13 +215,7 @@ def downgrade() -> None:
             table_name="data_quality_records",
         )
 
-    constraints = _constraint_names("data_quality_records")
     with op.batch_alter_table("data_quality_records") as batch:
-        if "fk_data_quality_records_supersedes_record" in constraints:
-            batch.drop_constraint(
-                "fk_data_quality_records_supersedes_record",
-                type_="foreignkey",
-            )
         for column in (
             "supersedes_record_id",
             "semantic_key",

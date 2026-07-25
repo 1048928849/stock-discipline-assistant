@@ -85,6 +85,10 @@ selector/inventory -> source binding -> Evidence/digests/package hash -> confirm
 
 ## 5. Verification order
 
+Before the first full migration run for a new database dialect, preflight index byte lengths,
+column and foreign-key compatibility, JSON/default DDL, identifier lengths, and dialect-specific
+transaction and lock semantics. Check every instance of the same dialect blocker in one task.
+
 1. New targeted tests.
 2. Related call-chain regressions.
 3. Current-phase regressions.

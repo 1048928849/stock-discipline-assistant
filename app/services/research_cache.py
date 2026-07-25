@@ -24,6 +24,7 @@ from app.models import (
     CompanyResearchRefresh,
     DataQualityRecord,
 )
+from app.services.url_normalization import normalize_announcement_url
 
 
 PROFILE_CAPABILITY = "fundamental.profile"
@@ -159,12 +160,10 @@ def _preflight_announcements(
                 "announcement catalog row cannot be parsed"
             ) from exc
         title = title.strip()
-        url = url.strip()
+        url = normalize_announcement_url(url)
         catalog = catalog.strip()
         if not title:
             raise ProviderUnavailableError("announcement catalog row has no title")
-        if not url:
-            raise ProviderUnavailableError("announcement catalog row has no URL")
         try:
             in_requested_coverage = (
                 isinstance(published, date) and start <= published <= end

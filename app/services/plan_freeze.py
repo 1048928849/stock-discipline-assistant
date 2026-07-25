@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from pydantic import ValidationError
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.domain.models import (
@@ -26,6 +27,14 @@ from app.data_hub.trading_calendar import (
 
 
 MAX_ANALYSIS_AGE = timedelta(hours=24)
+MYSQL_CONCURRENCY_ERRORS = {1205, 1213}
+
+
+def _mysql_concurrency_error(db: Session, exc: OperationalError) -> bool:
+    if db.get_bind().dialect.name != "mysql":
+        return False
+    arguments = getattr(exc.orig, "args", ())
+    return bool(arguments and arguments[0] in MYSQL_CONCURRENCY_ERRORS)
 
 
 def _package_time(value: datetime) -> datetime:
@@ -227,6 +236,15 @@ def freeze_trade_plan(
             request,
             analysis_run_id=analysis_run_id,
         )
+    except OperationalError as exc:
+        db.rollback()
+        if _mysql_concurrency_error(db, exc):
+            raise AppError(
+                409,
+                "PLAN_VERSION_CONFLICT",
+                "Concurrent plan version allocation conflicted; run a new analysis.",
+            ) from exc
+        raise
     except Exception:
         db.rollback()
         raise

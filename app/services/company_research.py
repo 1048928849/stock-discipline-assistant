@@ -34,6 +34,7 @@ from app.services.research_cache import (
     persist_announcement_catalog,
     persist_company_profile,
 )
+from app.services.url_normalization import normalize_announcement_url
 
 
 PROFILE_URL = "http://www.cninfo.com.cn/new/commonUrl?url=data/stock/stockDetail"
@@ -515,48 +516,74 @@ def sync_company_research(
             announcement_rows_to_persist = []
         else:
             announcement_rows_to_persist = announcement_rows
+        prepared_legacy_announcements = []
         for row in announcement_rows_to_persist:
             title, published, url, catalog = _announcement_fields(row)
-            if not url:
-                continue
+            normalized_url = normalize_announcement_url(url)
             category, risk = classify_announcement(title)
             document_url = None
             should_resolve = risk in {"红", "黄"} or category == "年报"
             if should_resolve and document_resolution_attempts < 8:
                 document_resolution_attempts += 1
-                document_url = _resolve_announcement_document_url(url)
+                document_url = _resolve_announcement_document_url(normalized_url)
                 if document_url:
                     resolved_documents += 1
-            announcement_item = db.scalar(
-                select(CompanyAnnouncement).where(
-                    CompanyAnnouncement.symbol == symbol, CompanyAnnouncement.url == url
+            prepared_legacy_announcements.append(
+                (
+                    row,
+                    title,
+                    published,
+                    normalized_url,
+                    catalog,
+                    category,
+                    risk,
+                    document_url,
                 )
             )
-            values = {
-                "title": title,
-                "announcement_category": category,
-                "risk_level": risk,
-                "published_date": published,
-                "catalog_source": catalog,
-                "exchange": "上交所" if symbol.startswith(("5", "6", "9")) else "深交所",
-                "url": url,
-                "source_document_url": document_url,
-                "raw_data": row,
-                "fetched_at": fetched_at,
-            }
-            if announcement_item is None:
-                db.add(CompanyAnnouncement(symbol=symbol, **values))
-                inserted += 1
-            else:
-                for key, value in values.items():
-                    setattr(announcement_item, key, value)
+        with db.begin_nested():
+            for (
+                row,
+                title,
+                published,
+                normalized_url,
+                catalog,
+                category,
+                risk,
+                document_url,
+            ) in prepared_legacy_announcements:
+                announcement_item = db.scalar(
+                    select(CompanyAnnouncement).where(
+                        CompanyAnnouncement.symbol == symbol,
+                        CompanyAnnouncement.url == normalized_url,
+                    )
+                )
+                values = {
+                    "title": title,
+                    "announcement_category": category,
+                    "risk_level": risk,
+                    "published_date": published,
+                    "catalog_source": catalog,
+                    "exchange": "上交所"
+                    if symbol.startswith(("5", "6", "9"))
+                    else "深交所",
+                    "url": normalized_url,
+                    "source_document_url": document_url,
+                    "raw_data": row,
+                    "fetched_at": fetched_at,
+                }
+                if announcement_item is None:
+                    db.add(CompanyAnnouncement(symbol=symbol, **values))
+                    inserted += 1
+                else:
+                    for key, value in values.items():
+                        setattr(announcement_item, key, value)
+            db.flush()
         sections["announcements"] = {
             "status": "success",
             "rows": len(announcement_rows),
             "inserted": inserted,
             "original_documents_resolved": resolved_documents,
         }
-        db.flush()
     except Exception as exc:
         sections["announcements"] = {"status": "unavailable", "message": str(exc)}
 
