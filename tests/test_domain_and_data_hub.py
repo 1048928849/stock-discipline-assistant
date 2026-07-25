@@ -16,6 +16,7 @@ from app.data_hub.router import ProviderResult
 from app.domain.models import (
     DecisionPackage,
     Evidence,
+    MarketQualityBinding,
     MarketSnapshot,
     QualitySnapshotItem,
     ResearchClaim,
@@ -45,6 +46,14 @@ def _evidence(
         observed_at="2026-07-24",
         fetched_at="2026-07-24T16:00:00",
         quality_status=quality,
+        market_quality_binding=MarketQualityBinding(
+            data_capability="market.daily.qfq",
+            subject_type="stock",
+            subject_id="300502",
+            semantic_key="qfq/CNY/share",
+            quality_record_id=1,
+            observed_at="2026-07-24T00:00:00",
+        ),
         payload={"close": 10.82},
     )
 
@@ -247,6 +256,56 @@ def test_freeze_hash_includes_quality_and_evidence_digest():
     verified = _decision_package(quality_status=DataQualityStatus.VERIFIED)
     assert single.evidence_digest != verified.evidence_digest
     assert single.package_hash != verified.package_hash
+
+
+def test_required_market_evidence_without_binding_blocks_freeze():
+    evidence = [_evidence().model_copy(update={"market_quality_binding": None})]
+    package = _decision_package(
+        evidence=evidence,
+        freeze_allowed=False,
+        blocked_reasons=["required market Evidence is missing a quality binding"],
+    )
+    assert package.freeze_allowed is False
+    assert "required market Evidence is missing a quality binding" in package.blocked_reasons
+
+
+def test_binding_data_capability_must_match_package_capability():
+    evidence = _evidence()
+    binding = evidence.market_quality_binding.model_copy(
+        update={"data_capability": "market.index_daily"}
+    )
+    with pytest.raises(ValidationError, match="data_capability"):
+        _decision_package(
+            evidence=[evidence.model_copy(update={"market_quality_binding": binding})]
+        )
+
+
+def test_binding_subject_is_included_in_evidence_digest():
+    original = _decision_package()
+    evidence = _evidence()
+    binding = evidence.market_quality_binding.model_copy(update={"subject_id": "300503"})
+    changed = _decision_package(
+        evidence=[evidence.model_copy(update={"market_quality_binding": binding})]
+    )
+    assert changed.evidence_digest != original.evidence_digest
+
+
+def test_binding_record_id_is_included_in_package_hash():
+    original = _decision_package()
+    evidence = _evidence()
+    binding = evidence.market_quality_binding.model_copy(update={"quality_record_id": 2})
+    changed = _decision_package(
+        evidence=[evidence.model_copy(update={"market_quality_binding": binding})]
+    )
+    assert changed.package_hash != original.package_hash
+
+
+def test_tampered_binding_rejects_package():
+    package = _decision_package()
+    payload = package.model_dump(mode="json")
+    payload["evidence"][0]["market_quality_binding"]["quality_record_id"] += 1
+    with pytest.raises(ValidationError, match="digest|hash"):
+        DecisionPackage.model_validate(payload)
 
 
 def test_decision_package_recomputes_quality_from_evidence():

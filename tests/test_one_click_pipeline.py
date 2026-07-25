@@ -7,11 +7,18 @@ from sqlalchemy import create_engine, insert, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from app.data_hub.contracts import DailyBar, DataProvider, ProviderMetadata, Quote
+from app.data_hub.contracts import (
+    DailyBar,
+    DataProvider,
+    ProviderMetadata,
+    ProviderUnavailableError,
+    Quote,
+)
 from app.data_hub.market_subjects import stock_daily_subject
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
 from app.database import Base
+from app.domain.models import DecisionPackage, MARKET_EVIDENCE_CAPABILITIES
 from app.errors import AppError
 from app.models import (
     CompanyAnnouncement,
@@ -27,7 +34,11 @@ from app.services.one_click_pipeline import (
     confirm_one_click_plan,
     run_one_click_analysis,
 )
-from app.services.market_cache import persist_market_quote, replace_market_series
+from app.services.market_cache import (
+    mapping_series_bars,
+    persist_market_quote,
+    replace_market_series,
+)
 from app.services.trade_plan_generator import generate_trade_plan_preview
 
 
@@ -169,6 +180,99 @@ class QuoteScenarioProvider(DataProvider):
             source_api="quote-fixture",
             fetched_at=now,
         )
+
+
+class BindingScenarioProvider(DataProvider):
+    def __init__(
+        self,
+        provider_id: str,
+        *,
+        close: str = "10",
+        quote_price: str = "10.82",
+        priority: int = 1,
+        fail: bool = False,
+    ):
+        self.metadata = ProviderMetadata(
+            provider_id=provider_id,
+            supported_capabilities=(
+                "market.daily.qfq",
+                "market.quote.realtime",
+                "market.index_daily",
+                "market.sector_daily",
+            ),
+            priority=priority,
+            realtime_supported=True,
+        )
+        self.close = Decimal(close)
+        self.quote_price = Decimal(quote_price)
+        self.fail = fail
+
+    def health_check(self, probe: bool = False):
+        return {"status": "healthy"}
+
+    def _check(self):
+        if self.fail:
+            raise ProviderUnavailableError("binding test refresh failed")
+
+    def get_quote(self, symbol):
+        self._check()
+        now = datetime.now()
+        return Quote(
+            symbol=symbol,
+            name="binding-test",
+            price=self.quote_price,
+            quote_type="realtime",
+            observed_at=now,
+            price_unit="CNY",
+            source=self.metadata.provider_id,
+            source_api="binding-test",
+            fetched_at=now,
+        )
+
+    def get_history(self, symbol, start, end):
+        self._check()
+        return [
+            DailyBar(
+                symbol=symbol,
+                trade_date=end - timedelta(days=259 - offset),
+                open=self.close,
+                high=self.close + Decimal("0.1"),
+                low=self.close - Decimal("0.1"),
+                close=self.close,
+                volume=Decimal("1000"),
+                adjustment="qfq",
+                price_unit="CNY",
+                volume_unit="share",
+                observed_at=datetime.combine(
+                    end - timedelta(days=259 - offset), datetime.min.time()
+                ),
+                source=self.metadata.provider_id,
+                fetched_at=datetime.now(),
+            )
+            for offset in range(260)
+        ]
+
+    def _series(self, end):
+        return {
+            "rows": [
+                {
+                    "date": end - timedelta(days=79 - offset),
+                    "close": self.close,
+                    "volume": Decimal("1000"),
+                }
+                for offset in range(80)
+            ],
+            "source": self.metadata.provider_id,
+            "fetched_at": datetime.now(),
+        }
+
+    def get_index_history(self, symbol, start, end):
+        self._check()
+        return self._series(end)
+
+    def get_sector_history(self, industry, start, end):
+        self._check()
+        return self._series(end)
 
 
 def seed_profile(session):
@@ -764,6 +868,447 @@ def test_market_quote_is_required_evidence(client, session, monkeypatch):
         item["capability"] == "market_quote" and item["required"]
         for item in package["evidence"]
     )
+
+
+def _analyze_bound_plan(client, session, monkeypatch):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    patch_benchmarks(monkeypatch)
+    response = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _confirm_bound_plan(client, analyzed):
+    return client.post(
+        f"/api/v1/trade-plan-generator/analyze/{analyzed['run_id']}/confirm"
+    )
+
+
+def _router_for_binding(session, *providers):
+    registry = ProviderRegistry()
+    for provider in providers:
+        registry.register(provider)
+    return DataHubRouter(session, registry)
+
+
+def _add_market_conflict(session, capability):
+    router = _router_for_binding(
+        session,
+        BindingScenarioProvider("binding-a", close="10", quote_price="10.82"),
+        BindingScenarioProvider(
+            "binding-b", close="11", quote_price="11.82", priority=2
+        ),
+    )
+    if capability == "stock_daily_bars":
+        result = router.get_history(
+            "300502", date.today() - timedelta(days=365), date.today()
+        )
+    elif capability == "market_quote":
+        result = router.get_quote("300502")
+    elif capability == "benchmark_daily_bars":
+        result = router.get_index_history(
+            "csi000300", date.today() - timedelta(days=240), date.today()
+        )
+    else:
+        profile = session.query(CompanyProfile).filter_by(symbol="300502").one()
+        result = router.get_sector_history(
+            profile.industry, date.today() - timedelta(days=240), date.today()
+        )
+    assert result.quality_status.value == "CONFLICTED"
+    session.commit()
+
+
+def _replace_bound_series(session, capability):
+    router = _router_for_binding(
+        session, BindingScenarioProvider(f"replacement-{capability}", close="12")
+    )
+    if capability == "stock_daily_bars":
+        result = router.get_history(
+            "300502", date.today() - timedelta(days=365), date.today()
+        )
+        bars = result.require_value()
+        min_rows = 250
+    elif capability == "benchmark_daily_bars":
+        result = router.get_index_history(
+            "csi000300", date.today() - timedelta(days=240), date.today()
+        )
+        bars = mapping_series_bars(
+            result.require_value(),
+            cache_symbol=result.subject.subject_id,
+            adjustment="unadjusted",
+        )
+        min_rows = 60
+    else:
+        profile = session.query(CompanyProfile).filter_by(symbol="300502").one()
+        result = router.get_sector_history(
+            profile.industry, date.today() - timedelta(days=240), date.today()
+        )
+        bars = mapping_series_bars(
+            result.require_value(),
+            cache_symbol=result.subject.subject_id,
+            adjustment="unadjusted",
+        )
+        min_rows = 60
+    session.commit()
+    replace_market_series(
+        session, router, result, bars, subject=result.subject, min_rows=min_rows
+    )
+    session.commit()
+
+
+def _rewrite_package_binding(session, analyzed, capability, **updates):
+    run = session.get(PlanAnalysisRun, analyzed["run_id"])
+    snapshot = dict(run.result_snapshot)
+    package = DecisionPackage.model_validate(snapshot["decision_package"])
+    evidence = []
+    for item in package.evidence:
+        if item.capability == capability:
+            binding = item.market_quality_binding.model_copy(update=updates)
+            item_updates = {"market_quality_binding": binding}
+            if "observed_at" in updates:
+                item_updates["observed_at"] = binding.observed_at.isoformat()
+            item = item.model_copy(update=item_updates)
+        evidence.append(item)
+    package_updates = {"evidence": evidence}
+    if "observed_at" in updates:
+        quality_snapshot = dict(package.quality_snapshot)
+        quality_snapshot[capability] = quality_snapshot[capability].model_copy(
+            update={"observed_at": [binding.observed_at.isoformat()]}
+        )
+        package_updates["quality_snapshot"] = quality_snapshot
+    changed = package.model_copy(update=package_updates)
+    changed = changed.model_copy(
+        update={"evidence_digest": changed.evidence_digest_value()}
+    )
+    payload = changed.model_dump(mode="json")
+    payload["package_hash"] = changed.package_hash_value()
+    snapshot["decision_package"] = DecisionPackage.model_validate(payload).model_dump(
+        mode="json"
+    )
+    run.result_snapshot = snapshot
+    session.commit()
+
+
+def test_market_evidence_contains_exact_quality_binding(
+    client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    evidence = {
+        item["capability"]: item
+        for item in analyzed["decision_package"]["evidence"]
+        if item["capability"] in MARKET_EVIDENCE_CAPABILITIES
+    }
+    assert set(evidence) == set(MARKET_EVIDENCE_CAPABILITIES)
+    for capability, data_capability in MARKET_EVIDENCE_CAPABILITIES.items():
+        binding = evidence[capability]["market_quality_binding"]
+        assert binding["data_capability"] == data_capability
+        assert binding["quality_record_id"] > 0
+        assert binding["observed_at"]
+        record = session.get(DataQualityRecord, binding["quality_record_id"])
+        assert record.persisted is True
+        assert record.subject_type == binding["subject_type"]
+        assert record.subject_id == binding["subject_id"]
+
+
+@pytest.mark.parametrize(
+    "test_capability",
+    list(MARKET_EVIDENCE_CAPABILITIES),
+)
+def test_confirm_revalidates_each_market_binding(
+    test_capability, client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    assert _confirm_bound_plan(client, analyzed).status_code == 201
+
+
+def test_confirm_revalidates_stock_daily_binding(client, session, monkeypatch):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    assert _confirm_bound_plan(client, analyzed).status_code == 201
+
+
+def test_confirm_revalidates_realtime_quote_binding(client, session, monkeypatch):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    assert _confirm_bound_plan(client, analyzed).status_code == 201
+
+
+def test_confirm_revalidates_index_binding(client, session, monkeypatch):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    assert _confirm_bound_plan(client, analyzed).status_code == 201
+
+
+def test_confirm_revalidates_sector_binding(client, session, monkeypatch):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    assert _confirm_bound_plan(client, analyzed).status_code == 201
+
+
+@pytest.mark.parametrize(
+    "capability",
+    list(MARKET_EVIDENCE_CAPABILITIES),
+)
+def test_market_conflict_after_analysis_blocks_confirm(
+    capability, client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    _add_market_conflict(session, capability)
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MARKET_BINDING_NOT_EXECUTABLE"
+    assert session.query(TradePlan).count() == 0
+
+
+def test_stock_daily_conflict_after_analysis_blocks_confirm(
+    client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    _add_market_conflict(session, "stock_daily_bars")
+    assert _confirm_bound_plan(client, analyzed).status_code == 422
+
+
+def test_quote_conflict_after_analysis_blocks_confirm(client, session, monkeypatch):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    _add_market_conflict(session, "market_quote")
+    assert _confirm_bound_plan(client, analyzed).status_code == 422
+
+
+def test_index_conflict_after_analysis_blocks_confirm(client, session, monkeypatch):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    _add_market_conflict(session, "benchmark_daily_bars")
+    assert _confirm_bound_plan(client, analyzed).status_code == 422
+
+
+def test_sector_conflict_after_analysis_blocks_confirm(client, session, monkeypatch):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    _add_market_conflict(session, "sector_daily_bars")
+    assert _confirm_bound_plan(client, analyzed).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "capability",
+    ["stock_daily_bars", "benchmark_daily_bars", "sector_daily_bars"],
+)
+def test_new_persisted_market_lineage_requires_reanalysis(
+    capability, client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    _replace_bound_series(session, capability)
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MARKET_BINDING_CHANGED"
+    assert session.query(TradePlan).count() == 0
+
+
+def test_new_persisted_stock_lineage_requires_reanalysis(client, session, monkeypatch):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    _replace_bound_series(session, "stock_daily_bars")
+    assert _confirm_bound_plan(client, analyzed).status_code == 422
+
+
+def test_new_persisted_index_lineage_requires_reanalysis(client, session, monkeypatch):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    _replace_bound_series(session, "benchmark_daily_bars")
+    assert _confirm_bound_plan(client, analyzed).status_code == 422
+
+
+def test_new_persisted_sector_lineage_requires_reanalysis(client, session, monkeypatch):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    _replace_bound_series(session, "sector_daily_bars")
+    assert _confirm_bound_plan(client, analyzed).status_code == 422
+
+
+def test_quote_naturally_ages_to_stale_before_confirm(client, session, monkeypatch):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    quote = session.query(MarketQuote).one()
+    stale_at = datetime.now() - timedelta(minutes=31)
+    quote.observed_at = stale_at
+    session.get(DataQualityRecord, quote.quality_record_id).observed_at = stale_at
+    session.commit()
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MARKET_BINDING_NOT_EXECUTABLE"
+
+
+def test_latest_close_cannot_replace_realtime_binding(client, session, monkeypatch):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    registry = ProviderRegistry()
+    registry.register(QuoteScenarioProvider("latest-only", quote_type="latest_close"))
+    router = DataHubRouter(session, registry)
+    result = router.get_latest_close("300502")
+    persist_market_quote(session, router, result)
+    session.commit()
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MARKET_BINDING_NOT_EXECUTABLE"
+
+
+def test_missing_refresh_attempt_does_not_block_fresh_bound_cache(
+    client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    router = _router_for_binding(
+        session, BindingScenarioProvider("failed-refresh", fail=True)
+    )
+    result = router.get_history(
+        "300502", date.today() - timedelta(days=365), date.today()
+    )
+    assert result.quality_status.value == "MISSING"
+    session.commit()
+    assert _confirm_bound_plan(client, analyzed).status_code == 201
+
+
+def test_unrelated_stock_conflict_does_not_block_confirm(
+    client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    router = _router_for_binding(
+        session,
+        BindingScenarioProvider("other-stock-a", close="10"),
+        BindingScenarioProvider("other-stock-b", close="11", priority=2),
+    )
+    result = router.get_history(
+        "300503", date.today() - timedelta(days=365), date.today()
+    )
+    assert result.quality_status.value == "CONFLICTED"
+    session.commit()
+    assert _confirm_bound_plan(client, analyzed).status_code == 201
+
+
+def test_unrelated_sector_conflict_does_not_block_confirm(
+    client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    router = _router_for_binding(
+        session,
+        BindingScenarioProvider("other-sector-a", close="10"),
+        BindingScenarioProvider("other-sector-b", close="11", priority=2),
+    )
+    result = router.get_sector_history(
+        "unrelated-sector", date.today() - timedelta(days=240), date.today()
+    )
+    assert result.quality_status.value == "CONFLICTED"
+    session.commit()
+    assert _confirm_bound_plan(client, analyzed).status_code == 201
+
+
+def test_binding_scope_mismatch_blocks_confirm(client, session, monkeypatch):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    _rewrite_package_binding(
+        session, analyzed, "stock_daily_bars", subject_id="300503"
+    )
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MARKET_BINDING_SCOPE_MISMATCH"
+
+
+def test_binding_observed_at_mismatch_blocks_confirm(client, session, monkeypatch):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    package = DecisionPackage.model_validate(analyzed["decision_package"])
+    binding = next(
+        item.market_quality_binding
+        for item in package.evidence
+        if item.capability == "stock_daily_bars"
+    )
+    _rewrite_package_binding(
+        session,
+        analyzed,
+        "stock_daily_bars",
+        observed_at=binding.observed_at + timedelta(seconds=1),
+    )
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MARKET_BINDING_CHANGED"
+
+
+def test_binding_quality_record_id_mismatch_blocks_confirm(
+    client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    quote_record_id = next(
+        item["market_quality_binding"]["quality_record_id"]
+        for item in analyzed["decision_package"]["evidence"]
+        if item["capability"] == "market_quote"
+    )
+    _rewrite_package_binding(
+        session,
+        analyzed,
+        "stock_daily_bars",
+        quality_record_id=quote_record_id,
+    )
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+
+
+def test_tampered_binding_rejects_confirm(client, session, monkeypatch):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    run = session.get(PlanAnalysisRun, analyzed["run_id"])
+    snapshot = dict(run.result_snapshot)
+    package = dict(snapshot["decision_package"])
+    evidence = [dict(item) for item in package["evidence"]]
+    target = next(item for item in evidence if item["capability"] == "market_quote")
+    target["market_quality_binding"] = dict(target["market_quality_binding"])
+    target["market_quality_binding"]["quality_record_id"] += 1
+    package["evidence"] = evidence
+    snapshot["decision_package"] = package
+    run.result_snapshot = snapshot
+    session.commit()
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "DECISION_PACKAGE_CHANGED"
+
+
+def test_legacy_package_without_market_bindings_cannot_confirm(
+    client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    run = session.get(PlanAnalysisRun, analyzed["run_id"])
+    snapshot = dict(run.result_snapshot)
+    package = dict(snapshot["decision_package"])
+    package["evidence"] = [
+        {key: value for key, value in item.items() if key != "market_quality_binding"}
+        for item in package["evidence"]
+    ]
+    snapshot["decision_package"] = package
+    run.result_snapshot = snapshot
+    session.commit()
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == (
+        "DECISION_PACKAGE_MARKET_BINDING_REQUIRED"
+    )
+
+
+def test_failed_binding_validation_creates_no_trade_plan(
+    client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    _add_market_conflict(session, "benchmark_daily_bars")
+    assert _confirm_bound_plan(client, analyzed).status_code == 422
+    assert session.query(TradePlan).count() == 0
+
+
+def test_direct_save_cannot_bypass_market_binding_validation(
+    client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    response = client.post(
+        "/api/v1/trade-plan-generator/save",
+        json={
+            **analyzed["generator_request"],
+            "preview_hash": analyzed["plan"]["preview_hash"],
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "DECISION_PACKAGE_REQUIRED"
+    assert session.query(TradePlan).count() == 0
 
 
 def test_old_latest_announcement_with_fresh_catalog_scan_can_confirm(
