@@ -12,6 +12,7 @@ from app.data_hub.trading_calendar import (
     SHANGHAI_TZ,
     get_trading_calendar,
     shanghai_now,
+    shanghai_today,
 )
 from app.models import (
     CompanyProfile,
@@ -374,8 +375,9 @@ def seed_governed_analysis(session, monkeypatch):
     router = DataHubRouter(session, registry)
     profile_result = router.company_profile("300502")
     persist_company_profile(session, router, profile_result)
-    start = date.today() - timedelta(days=3 * 366)
-    end = date.today()
+    today = shanghai_today()
+    start = today - timedelta(days=3 * 366)
+    end = today
     announcement_result = router.company_announcements("300502", start, end)
     persist_announcement_catalog(
         session,

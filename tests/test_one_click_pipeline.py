@@ -25,6 +25,7 @@ from app.data_hub.trading_calendar import (
     XSHGTradingCalendar,
     get_trading_calendar,
     shanghai_now,
+    shanghai_today,
     to_shanghai_aware,
 )
 from app.database import Base
@@ -1698,10 +1699,11 @@ def test_legacy_package_without_source_binding_cannot_confirm(
 
 
 def _add_research_conflict(session, capability):
+    today = shanghai_today()
     announcements = [
         {
             "公告标题": "冲突公告",
-            "公告日期": date.today().isoformat(),
+            "公告日期": today.isoformat(),
             "公告链接": "https://example.test/conflict",
         }
     ]
@@ -1719,7 +1721,7 @@ def _add_research_conflict(session, capability):
         result = router.company_profile("300502")
     else:
         result = router.company_announcements(
-            "300502", date.today() - timedelta(days=3 * 366), date.today()
+            "300502", today - timedelta(days=3 * 366), today
         )
     assert result.quality_status.value == "CONFLICTED"
     session.commit()
@@ -1739,19 +1741,21 @@ def test_research_conflict_after_analysis_blocks_confirm(
 def test_missing_research_attempt_does_not_block_fresh_bound_cache(
     client, session, monkeypatch
 ):
+    today = shanghai_today()
     analyzed = _analyze_bound_plan(client, session, monkeypatch)
     router = _router_for_binding(
         session, ResearchBindingScenarioProvider("missing", fail=True)
     )
     assert router.company_profile("300502").quality_status.value == "MISSING"
     assert router.company_announcements(
-        "300502", date.today() - timedelta(days=3 * 366), date.today()
+        "300502", today - timedelta(days=3 * 366), today
     ).quality_status.value == "MISSING"
     session.commit()
     assert _confirm_bound_plan(client, analyzed).status_code == 201
 
 
 def test_empty_scan_can_freeze_formal_plan(client, session, monkeypatch):
+    today = shanghai_today()
     account = create_account(client, assets="300000", cash="300000")
     seed_pattern(session)
     router = _router_for_binding(
@@ -1760,7 +1764,7 @@ def test_empty_scan_can_freeze_formal_plan(client, session, monkeypatch):
     )
     profile_result = router.company_profile("300502")
     persist_company_profile(session, router, profile_result)
-    start, end = date.today() - timedelta(days=3 * 366), date.today()
+    start, end = today - timedelta(days=3 * 366), today
     catalog_result = router.company_announcements("300502", start, end)
     persist_announcement_catalog(
         session, router, catalog_result, start=start, end=end
@@ -1787,6 +1791,7 @@ def test_empty_scan_can_freeze_formal_plan(client, session, monkeypatch):
 def test_new_persisted_research_lineage_requires_reanalysis(
     client, session, monkeypatch, capability
 ):
+    today = shanghai_today()
     analyzed = _analyze_bound_plan(client, session, monkeypatch)
     router = _router_for_binding(
         session,
@@ -1800,7 +1805,7 @@ def test_new_persisted_research_lineage_requires_reanalysis(
         result = router.company_profile("300502")
         persist_company_profile(session, router, result)
     else:
-        start, end = date.today() - timedelta(days=3 * 366), date.today()
+        start, end = today - timedelta(days=3 * 366), today
         result = router.company_announcements("300502", start, end)
         persist_announcement_catalog(
             session, router, result, start=start, end=end

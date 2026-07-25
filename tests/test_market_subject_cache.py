@@ -28,6 +28,7 @@ from app.data_hub.router import DataHubRouter, request_fingerprint
 from app.data_hub.trading_calendar import (
     get_trading_calendar,
     shanghai_now,
+    shanghai_today,
 )
 from app.domain.quality import DataQualityStatus
 from app.domain.quality_subject import SubjectRef, canonical_semantic_key
@@ -1701,9 +1702,10 @@ def test_unrelated_sector_conflict_does_not_block_current_sector(session):
 def test_market_sync_replaces_same_source_with_one_complete_lineage(
     client, session, monkeypatch
 ):
+    today = shanghai_today()
     old_router = _router(session, MarketStub("same-source", row_count=270))
     old = old_router.get_history(
-        "300502", date.today() - timedelta(days=365), date.today()
+        "300502", today - timedelta(days=365), today
     )
     _persist_daily(session, old_router, old)
     new_router = _router(
@@ -1731,8 +1733,8 @@ def test_market_sync_replaces_same_source_with_one_complete_lineage(
                 operation="get_history",
                 args=(
                     "300502",
-                    date.today() - timedelta(days=365),
-                    date.today(),
+                    today - timedelta(days=365),
+                    today,
                 ),
                 symbol="300502",
             ),
