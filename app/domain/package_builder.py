@@ -67,20 +67,12 @@ def _pipeline_evidence(step: dict[str, Any], symbol: str) -> Evidence:
         step["code"], (f"pipeline.{step['code']}", False)
     )
     observed_at = step.get("observed_at") or step.get("data_time")
-    binding = None
-    data_capability = MARKET_EVIDENCE_CAPABILITIES.get(capability)
-    if data_capability and all(
-        step.get(field) is not None
-        for field in ("subject_type", "subject_id", "quality_record_id")
-    ) and observed_at:
-        binding = MarketQualityBinding(
-            data_capability=data_capability,
-            subject_type=step["subject_type"],
-            subject_id=step["subject_id"],
-            semantic_key=step.get("semantic_key"),
-            quality_record_id=step["quality_record_id"],
-            observed_at=observed_at,
-        )
+    raw_binding = step.get("market_quality_binding")
+    binding = (
+        MarketQualityBinding.model_validate(raw_binding)
+        if raw_binding is not None
+        else None
+    )
     return Evidence(
         evidence_id=f"pipeline:{step['code']}",
         symbol=symbol,
@@ -102,6 +94,10 @@ def _pipeline_evidence(step: dict[str, Any], symbol: str) -> Evidence:
             "conflict_fields": step.get("conflict_fields", []),
             "price": step.get("price"),
             "quote_type": step.get("quote_type"),
+            "execution_price": step.get("execution_price"),
+            "execution_quote_type": step.get("execution_quote_type"),
+            "display_price": step.get("display_price"),
+            "display_quote_type": step.get("display_quote_type"),
             "fallback_used": step.get("fallback_used", False),
         },
         is_primary=required,

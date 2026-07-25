@@ -64,6 +64,33 @@ class BindingValidationResult:
     selected_observed_at: datetime | date | None
 
 
+def market_quality_binding_from_selection(
+    selection: CachedQuoteSelection | CachedSeriesSelection,
+    *,
+    data_capability: str,
+) -> MarketQualityBinding | None:
+    has_value = (
+        selection.value is not None
+        if isinstance(selection, CachedQuoteSelection)
+        else bool(selection.bars)
+    )
+    if (
+        not selection.executable
+        or not has_value
+        or selection.quality_record_id is None
+        or selection.observed_at is None
+    ):
+        return None
+    return MarketQualityBinding(
+        data_capability=data_capability,
+        subject_type=selection.subject.subject_type,
+        subject_id=selection.subject.subject_id,
+        semantic_key=canonical_semantic_key(selection.subject.semantic_key),
+        quality_record_id=selection.quality_record_id,
+        observed_at=selection.observed_at,
+    )
+
+
 @dataclass(frozen=True)
 class _SeriesCandidate:
     bars: list[MarketDailyBar]
@@ -820,6 +847,7 @@ __all__ = [
     "canonical_series_row",
     "effective_quality_metadata",
     "mapping_series_bars",
+    "market_quality_binding_from_selection",
     "persist_market_quote",
     "replace_market_series",
     "resolve_cached_quote",
