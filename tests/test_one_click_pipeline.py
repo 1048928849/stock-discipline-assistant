@@ -25,6 +25,7 @@ from app.models import (
     CompanyProfile,
     CompanyResearchRefresh,
     DataQualityRecord,
+    MarketDailyBar,
     MarketQuote,
     PlanAnalysisRun,
     TradePlan,
@@ -273,6 +274,38 @@ class BindingScenarioProvider(DataProvider):
     def get_sector_history(self, industry, start, end):
         self._check()
         return self._series(end)
+
+
+class PatternRefreshProvider(BindingScenarioProvider):
+    def __init__(self, provider_id, rows, **kwargs):
+        self.quote_failure = kwargs.pop("quote_failure", False)
+        super().__init__(provider_id, **kwargs)
+        self.rows = rows
+
+    def get_quote(self, symbol):
+        if self.quote_failure:
+            raise ProviderUnavailableError("realtime quote refresh failed")
+        return super().get_quote(symbol)
+
+    def get_history(self, symbol, start, end):
+        return [
+            DailyBar(
+                symbol=symbol,
+                trade_date=row.trade_date,
+                open=row.open,
+                high=row.high,
+                low=row.low,
+                close=row.close,
+                volume=row.volume,
+                adjustment=row.adjustment,
+                price_unit=row.price_unit,
+                volume_unit=row.volume_unit,
+                observed_at=row.observed_at,
+                source=self.metadata.provider_id,
+                fetched_at=datetime.now(),
+            )
+            for row in self.rows
+        ]
 
 
 def seed_profile(session):
@@ -1309,6 +1342,225 @@ def test_direct_save_cannot_bypass_market_binding_validation(
     )
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "DECISION_PACKAGE_REQUIRED"
+    assert session.query(TradePlan).count() == 0
+
+
+def _refresh_analysis_with_quote_scenario(
+    client,
+    session,
+    monkeypatch,
+    *,
+    quote_mode="missing",
+    remove_cached_quote=False,
+):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile(session)
+    patch_benchmarks(monkeypatch)
+    old_quote = session.query(MarketQuote).one()
+    old_record_id = old_quote.quality_record_id
+    old_observed_at = old_quote.observed_at
+    cached_rows = session.query(MarketDailyBar).filter_by(symbol="300502").all()
+    if remove_cached_quote:
+        session.delete(old_quote)
+        session.commit()
+
+    if quote_mode == "conflicted":
+        providers = (
+            PatternRefreshProvider(
+                "refresh-a", cached_rows, close="10", quote_price="10.82"
+            ),
+            PatternRefreshProvider(
+                "refresh-b",
+                cached_rows,
+                close="10",
+                quote_price="11.82",
+                priority=2,
+            ),
+        )
+    else:
+        providers = (
+            PatternRefreshProvider(
+                "refresh-missing",
+                cached_rows,
+                close="10",
+                quote_failure=True,
+            ),
+        )
+    router = _router_for_binding(session, *providers)
+    monkeypatch.setattr(
+        "app.services.one_click_pipeline.build_data_hub", lambda db: router
+    )
+    response = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "refresh": True,
+            "enable_ai": False,
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json(), old_record_id, old_observed_at
+
+
+def _quote_evidence(analyzed):
+    return next(
+        item
+        for item in analyzed["decision_package"]["evidence"]
+        if item["capability"] == "market_quote"
+    )
+
+
+def test_refresh_quote_failure_uses_existing_fresh_realtime_binding(
+    client, session, monkeypatch
+):
+    analyzed, old_record_id, old_observed_at = _refresh_analysis_with_quote_scenario(
+        client, session, monkeypatch
+    )
+    evidence = _quote_evidence(analyzed)
+    binding = evidence["market_quality_binding"]
+    assert binding["quality_record_id"] == old_record_id
+    assert datetime.fromisoformat(binding["observed_at"]) == old_observed_at
+    assert evidence["payload"]["quote_type"] == "realtime"
+    assert evidence["payload"]["fallback_used"] is True
+    missing_attempt = session.query(DataQualityRecord).filter_by(
+        capability="market.quote.realtime", quality_status="MISSING"
+    ).one()
+    assert missing_attempt.persisted is False
+    assert _confirm_bound_plan(client, analyzed).status_code == 201
+
+
+def test_market_quote_binding_comes_from_selected_quote(
+    client, session, monkeypatch
+):
+    analyzed, old_record_id, _ = _refresh_analysis_with_quote_scenario(
+        client, session, monkeypatch
+    )
+    assert _quote_evidence(analyzed)["market_quality_binding"][
+        "quality_record_id"
+    ] == old_record_id
+
+
+def test_quote_binding_observed_at_matches_quality_record(
+    client, session, monkeypatch
+):
+    analyzed, _, _ = _refresh_analysis_with_quote_scenario(
+        client, session, monkeypatch
+    )
+    binding = _quote_evidence(analyzed)["market_quality_binding"]
+    record = session.get(DataQualityRecord, binding["quality_record_id"])
+    assert datetime.fromisoformat(binding["observed_at"]) == record.observed_at
+
+
+def test_quote_binding_payload_and_lineage_use_same_quote(
+    client, session, monkeypatch
+):
+    analyzed, _, _ = _refresh_analysis_with_quote_scenario(
+        client, session, monkeypatch
+    )
+    evidence = _quote_evidence(analyzed)
+    assert evidence["payload"]["quote_type"] == "realtime"
+    assert evidence["payload"]["execution_quote_type"] == "realtime"
+    assert evidence["payload"]["execution_price"] == evidence["payload"]["price"]
+    assert evidence["observed_at"] == evidence["market_quality_binding"]["observed_at"]
+
+
+def test_latest_close_display_has_no_realtime_execution_binding(
+    client, session, monkeypatch
+):
+    analyzed, _, _ = _refresh_analysis_with_quote_scenario(
+        client, session, monkeypatch, remove_cached_quote=True
+    )
+    evidence = _quote_evidence(analyzed)
+    assert evidence["market_quality_binding"] is None
+    assert evidence["payload"]["display_quote_type"] == "latest_close"
+    assert evidence["payload"]["execution_quote_type"] is None
+    assert analyzed["decision_package"]["freeze_allowed"] is False
+
+
+def test_missing_quote_result_does_not_report_realtime_refresh_success(
+    client, session, monkeypatch
+):
+    analyzed, _, _ = _refresh_analysis_with_quote_scenario(
+        client, session, monkeypatch, remove_cached_quote=True
+    )
+    step = next(item for item in analyzed["steps"] if item["code"] == "market_quote")
+    assert step["status"] == "partial"
+    assert "已取得实时价格" not in step["detail"]
+
+
+def test_refresh_failure_with_no_trusted_quote_blocks_freeze(
+    client, session, monkeypatch
+):
+    analyzed, _, _ = _refresh_analysis_with_quote_scenario(
+        client, session, monkeypatch, remove_cached_quote=True
+    )
+    assert analyzed["decision_package"]["freeze_allowed"] is False
+    assert _confirm_bound_plan(client, analyzed).status_code == 422
+
+
+def test_refresh_failure_with_fresh_quote_allows_confirm(
+    client, session, monkeypatch
+):
+    analyzed, _, _ = _refresh_analysis_with_quote_scenario(
+        client, session, monkeypatch
+    )
+    assert analyzed["decision_package"]["freeze_allowed"] is True
+    assert _confirm_bound_plan(client, analyzed).status_code == 201
+
+
+def test_refresh_conflict_still_blocks_confirm(client, session, monkeypatch):
+    analyzed, _, _ = _refresh_analysis_with_quote_scenario(
+        client, session, monkeypatch, quote_mode="conflicted"
+    )
+    assert analyzed["decision_package"]["freeze_allowed"] is False
+    assert _confirm_bound_plan(client, analyzed).status_code == 422
+
+
+def test_all_four_market_steps_emit_explicit_binding(client, session, monkeypatch):
+    analyzed, _, _ = _refresh_analysis_with_quote_scenario(
+        client, session, monkeypatch
+    )
+    market_codes = {
+        "market_data",
+        "market_quote",
+        "market_judgement",
+        "industry_judgement",
+    }
+    steps = {item["code"]: item for item in analyzed["steps"]}
+    assert all(steps[code]["market_quality_binding"] for code in market_codes)
+
+
+def test_removing_nested_binding_blocks_freeze_even_if_flat_fields_exist(
+    client, session, monkeypatch
+):
+    analyzed, _, _ = _refresh_analysis_with_quote_scenario(
+        client, session, monkeypatch
+    )
+    run = session.get(PlanAnalysisRun, analyzed["run_id"])
+    quote_step = next(
+        item for item in run.pipeline_steps if item["code"] == "market_quote"
+    )
+    assert quote_step["subject_id"] == "300502"
+    assert quote_step["quality_record_id"] > 0
+    snapshot = dict(run.result_snapshot)
+    package = dict(snapshot["decision_package"])
+    evidence = [dict(item) for item in package["evidence"]]
+    market_quote = next(
+        item for item in evidence if item["capability"] == "market_quote"
+    )
+    market_quote["market_quality_binding"] = None
+    package["evidence"] = evidence
+    snapshot["decision_package"] = package
+    run.result_snapshot = snapshot
+    session.commit()
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == (
+        "DECISION_PACKAGE_MARKET_BINDING_REQUIRED"
+    )
     assert session.query(TradePlan).count() == 0
 
 

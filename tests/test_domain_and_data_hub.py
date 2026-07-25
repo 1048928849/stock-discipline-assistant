@@ -25,6 +25,7 @@ from app.domain.models import (
     RiskDecision,
     StrategyDecision,
 )
+from app.domain.package_builder import _pipeline_evidence
 from app.research.orchestrator import (
     ExistingAIResearchOrchestrator,
     ResearchExecution,
@@ -306,6 +307,55 @@ def test_tampered_binding_rejects_package():
     payload["evidence"][0]["market_quality_binding"]["quality_record_id"] += 1
     with pytest.raises(ValidationError, match="digest|hash"):
         DecisionPackage.model_validate(payload)
+
+
+def test_market_binding_is_not_inferred_from_flat_step_fields():
+    evidence = _pipeline_evidence(
+        {
+            "code": "market_quote",
+            "status": "success",
+            "source": "test",
+            "effective_quality": "SINGLE_SOURCE",
+            "subject_type": "stock",
+            "subject_id": "300502",
+            "semantic_key": "realtime/CNY",
+            "quality_record_id": 7,
+            "observed_at": "2026-07-25T09:30:00",
+        },
+        "300502",
+    )
+    assert evidence.market_quality_binding is None
+
+
+def test_tampering_flat_subject_fields_does_not_change_binding():
+    nested = {
+        "data_capability": "market.quote.realtime",
+        "subject_type": "stock",
+        "subject_id": "300502",
+        "semantic_key": "realtime/CNY",
+        "quality_record_id": 7,
+        "observed_at": "2026-07-25T09:30:00",
+    }
+    step = {
+        "code": "market_quote",
+        "status": "success",
+        "source": "test",
+        "effective_quality": "SINGLE_SOURCE",
+        "observed_at": nested["observed_at"],
+        "market_quality_binding": nested,
+    }
+    original = _pipeline_evidence(step, "300502")
+    tampered = _pipeline_evidence(
+        {
+            **step,
+            "subject_type": "index",
+            "subject_id": "CSI000300",
+            "semantic_key": "unadjusted/CNY/share",
+            "quality_record_id": 999,
+        },
+        "300502",
+    )
+    assert tampered.market_quality_binding == original.market_quality_binding
 
 
 def test_decision_package_recomputes_quality_from_evidence():
