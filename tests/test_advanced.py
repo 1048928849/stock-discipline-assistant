@@ -14,6 +14,7 @@ from app.providers.market import DailyBar, ProviderUnavailableError
 from app.providers.registry import ProviderRegistry
 from app.providers.x_social_provider import XSocialClueProvider
 from app.providers.x_provider import TWScrapeProvider, XUnavailableError
+from app.data_hub.trading_calendar import SHANGHAI_TZ
 from app.services.backtests import run_backtest
 from app.services.discipline import check_discipline
 
@@ -155,7 +156,9 @@ def test_akshare_adapter_maps_fixed_frames(monkeypatch):
             )
 
     monkeypatch.setattr(AKShareProvider, "_ak", staticmethod(lambda: FakeAK))
-    provider = AKShareProvider()
+    provider = AKShareProvider(
+        now_fn=lambda: datetime(2026, 7, 24, 10, 0, tzinfo=SHANGHAI_TZ)
+    )
     assert provider.get_quote("000001").price == Decimal("12.34")
     assert provider.get_history("000001", date(2026, 7, 1), date(2026, 7, 22))[0].close == Decimal(
         "12.3"
@@ -214,7 +217,10 @@ def test_akshare_quote_falls_back_to_sina(monkeypatch):
             return pd.DataFrame([{"代码": "sz300502", "名称": "新易盛", "最新价": 123.45}])
 
     monkeypatch.setattr(AKShareProvider, "_ak", staticmethod(lambda: FakeAK))
-    quote = AKShareProvider(retries=1).get_quote("300502")
+    quote = AKShareProvider(
+        retries=1,
+        now_fn=lambda: datetime(2026, 7, 24, 10, 0, tzinfo=SHANGHAI_TZ),
+    ).get_quote("300502")
     assert quote.source == "akshare_sina"
     assert quote.price == Decimal("123.45")
 

@@ -1,6 +1,7 @@
 import time
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+from typing import Callable
 
 from app.data_hub.contracts import (
     AnnouncementProvider,
@@ -12,6 +13,11 @@ from app.data_hub.contracts import (
     ProviderMetadata,
     ProviderUnavailableError,
     Quote,
+)
+from app.data_hub.trading_calendar import (
+    SHANGHAI_TZ,
+    TradingCalendar,
+    get_trading_calendar,
 )
 
 
@@ -26,13 +32,23 @@ class AKShareProvider(
 
     source = "akshare"
 
-    def __init__(self, retries: int = 2, timeout: float = 20):
+    def __init__(
+        self,
+        retries: int = 2,
+        timeout: float = 20,
+        *,
+        calendar: TradingCalendar | None = None,
+        now_fn: Callable[[], datetime] | None = None,
+    ):
         self.retries = max(1, retries)
         self.timeout = timeout
+        self.calendar = calendar or get_trading_calendar()
+        self.now_fn = now_fn or (lambda: datetime.now(SHANGHAI_TZ))
         self.metadata = ProviderMetadata(
             provider_id="akshare",
             supported_capabilities=(
                 "market.quote.realtime",
+                "market.quote.latest_close",
                 "market.daily.qfq",
                 "market.index_daily",
                 "market.sector_daily",
@@ -98,8 +114,9 @@ class AKShareProvider(
                     time.sleep(0.3 * attempt)
         raise RuntimeError("；".join(errors))
 
-    @staticmethod
-    def _quote_from_frame(frame, symbol: str, source: str, api_name: str) -> Quote:
+    def _quote_from_frame(
+        self, frame, symbol: str, source: str, api_name: str
+    ) -> Quote:
         required = {"代码", "名称", "最新价"}
         if not required.issubset(frame.columns):
             raise ProviderUnavailableError(
@@ -110,17 +127,56 @@ class AKShareProvider(
         if rows.empty:
             raise ProviderUnavailableError(f"{api_name} 未找到股票代码 {symbol}")
         row = rows.iloc[0]
-        now = datetime.now()
+        fetched_at = self.now_fn()
+        if fetched_at.tzinfo is None:
+            fetched_at = fetched_at.replace(tzinfo=SHANGHAI_TZ)
+        else:
+            fetched_at = fetched_at.astimezone(SHANGHAI_TZ)
+        if self.calendar.is_realtime_session(fetched_at):
+            # Spot endpoints expose no exchange timestamp. During an active
+            # session, request completion is the synchronous snapshot time.
+            quote_type = "realtime"
+            observed_at = fetched_at
+        else:
+            day_field = next(
+                (
+                    field
+                    for field in ("日期", "date", "trade_date")
+                    if field in frame.columns
+                ),
+                None,
+            )
+            if day_field is None:
+                raise ProviderUnavailableError(
+                    f"{api_name} cannot prove an after-hours close trade date"
+                )
+            try:
+                trade_date = date.fromisoformat(str(row[day_field])[:10])
+            except (TypeError, ValueError) as exc:
+                raise ProviderUnavailableError(
+                    f"{api_name} has an invalid after-hours close trade date"
+                ) from exc
+            expected = self.calendar.latest_completed_session(fetched_at)
+            if trade_date != expected:
+                raise ProviderUnavailableError(
+                    f"{api_name} close date does not match latest completed session"
+                )
+            quote_type = "latest_close"
+            observed_at = self.calendar.session_close_at(trade_date)
+        try:
+            price = Decimal(str(row["最新价"]))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ProviderUnavailableError(f"{api_name} has an invalid price") from exc
         return Quote(
             symbol=symbol,
             name=str(row["名称"]),
-            price=Decimal(str(row["最新价"])),
-            quote_type="realtime",
-            observed_at=now,
+            price=price,
+            quote_type=quote_type,
+            observed_at=observed_at,
             price_unit="CNY",
             source=source,
             source_api=api_name,
-            fetched_at=now,
+            fetched_at=fetched_at,
         )
 
     def get_quote(self, symbol: str) -> Quote:

@@ -8,6 +8,7 @@ from app.data_hub.contracts import DailyBar, DataProvider, ProviderMetadata, Quo
 from app.data_hub.market_subjects import stock_daily_subject
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
+from app.data_hub.trading_calendar import get_trading_calendar
 from app.models import (
     CompanyProfile,
     DataQualityRecord,
@@ -210,7 +211,8 @@ def _replace_quote_scenario(session, scenario: str, *, price="10.82"):
     elif scenario == "latest_close":
         session.delete(stored)
         session.flush()
-        now = datetime.now()
+        calendar = get_trading_calendar()
+        now = calendar.session_close_at(calendar.latest_completed_session())
         close = Quote(
             symbol="300502",
             name="test company",

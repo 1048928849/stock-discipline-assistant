@@ -25,6 +25,7 @@ from app.data_hub.market_subjects import (
 )
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter, request_fingerprint
+from app.data_hub.trading_calendar import get_trading_calendar
 from app.domain.quality import DataQualityStatus
 from app.domain.quality_subject import SubjectRef, canonical_semantic_key
 from app.models import (
@@ -101,6 +102,9 @@ class MarketStub(DataProvider):
     def get_quote(self, symbol: str) -> Quote:
         self._fail_if_requested("get_quote")
         now = self.observed_at or datetime.now()
+        if self.quote_type == "latest_close" and self.observed_at is None:
+            calendar = get_trading_calendar()
+            now = calendar.session_close_at(calendar.latest_completed_session())
         return Quote(
             symbol=symbol,
             name=f"stock-{symbol}",
@@ -665,7 +669,7 @@ def test_future_verified_refresh_does_not_supersede(session):
         conflict_time=now - timedelta(minutes=1),
         refresh_time=now + timedelta(minutes=1),
     )
-    assert refresh.quality_status == "VERIFIED"
+    assert refresh.quality_status == "MISSING"
     assert refresh.supersedes_record_id is None
 
 

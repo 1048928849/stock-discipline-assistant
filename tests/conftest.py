@@ -18,6 +18,27 @@ from app.database import Base, get_db
 from app.main import app
 
 
+@pytest.fixture(autouse=True)
+def deterministic_legacy_market_session(request, monkeypatch):
+    """Keep pre-D.1 tests independent from the wall clock.
+
+    D.1 contract tests inject their own clock and exercise the production
+    validators without this compatibility fixture.
+    """
+    if request.path.name == "test_market_time_contracts.py":
+        yield
+        return
+
+    from app.data_hub.trading_calendar import TradingPhase, XSHGTradingCalendar
+
+    monkeypatch.setattr(
+        XSHGTradingCalendar,
+        "market_phase",
+        lambda self, now=None: TradingPhase.MORNING_SESSION,
+    )
+    yield
+
+
 @pytest.fixture()
 def session():
     engine = create_engine(

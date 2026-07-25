@@ -11,7 +11,11 @@ from typing import Any, Callable
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.data_hub.contracts import ProviderUnavailableError
+from app.data_hub.contracts import (
+    ProviderUnavailableError,
+    validate_daily_bar_contract,
+    validate_quote_contract,
+)
 from app.data_hub.market_subjects import (
     index_daily_subject,
     sector_daily_subject,
@@ -31,7 +35,11 @@ from app.data_hub.quality import (
     policy_for,
 )
 from app.data_hub.registry import ProviderRegistry
-from app.data_hub.trading_calendar import TradingCalendar, get_trading_calendar
+from app.data_hub.trading_calendar import (
+    SHANGHAI_TZ,
+    TradingCalendar,
+    get_trading_calendar,
+)
 from app.domain.quality_subject import SubjectRef, canonical_semantic_key
 from app.models import (
     DataProviderCallLog,
@@ -228,12 +236,17 @@ class DataHubRouter:
         db: Session,
         registry: ProviderRegistry,
         calendar: TradingCalendar | None = None,
+        now_fn: Callable[[], datetime] | None = None,
     ):
         self.db = db
         self.registry = registry
         self.calendar = calendar or get_trading_calendar()
+        self.now_fn = now_fn or datetime.now
         self.calls: dict[str, ProviderResult] = {}
         self.call_results: dict[CallResultKey, ProviderResult] = {}
+
+    def _now(self) -> datetime:
+        return self.now_fn()
 
     @staticmethod
     def _call_result_key(
@@ -318,7 +331,7 @@ class DataHubRouter:
         cls, capability: str, value: Any, fetched_at: datetime
     ) -> datetime | date | None:
         if capability.startswith("market.quote"):
-            return getattr(value, "observed_at", None) or fetched_at
+            return getattr(value, "observed_at", None)
         if capability == "fundamental.profile":
             return fetched_at
         if capability in {"market.symbols", "market.indices", "market.sectors"}:
@@ -374,10 +387,15 @@ class DataHubRouter:
         return None
 
     @staticmethod
-    def _as_datetime(value: datetime | date | None) -> datetime | None:
+    def _as_datetime(
+        value: datetime | date | None,
+        *,
+        market_time: bool = False,
+    ) -> datetime | None:
         if isinstance(value, datetime):
             if value.tzinfo is not None:
-                return value.astimezone(timezone.utc).replace(tzinfo=None)
+                target_tz = SHANGHAI_TZ if market_time else timezone.utc
+                return value.astimezone(target_tz).replace(tzinfo=None)
             return value
         if isinstance(value, date):
             return datetime.combine(value, datetime_time.min)
@@ -439,7 +457,10 @@ class DataHubRouter:
             or result.normalized_digest is None
         ):
             return None
-        observed_at = self._as_datetime(result.observed_at)
+        observed_at = self._as_datetime(
+            result.observed_at,
+            market_time=result.capability.startswith("market."),
+        )
         if observed_at is None or observed_at > evaluated_at:
             return None
 
@@ -543,7 +564,7 @@ class DataHubRouter:
         self.db.flush()
 
     def _record_quality(self, result: ProviderResult, symbol: str | None) -> ProviderResult:
-        now = datetime.now()
+        now = self._now()
         latest_content_at = result.latest_content_at
         if (
             result.capability == "announcement.catalog"
@@ -574,7 +595,10 @@ class DataHubRouter:
                 evaluated_at=now,
             ),
             quality_status=result.quality_status.value,
-            observed_at=self._as_datetime(result.observed_at),
+            observed_at=self._as_datetime(
+                result.observed_at,
+                market_time=result.capability.startswith("market."),
+            ),
             fetched_at=result.fetched_at.replace(tzinfo=None)
             if result.fetched_at.tzinfo
             else result.fetched_at,
@@ -604,7 +628,7 @@ class DataHubRouter:
     def mark_persisted(self, result: ProviderResult, cached_at: datetime | None = None) -> None:
         record = self.validate_persistence_result(result)
         record.persisted = True
-        record.cached_at = cached_at or datetime.now()
+        record.cached_at = cached_at or self._now()
         self.db.flush()
 
     def validate_persistence_result(self, result: ProviderResult) -> DataQualityRecord:
@@ -639,7 +663,10 @@ class DataHubRouter:
             raise ProviderUnavailableError("Provider result quality does not match lineage")
         if record.normalized_digest != result.normalized_digest:
             raise ProviderUnavailableError("Provider result digest does not match lineage")
-        if self._as_datetime(record.observed_at) != self._as_datetime(result.observed_at):
+        if self._as_datetime(record.observed_at) != self._as_datetime(
+            result.observed_at,
+            market_time=result.capability.startswith("market."),
+        ):
             raise ProviderUnavailableError(
                 "Provider result observed_at does not match lineage"
             )
@@ -675,7 +702,7 @@ class DataHubRouter:
                 duration_ms=duration_ms,
                 error=error,
                 requested_at=started,
-                completed_at=datetime.now(),
+                completed_at=self._now(),
             )
         )
         self.db.flush()
@@ -719,15 +746,32 @@ class DataHubRouter:
         ]
         providers = configured
         for index, provider in enumerate(providers):
-            started = datetime.now()
+            started = self._now()
             timer = time.perf_counter()
             try:
                 value = getattr(provider, operation)(*args, **kwargs)
+                fetched_at = self._now()
+                if capability in {
+                    "market.quote.realtime",
+                    "market.quote.latest_close",
+                }:
+                    validate_quote_contract(
+                        value,
+                        capability=capability,
+                        expected_symbol=symbol or "",
+                        evaluated_at=fetched_at,
+                        calendar=self.calendar,
+                    )
+                elif capability in {"market.daily.qfq", "market.daily.unadjusted"}:
+                    validate_daily_bar_contract(
+                        value,
+                        capability=capability,
+                        expected_symbol=symbol or "",
+                    )
                 if validator and not validator(value):
                     raise ProviderUnavailableError(
                         "Provider data failed capability completeness validation"
                     )
-                fetched_at = datetime.now()
                 observed_at = self._observed_at(capability, value, fetched_at)
                 stale = observation_is_stale(
                     observed_at,
@@ -784,7 +828,7 @@ class DataHubRouter:
                         "status": "failed",
                         "duration_ms": duration_ms,
                         "observed_at": None,
-                        "fetched_at": datetime.now().isoformat(),
+                        "fetched_at": self._now().isoformat(),
                         "cache_used": False,
                         "fallback_used": index > 0,
                         "stale": False,
@@ -830,7 +874,7 @@ class DataHubRouter:
                 request_fingerprint=fingerprint,
                 request_summary=request_summary,
                 observed_at=scan_completed_at or selected.observed_at,
-                fetched_at=selected.fetched_at or datetime.now(),
+                fetched_at=selected.fetched_at or self._now(),
                 fallback_used=bool(errors) or selected.provider_id != observations[0].provider_id,
                 cache_used=False,
                 errors=errors,
@@ -855,7 +899,7 @@ class DataHubRouter:
         if cache_loader and policy.allow_cache_fallback:
             cached = cache_loader()
             if cached is not None and self.payload_row_count(capability, cached) > 0:
-                now = datetime.now()
+                now = self._now()
                 observed_at = self._observed_at(capability, cached, now)
                 digest = canonical_digest(cached, policy)
                 audit.append(
@@ -912,7 +956,7 @@ class DataHubRouter:
                 )
                 return self._remember_result(result)
 
-        now = datetime.now()
+        now = self._now()
         result = ProviderResult(
             value=None,
             provider_id="none",
@@ -1128,7 +1172,7 @@ class DataHubRouter:
     def record_cache_fallback(
         self, capability: str, operation: str, symbol: str, row_count: int, errors: str
     ) -> None:
-        now = datetime.now()
+        now = self._now()
         self._log(
             provider_id="local_cache",
             capability=capability,

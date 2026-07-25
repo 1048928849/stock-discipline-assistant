@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import httpx
 
@@ -13,7 +13,9 @@ from app.data_hub.contracts import (
     ProviderMetadata,
     ProviderUnavailableError,
     Quote,
+    validate_daily_bar_contract,
 )
+from app.data_hub.trading_calendar import SHANGHAI_TZ
 
 
 class ProfessionalMarketApiProvider(MarketDataProvider):
@@ -79,19 +81,43 @@ class ProfessionalMarketApiProvider(MarketDataProvider):
 
     def get_quote(self, symbol: str) -> Quote:
         row = self._get("/market/quote", {"symbol": symbol})
-        fetched_at = datetime.fromisoformat(row.get("fetched_at") or datetime.now().isoformat())
-        observed_at = datetime.fromisoformat(row.get("observed_at") or fetched_at.isoformat())
-        return Quote(
-            symbol=symbol,
-            name=str(row.get("name") or symbol),
-            price=Decimal(str(row["price"])),
-            quote_type=str(row.get("quote_type") or "realtime"),
-            observed_at=observed_at,
-            price_unit=str(row.get("price_unit") or "CNY"),
-            source="professional_market_api",
-            source_api="/market/quote",
-            fetched_at=fetched_at,
-        )
+        if not isinstance(row, dict):
+            raise ProviderUnavailableError(
+                "professional quote contract requires an object"
+            )
+        required = {"price", "quote_type", "observed_at", "fetched_at", "price_unit"}
+        missing = {field for field in required if row.get(field) in (None, "")}
+        if missing:
+            raise ProviderUnavailableError(
+                f"professional quote contract missing fields: {sorted(missing)}"
+            )
+        if row["quote_type"] != "realtime":
+            raise ProviderUnavailableError(
+                "professional quote contract requires quote_type=realtime"
+            )
+        try:
+            fetched_at = datetime.fromisoformat(str(row["fetched_at"]))
+            observed_at = datetime.fromisoformat(str(row["observed_at"]))
+        except (TypeError, ValueError) as exc:
+            raise ProviderUnavailableError(
+                "professional quote contract has invalid timestamps"
+            ) from exc
+        try:
+            return Quote(
+                symbol=str(row.get("symbol") or symbol),
+                name=str(row.get("name") or symbol),
+                price=Decimal(str(row["price"])),
+                quote_type=row["quote_type"],
+                observed_at=observed_at,
+                price_unit=str(row["price_unit"]),
+                source="professional_market_api",
+                source_api="/market/quote",
+                fetched_at=fetched_at,
+            )
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ProviderUnavailableError(
+                "professional quote contract has invalid field types"
+            ) from exc
 
     def get_history(self, symbol: str, start: date, end: date) -> list[DailyBar]:
         body = self._get(
@@ -104,29 +130,77 @@ class ProfessionalMarketApiProvider(MarketDataProvider):
                 "adjust": "qfq",
             },
         )
-        rows = body.get("rows", body)
-        return [
-            DailyBar(
-                symbol=symbol,
-                trade_date=date.fromisoformat(str(row["date"])[:10]),
-                open=Decimal(str(row["open"])),
-                high=Decimal(str(row["high"])),
-                low=Decimal(str(row["low"])),
-                close=Decimal(str(row["close"])),
-                volume=Decimal(str(row["volume"])),
-                adjustment=str(row.get("adjustment") or "qfq"),
-                price_unit=str(row.get("price_unit") or "CNY"),
-                volume_unit=str(row.get("volume_unit") or "share"),
-                observed_at=datetime.fromisoformat(
-                    row.get("observed_at") or f"{str(row['date'])[:10]}T00:00:00"
-                ),
-                source="professional_market_api_qfq",
-                fetched_at=datetime.fromisoformat(
-                    row.get("fetched_at") or datetime.now().isoformat()
-                ),
+        if isinstance(body, dict):
+            rows = body.get("rows", body)
+        elif isinstance(body, list):
+            rows = body
+        else:
+            raise ProviderUnavailableError(
+                "professional history contract requires an object or rows list"
             )
-            for row in rows
-        ]
+        if not isinstance(rows, list):
+            raise ProviderUnavailableError(
+                "professional history contract requires a rows list"
+            )
+        bars = []
+        required = {
+            "date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "adjustment",
+            "price_unit",
+            "volume_unit",
+            "fetched_at",
+        }
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ProviderUnavailableError(
+                    "professional history contract requires object rows"
+                )
+            missing = {field for field in required if row.get(field) in (None, "")}
+            if missing:
+                raise ProviderUnavailableError(
+                    f"professional history contract missing fields: {sorted(missing)}"
+                )
+            try:
+                trade_date = date.fromisoformat(str(row["date"])[:10])
+                observed_at = (
+                    datetime.fromisoformat(str(row["observed_at"]))
+                    if row.get("observed_at")
+                    else datetime.combine(
+                        trade_date, datetime.min.time(), tzinfo=SHANGHAI_TZ
+                    )
+                )
+                fetched_at = datetime.fromisoformat(str(row["fetched_at"]))
+                bar = DailyBar(
+                    symbol=str(row.get("symbol") or symbol),
+                    trade_date=trade_date,
+                    open=Decimal(str(row["open"])),
+                    high=Decimal(str(row["high"])),
+                    low=Decimal(str(row["low"])),
+                    close=Decimal(str(row["close"])),
+                    volume=Decimal(str(row["volume"])),
+                    adjustment=str(row["adjustment"]),
+                    price_unit=str(row["price_unit"]),
+                    volume_unit=str(row["volume_unit"]),
+                    observed_at=observed_at,
+                    source="professional_market_api_qfq",
+                    fetched_at=fetched_at,
+                )
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise ProviderUnavailableError(
+                    "professional history contract has invalid field types"
+                ) from exc
+            bars.append(bar)
+        validate_daily_bar_contract(
+            bars,
+            capability="market.daily.qfq",
+            expected_symbol=symbol,
+        )
+        return bars
 
     def _benchmark(self, path: str, key: str, start: date, end: date) -> dict:
         body = self._get(

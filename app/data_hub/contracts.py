@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal
+
+from app.data_hub.trading_calendar import SHANGHAI_TZ, TradingCalendar, TradingPhase
 
 
 class ProviderUnavailableError(RuntimeError):
@@ -140,3 +142,133 @@ class SocialClueProvider(DataProvider):
         self, symbol: str, company_name: str | None, start: datetime, end: datetime
     ) -> list[dict]:
         raise NotImplementedError
+
+
+_FUTURE_TIME_TOLERANCE = timedelta(seconds=1)
+
+
+def _shanghai_datetime(value: datetime, field: str) -> datetime:
+    if not isinstance(value, datetime):
+        raise ProviderUnavailableError(f"market contract requires {field}")
+    if value.tzinfo is None:
+        return value.replace(tzinfo=SHANGHAI_TZ)
+    return value.astimezone(SHANGHAI_TZ)
+
+
+def validate_quote_contract(
+    quote: Quote,
+    *,
+    capability: str,
+    expected_symbol: str,
+    evaluated_at: datetime,
+    calendar: TradingCalendar,
+) -> None:
+    if not isinstance(quote, Quote):
+        raise ProviderUnavailableError("quote contract requires a Quote value")
+    if quote.symbol != expected_symbol:
+        raise ProviderUnavailableError("quote contract symbol mismatch")
+    if quote.price_unit != "CNY":
+        raise ProviderUnavailableError("quote contract requires CNY price_unit")
+    if not isinstance(quote.price, Decimal) or quote.price <= 0:
+        raise ProviderUnavailableError("quote contract requires a positive price")
+    if not quote.source or not quote.source_api:
+        raise ProviderUnavailableError("quote contract requires source lineage")
+    observed = _shanghai_datetime(quote.observed_at, "observed_at")
+    fetched = _shanghai_datetime(quote.fetched_at, "fetched_at")
+    current = _shanghai_datetime(evaluated_at, "evaluated_at")
+    if observed > fetched + _FUTURE_TIME_TOLERANCE:
+        raise ProviderUnavailableError("quote contract observed_at is after fetched_at")
+    if observed > current + _FUTURE_TIME_TOLERANCE:
+        raise ProviderUnavailableError("quote contract observed_at is in the future")
+
+    if capability == "market.quote.realtime":
+        if quote.quote_type != "realtime":
+            raise ProviderUnavailableError("realtime quote contract type mismatch")
+        current_phase = calendar.market_phase(current)
+        if current_phase not in {
+            TradingPhase.MORNING_SESSION,
+            TradingPhase.AFTERNOON_SESSION,
+        }:
+            raise ProviderUnavailableError("realtime quote contract requires active session")
+        if observed.date() != current.date():
+            raise ProviderUnavailableError("realtime quote contract requires current session")
+        if calendar.market_phase(observed) != current_phase:
+            raise ProviderUnavailableError(
+                "realtime quote contract observed_at is outside current trading window"
+            )
+        return
+
+    if capability == "market.quote.latest_close":
+        if quote.quote_type != "latest_close":
+            raise ProviderUnavailableError("latest-close quote contract type mismatch")
+        try:
+            expected_close = calendar.session_close_at(observed.date())
+        except ValueError as exc:
+            raise ProviderUnavailableError(
+                "latest-close quote contract requires an exchange session"
+            ) from exc
+        if observed != expected_close:
+            raise ProviderUnavailableError(
+                "latest-close quote contract requires official session close time"
+            )
+        if observed.date() > calendar.latest_completed_session(current):
+            raise ProviderUnavailableError(
+                "latest-close quote contract session is not completed"
+            )
+        return
+
+    raise ProviderUnavailableError(f"unsupported quote capability contract: {capability}")
+
+
+def validate_daily_bar_contract(
+    bars: Any,
+    *,
+    capability: str,
+    expected_symbol: str,
+) -> None:
+    expected_adjustment = {
+        "market.daily.qfq": "qfq",
+        "market.daily.unadjusted": "unadjusted",
+    }.get(capability)
+    if expected_adjustment is None:
+        raise ProviderUnavailableError(
+            f"unsupported daily capability contract: {capability}"
+        )
+    if not isinstance(bars, list) or not bars:
+        raise ProviderUnavailableError("daily contract requires a non-empty list")
+    dates: list[date] = []
+    for bar in bars:
+        if not isinstance(bar, DailyBar):
+            raise ProviderUnavailableError("daily contract requires DailyBar rows")
+        if not isinstance(bar.trade_date, date) or isinstance(bar.trade_date, datetime):
+            raise ProviderUnavailableError("daily contract requires a trade_date")
+        if bar.symbol != expected_symbol:
+            raise ProviderUnavailableError("daily contract symbol mismatch")
+        if bar.adjustment != expected_adjustment:
+            raise ProviderUnavailableError("daily contract adjustment mismatch")
+        if bar.price_unit != "CNY" or bar.volume_unit != "share":
+            raise ProviderUnavailableError("daily contract unit mismatch")
+        observed = _shanghai_datetime(bar.observed_at, "observed_at")
+        fetched = _shanghai_datetime(bar.fetched_at, "fetched_at")
+        if observed.date() != bar.trade_date:
+            raise ProviderUnavailableError("daily contract observed_at date mismatch")
+        prices = (bar.open, bar.high, bar.low, bar.close)
+        if not all(isinstance(value, Decimal) for value in (*prices, bar.volume)):
+            raise ProviderUnavailableError("daily contract requires decimal values")
+        if min(prices) <= 0:
+            raise ProviderUnavailableError("daily contract requires positive OHLC")
+        if bar.high < max(bar.open, bar.close, bar.low):
+            raise ProviderUnavailableError("daily contract high is invalid")
+        if bar.low > min(bar.open, bar.close, bar.high):
+            raise ProviderUnavailableError("daily contract low is invalid")
+        if bar.volume < 0:
+            raise ProviderUnavailableError("daily contract volume is negative")
+        if observed > fetched + _FUTURE_TIME_TOLERANCE:
+            raise ProviderUnavailableError("daily contract observed_at is after fetched_at")
+        if not bar.source:
+            raise ProviderUnavailableError("daily contract requires source lineage")
+        dates.append(bar.trade_date)
+    if dates != sorted(set(dates)):
+        raise ProviderUnavailableError(
+            "daily contract trade_date must be unique and increasing"
+        )

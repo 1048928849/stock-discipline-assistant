@@ -73,6 +73,33 @@ Freshness is evaluated whenever data is analyzed, displayed as executable, saved
 It is not a permanent property copied from acquisition time.
 
 - Intraday capabilities use their configured duration from `observed_at`.
+- `market.quote.realtime` additionally requires an active A-share continuous
+  trading session. Fresh age alone cannot make a lunch-break, after-close,
+  weekend, or exchange-holiday quote executable.
+
+## Market time and capability contracts
+
+All market timestamps use `Asia/Shanghai` semantics. `observed_at` is the
+business time represented by the quote or bar; `fetched_at` is when this
+system completed the request. A missing business timestamp is never replaced
+with `fetched_at`.
+
+A-share continuous sessions are half-open intervals: `[09:30, 11:30)` and
+`[13:00, 15:00)`. Therefore 11:30 is lunch break and 15:00 is closed. The
+official daily close is always 15:00; any later data-landing buffer is a
+separate operational concern.
+
+`market.quote.realtime` accepts only a current-session realtime `Quote` with
+matching symbol, CNY units, explicit timestamps, and an observation inside the
+current continuous window. `market.quote.latest_close` accepts only an
+official 15:00 close for a completed exchange session and never satisfies a
+realtime request.
+
+`market.daily.qfq` and `market.daily.unadjusted` require explicit adjustment
+and units on every `DailyBar`, matching symbols, unique increasing trade dates,
+same-date observations, legal OHLC values, and non-negative volume. Router
+validation occurs before a `QualityObservation` is formed; persistence
+preflight remains the second boundary.
 - Daily market capabilities use the A-share trading calendar and trading-session lag, not
   natural-day subtraction.
 - Announcement catalog freshness uses the successful scan `checked_at`. The latest

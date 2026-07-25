@@ -24,6 +24,7 @@ class CapabilityQualityPolicy:
     time_tolerance: timedelta = timedelta(seconds=1)
     verify_multiple_sources: bool = False
     allow_cache_fallback: bool = True
+    requires_active_session: bool = False
 
 
 DEFAULT_POLICY = CapabilityQualityPolicy(
@@ -58,6 +59,7 @@ QUALITY_POLICIES: dict[str, CapabilityQualityPolicy] = {
         business_fields=("symbol", "price", "quote_type", "price_unit"),
         numeric_tolerance=Decimal("0.0001"),
         verify_multiple_sources=True,
+        requires_active_session=True,
     ),
     "market.quote.latest_close": CapabilityQualityPolicy(
         "market.quote.latest_close",
@@ -347,6 +349,10 @@ def observation_is_stale(
     if observed_at is None:
         return True
     current = now or datetime.now()
+    if policy.requires_active_session and not (
+        calendar or get_trading_calendar()
+    ).is_realtime_session(current):
+        return True
     if policy.max_trading_session_lag is not None:
         observed_date = (
             observed_at.date() if isinstance(observed_at, datetime) else observed_at

@@ -1,8 +1,12 @@
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
-from app.data_hub.contracts import DataProvider, ProviderMetadata
-from app.data_hub.market_subjects import index_daily_subject, sector_daily_subject
+from app.data_hub.contracts import DataProvider, ProviderMetadata, Quote
+from app.data_hub.market_subjects import (
+    index_daily_subject,
+    sector_daily_subject,
+    stock_quote_subject,
+)
 from app.data_hub.quality import (
     DataQualityStatus,
     QualityObservation,
@@ -50,39 +54,79 @@ def router_for(session, capability, *providers):
 
 
 def test_data_hub_real_router_verified(session):
-    first = {"symbol": "300502", "price": Decimal("10.00"), "source": "a"}
-    second = {"symbol": "300502.SZ", "price": 10.0, "source": "b"}
+    now = datetime.now()
+    first = Quote(
+        "300502", "test", Decimal("10.00"), "realtime", now, "CNY", "a", "a", now
+    )
+    second = Quote(
+        "300502", "test", Decimal("10.0"), "realtime", now, "CNY", "b", "b", now
+    )
     router, capability = router_for(
         session,
-        "market.quote",
-        StubProvider("a", "market.quote", first),
-        StubProvider("b", "market.quote", second, priority=20),
+        "market.quote.realtime",
+        StubProvider("a", "market.quote.realtime", first),
+        StubProvider("b", "market.quote.realtime", second, priority=20),
     )
-    result = router.invoke(capability, "fetch")
+    result = router.invoke(
+        capability,
+        "fetch",
+        symbol="300502",
+        subject=stock_quote_subject("300502", "realtime", "CNY"),
+    )
     assert result.quality_status == DataQualityStatus.VERIFIED
     assert len(result.provider_observations) == 2
 
 
 def test_data_hub_real_router_conflicted(session):
+    now = datetime.now()
     router, capability = router_for(
         session,
-        "market.quote",
-        StubProvider("a", "market.quote", {"symbol": "300502", "price": 10}),
-        StubProvider("b", "market.quote", {"symbol": "300502", "price": 11}, priority=20),
+        "market.quote.realtime",
+        StubProvider(
+            "a",
+            "market.quote.realtime",
+            Quote("300502", "test", Decimal("10"), "realtime", now, "CNY", "a", "a", now),
+        ),
+        StubProvider(
+            "b",
+            "market.quote.realtime",
+            Quote("300502", "test", Decimal("11"), "realtime", now, "CNY", "b", "b", now),
+            priority=20,
+        ),
     )
-    result = router.invoke(capability, "fetch")
+    result = router.invoke(
+        capability,
+        "fetch",
+        symbol="300502",
+        subject=stock_quote_subject("300502", "realtime", "CNY"),
+    )
     assert result.quality_status == DataQualityStatus.CONFLICTED
     assert result.conflict_fields
 
 
 def test_data_hub_single_valid_source(session):
+    now = datetime.now()
     router, capability = router_for(
         session,
-        "market.quote",
-        StubProvider("a", "market.quote", {"symbol": "300502", "price": 10}),
-        StubProvider("b", "market.quote", error=RuntimeError("offline"), priority=20),
+        "market.quote.realtime",
+        StubProvider(
+            "a",
+            "market.quote.realtime",
+            Quote("300502", "test", Decimal("10"), "realtime", now, "CNY", "a", "a", now),
+        ),
+        StubProvider(
+            "b",
+            "market.quote.realtime",
+            error=RuntimeError("offline"),
+            priority=20,
+        ),
     )
-    result = router.invoke(capability, "fetch")
+    result = router.invoke(
+        capability,
+        "fetch",
+        symbol="300502",
+        subject=stock_quote_subject("300502", "realtime", "CNY"),
+    )
     assert result.quality_status == DataQualityStatus.SINGLE_SOURCE
     assert result.errors
 

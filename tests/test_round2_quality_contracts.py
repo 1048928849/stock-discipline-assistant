@@ -285,8 +285,13 @@ def test_market_sync_preserves_stale_quality_in_cache(client, session, monkeypat
     def stale_history(symbol, start, end):
         rows = original_history(symbol, start, end)
         return [
-            DailyBar(**{**row.__dict__, "trade_date": date.today() - timedelta(days=10),
-                        "observed_at": datetime.now() - timedelta(days=10)})
+            DailyBar(
+                **{
+                    **row.__dict__,
+                    "trade_date": row.trade_date - timedelta(days=10),
+                    "observed_at": row.observed_at - timedelta(days=10),
+                }
+            )
             for row in rows
         ]
 

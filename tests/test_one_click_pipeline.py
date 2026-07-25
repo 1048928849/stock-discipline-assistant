@@ -17,6 +17,11 @@ from app.data_hub.contracts import (
 from app.data_hub.market_subjects import stock_daily_subject
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
+from app.data_hub.trading_calendar import (
+    TradingPhase,
+    XSHGTradingCalendar,
+    get_trading_calendar,
+)
 from app.database import Base
 from app.domain.models import DecisionPackage, MARKET_EVIDENCE_CAPABILITIES
 from app.errors import AppError
@@ -175,6 +180,9 @@ class QuoteScenarioProvider(DataProvider):
 
     def get_quote(self, symbol):
         now = datetime.now()
+        if self.quote_type == "latest_close":
+            calendar = get_trading_calendar()
+            now = calendar.session_close_at(calendar.latest_completed_session())
         return Quote(
             symbol=symbol,
             name="测试公司",
@@ -1075,6 +1083,36 @@ def _confirm_bound_plan(client, analyzed):
     return client.post(
         f"/api/v1/trade-plan-generator/analyze/{analyzed['run_id']}/confirm"
     )
+
+
+def test_confirm_rejects_package_when_market_closes_before_confirmation(
+    client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    assert analyzed["decision_package"]["freeze_allowed"] is True
+    monkeypatch.setattr(
+        XSHGTradingCalendar,
+        "market_phase",
+        lambda self, now=None: TradingPhase.CLOSED,
+    )
+
+    response = _confirm_bound_plan(client, analyzed)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MARKET_BINDING_NOT_EXECUTABLE"
+
+
+def test_active_session_fresh_realtime_quote_can_confirm(
+    client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+
+    response = _confirm_bound_plan(client, analyzed)
+
+    assert response.status_code == 201, response.text
+    assert session.query(TradePlan).filter_by(
+        analysis_run_id=analyzed["run_id"]
+    ).count() == 1
 
 
 def _research_evidence(analyzed):
