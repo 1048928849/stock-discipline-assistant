@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.domain.models import (
     DecisionPackage,
@@ -23,6 +24,9 @@ from app.domain.models import (
     StrategyDecision,
 )
 from app.domain.quality import DataQualityStatus, worst_quality
+
+
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
 STEP_CAPABILITIES: dict[str, tuple[str, bool]] = {
@@ -351,6 +355,9 @@ def build_decision_package(
     industry = preview.get("industry_assessment") or {}
     current_price = existing.get("current_price")
     generated_at = datetime.fromisoformat(preview["generated_at"])
+    if generated_at.tzinfo is None:
+        raise ValueError("preview generated_at must be timezone-aware")
+    generated_at = generated_at.astimezone(SHANGHAI_TZ)
     package = DecisionPackage.model_construct(
         package_id=f"decision:{preview['preview_hash']}",
         created_at=generated_at,

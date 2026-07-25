@@ -39,8 +39,11 @@ from app.data_hub.trading_calendar import (
     TradingCalendar,
     get_trading_calendar,
     shanghai_now,
+    storage_naive_to_aware,
+    time_storage_semantics_for_capability,
+    to_market_storage_naive,
     to_shanghai_aware,
-    to_storage_naive,
+    to_utc_storage_naive,
 )
 from app.domain.quality_subject import SubjectRef, canonical_semantic_key
 from app.models import (
@@ -402,8 +405,8 @@ class DataHubRouter:
             if value.tzinfo is None:
                 return value
             if market_time:
-                return to_storage_naive(value)
-            return value.astimezone(timezone.utc).replace(tzinfo=None)
+                return to_market_storage_naive(value)
+            return to_utc_storage_naive(value)
         if isinstance(value, date):
             return datetime.combine(value, datetime_time.min)
         return None
@@ -465,6 +468,9 @@ class DataHubRouter:
         ):
             return None
         market_time = result.capability.startswith("market.")
+        storage_semantics = time_storage_semantics_for_capability(
+            result.capability
+        )
         stored_observed_at = self._as_datetime(
             result.observed_at,
             market_time=market_time,
@@ -510,12 +516,18 @@ class DataHubRouter:
         for candidate in scoped_records:
             conflict = conflicts_by_id.get(candidate.supersedes_record_id)
             candidate_observed_at = (
-                to_shanghai_aware(candidate.observed_at, naive_is_shanghai=True)
+                storage_naive_to_aware(
+                    candidate.observed_at,
+                    semantics=storage_semantics,
+                )
                 if candidate.observed_at is not None
                 else None
             )
             conflict_observed_at = (
-                to_shanghai_aware(conflict.observed_at, naive_is_shanghai=True)
+                storage_naive_to_aware(
+                    conflict.observed_at,
+                    semantics=storage_semantics,
+                )
                 if conflict is not None and conflict.observed_at is not None
                 else None
             )
@@ -548,7 +560,10 @@ class DataHubRouter:
             conflict is None
             or conflict.observed_at is None
             or observed_at
-            < to_shanghai_aware(conflict.observed_at, naive_is_shanghai=True)
+            < storage_naive_to_aware(
+                conflict.observed_at,
+                semantics=storage_semantics,
+            )
         ):
             return None
         return conflict.id
@@ -575,6 +590,10 @@ class DataHubRouter:
             .with_for_update()
         )
         if head is None:
+            stored_updated_at = self._as_datetime(
+                updated_at,
+                market_time=result.capability.startswith("market."),
+            )
             self.db.add(
                 DataQualitySubjectHead(
                     capability=result.capability,
@@ -583,13 +602,16 @@ class DataHubRouter:
                     semantic_key=semantic_key,
                     current_record_id=record.id,
                     generation=1,
-                    updated_at=to_storage_naive(updated_at),
+                    updated_at=stored_updated_at,
                 )
             )
         else:
             head.current_record_id = record.id
             head.generation += 1
-            head.updated_at = to_storage_naive(updated_at)
+            head.updated_at = self._as_datetime(
+                updated_at,
+                market_time=result.capability.startswith("market."),
+            )
         self.db.flush()
 
     def _record_quality(self, result: ProviderResult, symbol: str | None) -> ProviderResult:
@@ -659,9 +681,9 @@ class DataHubRouter:
         record = self.validate_persistence_result(result)
         record.persisted = True
         cache_time = cached_at or self._now()
-        record.cached_at = to_storage_naive(
+        record.cached_at = self._as_datetime(
             cache_time,
-            naive_is_shanghai=cache_time.tzinfo is None,
+            market_time=result.capability.startswith("market."),
         )
         self.db.flush()
 
@@ -735,8 +757,8 @@ class DataHubRouter:
                 row_count=row_count,
                 duration_ms=duration_ms,
                 error=error,
-                requested_at=to_storage_naive(started),
-                completed_at=to_storage_naive(self._now()),
+                requested_at=to_market_storage_naive(started),
+                completed_at=to_market_storage_naive(self._now()),
             )
         )
         self.db.flush()

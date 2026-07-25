@@ -8,7 +8,11 @@ from app.data_hub.contracts import DailyBar, DataProvider, ProviderMetadata, Quo
 from app.data_hub.market_subjects import stock_daily_subject
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
-from app.data_hub.trading_calendar import get_trading_calendar, shanghai_now
+from app.data_hub.trading_calendar import (
+    SHANGHAI_TZ,
+    get_trading_calendar,
+    shanghai_now,
+)
 from app.models import (
     CompanyProfile,
     DataQualityRecord,
@@ -22,6 +26,7 @@ from app.services.research_cache import (
     persist_company_profile,
 )
 from app.services.trade_plan_ai import validate_ai_output
+from app.services import trade_plan_generator as trade_plan_generator_service
 from app.services.trade_plan_generator import _floor_lot, ensure_generator_rule_version
 
 
@@ -174,6 +179,71 @@ def payload(account_id, symbol="300502", **changes):
     return result
 
 
+def _preview_with_fixed_shanghai_clock(client, session, monkeypatch):
+    fixed = datetime(2026, 7, 24, 10, 0, tzinfo=SHANGHAI_TZ)
+    monkeypatch.setattr(__name__ + ".shanghai_now", lambda: fixed)
+    monkeypatch.setattr("app.data_hub.router.shanghai_now", lambda: fixed)
+    monkeypatch.setattr("app.data_hub.effective_quality.shanghai_now", lambda: fixed)
+    monkeypatch.setattr(
+        trade_plan_generator_service,
+        "shanghai_now",
+        lambda: fixed,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        trade_plan_generator_service,
+        "shanghai_today",
+        lambda: fixed.date(),
+        raising=False,
+    )
+    account = create_account(client)
+    seed_pattern(session)
+    response = client.post(
+        "/api/v1/trade-plan-generator/preview",
+        json=payload(account["id"]),
+    )
+    assert response.status_code == 200, response.text
+    return fixed, response.json()
+
+
+def test_preview_generated_at_is_shanghai_aware(client, session, monkeypatch):
+    fixed, preview = _preview_with_fixed_shanghai_clock(
+        client, session, monkeypatch
+    )
+    generated_at = datetime.fromisoformat(preview["generated_at"])
+    assert generated_at == fixed
+    assert generated_at.utcoffset() == timedelta(hours=8)
+
+
+def test_preview_current_dates_use_shanghai_date(client, session, monkeypatch):
+    fixed, preview = _preview_with_fixed_shanghai_clock(
+        client, session, monkeypatch
+    )
+    current_context = {
+        item["source_id"]: item["data_date"]
+        for item in preview["sources"]
+        if item["source_id"] in {"account", "market_sector_context"}
+    }
+    assert current_context == {
+        "account": fixed.date().isoformat(),
+        "market_sector_context": fixed.date().isoformat(),
+    }
+
+
+def test_preview_hash_is_stable_with_injected_shanghai_clock(
+    client, session, monkeypatch
+):
+    fixed, first = _preview_with_fixed_shanghai_clock(client, session, monkeypatch)
+    response = client.post(
+        "/api/v1/trade-plan-generator/preview",
+        json=payload(first["account"]["id"]),
+    )
+    assert response.status_code == 200, response.text
+    second = response.json()
+    assert first["generated_at"] == second["generated_at"] == fixed.isoformat()
+    assert first["preview_hash"] == second["preview_hash"]
+
+
 def _replace_quote_scenario(session, scenario: str, *, price="10.82"):
     stored = session.query(MarketQuote).filter_by(symbol="300502").one_or_none()
     if scenario == "stale":
@@ -183,7 +253,7 @@ def _replace_quote_scenario(session, scenario: str, *, price="10.82"):
     elif scenario == "missing":
         session.delete(stored)
     elif scenario == "conflicted":
-        now = datetime.now()
+        now = shanghai_now()
         first = Quote(
             symbol="300502",
             name="test company",

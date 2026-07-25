@@ -12,6 +12,7 @@ from app.data_hub.contracts import (
     ProviderUnavailableError,
     Quote,
     validate_daily_bar_contract,
+    validate_quote_contract,
 )
 from app.data_hub.effective_quality import EffectiveQualityResolver
 from app.data_hub.registry import ProviderRegistry
@@ -200,6 +201,65 @@ def test_contract_failure_is_audited_as_provider_failure(session):
     assert result.quality_status == DataQualityStatus.MISSING
     assert log.status == "failed"
     assert "contract" in log.error.lower()
+
+
+def test_generic_quote_rejects_naive_observed_at():
+    with pytest.raises(ProviderUnavailableError, match="timezone-aware observed_at"):
+        validate_quote_contract(
+            _quote(observed_at=MORNING.replace(tzinfo=None)),
+            capability="market.quote.realtime",
+            expected_symbol="300502",
+            evaluated_at=MORNING,
+            calendar=XSHGTradingCalendar(),
+        )
+
+
+def test_generic_quote_rejects_naive_fetched_at():
+    with pytest.raises(ProviderUnavailableError, match="timezone-aware fetched_at"):
+        validate_quote_contract(
+            _quote(fetched_at=MORNING.replace(tzinfo=None)),
+            capability="market.quote.realtime",
+            expected_symbol="300502",
+            evaluated_at=MORNING,
+            calendar=XSHGTradingCalendar(),
+        )
+
+
+def test_router_rejects_provider_with_host_naive_quote(session):
+    naive = MORNING.replace(tzinfo=None)
+    result = _router(
+        session,
+        MORNING,
+        QuoteProvider("host-naive", _quote(observed_at=naive, fetched_at=naive)),
+    ).get_quote("300502")
+    assert result.quality_status == DataQualityStatus.MISSING
+
+
+def test_naive_quote_failure_is_audited(session):
+    naive = MORNING.replace(tzinfo=None)
+    result = _router(
+        session,
+        MORNING,
+        QuoteProvider("naive-audit", _quote(observed_at=naive, fetched_at=naive)),
+    ).get_quote("300502")
+    log = session.query(DataProviderCallLog).filter_by(provider_id="naive-audit").one()
+    assert result.quality_status == DataQualityStatus.MISSING
+    assert log.status == "failed"
+    assert "timezone-aware" in log.error
+
+
+def test_utc_aware_quote_is_accepted_and_compared_in_shanghai(session):
+    utc_morning = datetime(2026, 7, 24, 2, 0, tzinfo=timezone.utc)
+    result = _router(
+        session,
+        MORNING,
+        QuoteProvider(
+            "utc-aware",
+            _quote(observed_at=utc_morning, fetched_at=utc_morning),
+        ),
+    ).get_quote("300502")
+    assert result.quality_status == DataQualityStatus.SINGLE_SOURCE
+    assert result.observed_at == utc_morning
 
 
 def test_invalid_provider_is_excluded_when_another_provider_is_valid(session):

@@ -10,6 +10,8 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from app.data_hub.trading_calendar import (
+    storage_naive_to_aware,
+    time_storage_semantics_for_capability,
     TradingCalendar,
     get_trading_calendar,
     shanghai_now,
@@ -376,9 +378,9 @@ def observation_is_stale(
         if isinstance(observed_at, datetime)
         else datetime.combine(observed_at, datetime.min.time())
     )
-    observed_dt = to_shanghai_aware(
+    observed_dt = storage_naive_to_aware(
         observed_dt,
-        naive_is_shanghai=observed_dt.tzinfo is None,
+        semantics=time_storage_semantics_for_capability(policy.capability),
     )
     return current - observed_dt > policy.max_age
 

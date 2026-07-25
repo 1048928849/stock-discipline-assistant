@@ -104,7 +104,7 @@ class MarketStub(DataProvider):
 
     def get_quote(self, symbol: str) -> Quote:
         self._fail_if_requested("get_quote")
-        now = self.observed_at or datetime.now()
+        now = self.observed_at or shanghai_now()
         if self.quote_type == "latest_close" and self.observed_at is None:
             calendar = get_trading_calendar()
             now = calendar.session_close_at(calendar.latest_completed_session())
@@ -117,7 +117,7 @@ class MarketStub(DataProvider):
             price_unit="CNY",
             source=self.provider_id,
             source_api="quote",
-            fetched_at=datetime.now(),
+            fetched_at=shanghai_now(),
         )
 
     def get_quote_alias(self, symbol: str) -> Quote:
@@ -609,7 +609,7 @@ def _conflict_then_refresh(
 
 
 def test_verified_refresh_supersedes_same_scope_conflict(session):
-    now = datetime.now()
+    now = shanghai_now()
     conflict, refresh = _conflict_then_refresh(
         session,
         conflict_time=now - timedelta(minutes=2),
@@ -620,7 +620,7 @@ def test_verified_refresh_supersedes_same_scope_conflict(session):
 
 
 def test_verified_provider_fallback_supersedes_same_scope_conflict(session):
-    now = datetime.now()
+    now = shanghai_now()
     conflict, _ = _conflict_then_refresh(
         session,
         conflict_time=now - timedelta(minutes=3),
@@ -642,7 +642,7 @@ def test_verified_provider_fallback_supersedes_same_scope_conflict(session):
 
 
 def test_stale_resolution_does_not_hide_conflict_from_fresh_refresh(session):
-    now = datetime.now()
+    now = shanghai_now()
     conflict, stale_resolution = _conflict_then_refresh(
         session,
         conflict_time=now - timedelta(minutes=3),
@@ -668,7 +668,7 @@ def test_stale_resolution_does_not_hide_conflict_from_fresh_refresh(session):
 
 
 def test_single_source_refresh_does_not_supersede_conflict(session):
-    now = datetime.now()
+    now = shanghai_now()
     _, refresh = _conflict_then_refresh(
         session,
         conflict_time=now - timedelta(minutes=2),
@@ -680,7 +680,7 @@ def test_single_source_refresh_does_not_supersede_conflict(session):
 
 
 def test_backdated_verified_refresh_does_not_supersede(session):
-    now = datetime.now()
+    now = shanghai_now()
     _, refresh = _conflict_then_refresh(
         session,
         conflict_time=now - timedelta(minutes=1),
@@ -691,7 +691,7 @@ def test_backdated_verified_refresh_does_not_supersede(session):
 
 
 def test_future_verified_refresh_does_not_supersede(session):
-    now = datetime.now()
+    now = shanghai_now()
     _, refresh = _conflict_then_refresh(
         session,
         conflict_time=now - timedelta(minutes=1),
@@ -702,7 +702,7 @@ def test_future_verified_refresh_does_not_supersede(session):
 
 
 def test_different_semantic_key_does_not_supersede(session):
-    now = datetime.now()
+    now = shanghai_now()
     _, refresh = _conflict_then_refresh(
         session,
         conflict_time=now - timedelta(minutes=2),

@@ -147,14 +147,6 @@ class SocialClueProvider(DataProvider):
 _FUTURE_TIME_TOLERANCE = timedelta(seconds=1)
 
 
-def _shanghai_datetime(value: datetime, field: str) -> datetime:
-    if not isinstance(value, datetime):
-        raise ProviderUnavailableError(f"market contract requires {field}")
-    if value.tzinfo is None:
-        return value.replace(tzinfo=SHANGHAI_TZ)
-    return value.astimezone(SHANGHAI_TZ)
-
-
 def _aware_shanghai_datetime(value: datetime, field: str) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise ProviderUnavailableError(
@@ -185,9 +177,9 @@ def validate_quote_contract(
         raise ProviderUnavailableError("quote contract requires a positive price")
     if not quote.source or not quote.source_api:
         raise ProviderUnavailableError("quote contract requires source lineage")
-    observed = _shanghai_datetime(quote.observed_at, "observed_at")
-    fetched = _shanghai_datetime(quote.fetched_at, "fetched_at")
-    current = _shanghai_datetime(evaluated_at, "evaluated_at")
+    observed = _aware_shanghai_datetime(quote.observed_at, "observed_at")
+    fetched = _aware_shanghai_datetime(quote.fetched_at, "fetched_at")
+    current = _aware_shanghai_datetime(evaluated_at, "evaluated_at")
     if observed > fetched + _FUTURE_TIME_TOLERANCE:
         raise ProviderUnavailableError("quote contract observed_at is after fetched_at")
     if observed > current + _FUTURE_TIME_TOLERANCE:

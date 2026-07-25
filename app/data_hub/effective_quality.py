@@ -9,10 +9,11 @@ from sqlalchemy.orm import Session
 
 from app.data_hub.quality import observation_is_stale, policy_for
 from app.data_hub.trading_calendar import (
-    SHANGHAI_TZ,
     TradingCalendar,
     get_trading_calendar,
     shanghai_now,
+    storage_naive_to_aware,
+    time_storage_semantics_for_capability,
     to_shanghai_aware,
 )
 from app.domain.quality import DataQualityStatus, worst_quality
@@ -74,16 +75,15 @@ def _scope_matches(
     return _record_scope(record) == _scope_key(capability, subject)
 
 
-def _comparable_datetime(value: datetime | date, reference: datetime) -> datetime:
-    del reference
+def _comparable_datetime(value: datetime | date, capability: str) -> datetime:
     result = (
         value
         if isinstance(value, datetime)
-        else datetime.combine(value, time.min, tzinfo=SHANGHAI_TZ)
+        else datetime.combine(value, time.min)
     )
-    return to_shanghai_aware(
+    return storage_naive_to_aware(
         result,
-        naive_is_shanghai=result.tzinfo is None,
+        semantics=time_storage_semantics_for_capability(capability),
     )
 
 
@@ -91,13 +91,14 @@ def _conservative_observed_at(
     stored: datetime | date | None,
     supplied: datetime | date | None,
     evaluated_at: datetime,
+    capability: str,
 ) -> datetime | date | None:
     if stored is None:
         return supplied
     if supplied is None:
         return stored
-    stored_dt = _comparable_datetime(stored, evaluated_at)
-    supplied_dt = _comparable_datetime(supplied, evaluated_at)
+    stored_dt = _comparable_datetime(stored, capability)
+    supplied_dt = _comparable_datetime(supplied, capability)
     return stored if stored_dt <= supplied_dt else supplied
 
 
@@ -105,25 +106,28 @@ def _resolution_applies_to_observation(
     resolution_observed_at: datetime | date | None,
     cached_observed_at: datetime | date | None,
     evaluated_at: datetime,
+    capability: str,
 ) -> bool:
     if resolution_observed_at is None or cached_observed_at is None:
         return True
+    del evaluated_at
     return _comparable_datetime(
         resolution_observed_at,
-        evaluated_at,
-    ) >= _comparable_datetime(cached_observed_at, evaluated_at)
+        capability,
+    ) >= _comparable_datetime(cached_observed_at, capability)
 
 
 def _resolution_business_time_is_valid(
     resolution_observed_at: datetime | date | None,
     conflict_observed_at: datetime | date | None,
     evaluated_at: datetime,
+    capability: str,
 ) -> bool:
     if resolution_observed_at is None or conflict_observed_at is None:
         return False
-    resolution_dt = _comparable_datetime(resolution_observed_at, evaluated_at)
-    conflict_dt = _comparable_datetime(conflict_observed_at, evaluated_at)
-    evaluated_dt = _comparable_datetime(evaluated_at, evaluated_at)
+    resolution_dt = _comparable_datetime(resolution_observed_at, capability)
+    conflict_dt = _comparable_datetime(conflict_observed_at, capability)
+    evaluated_dt = to_shanghai_aware(evaluated_at)
     return conflict_dt <= resolution_dt <= evaluated_dt
 
 
@@ -135,8 +139,8 @@ def _freshness_quality(
 ) -> tuple[DataQualityStatus, str | None]:
     if observed_at is None:
         return DataQualityStatus.MISSING, "missing_observed_at"
-    observed_dt = _comparable_datetime(observed_at, evaluated_at)
-    evaluated_dt = _comparable_datetime(evaluated_at, evaluated_at)
+    observed_dt = _comparable_datetime(observed_at, capability)
+    evaluated_dt = to_shanghai_aware(evaluated_at)
     if observed_dt - evaluated_dt > MAX_FUTURE_CLOCK_SKEW:
         return DataQualityStatus.MISSING, "observed_at_in_future"
     if observation_is_stale(
@@ -349,6 +353,7 @@ class EffectiveQualityResolver:
             record.observed_at,
             request.observed_at,
             evaluated_at,
+            request.capability,
         )
         freshness_quality, freshness_reason = _freshness_quality(
             observed_at,
@@ -400,6 +405,7 @@ class EffectiveQualityResolver:
                         candidate.observed_at,
                         conflict.observed_at,
                         evaluated_at,
+                        request.capability,
                     )
                     and candidate.trusted
                 ):
@@ -413,6 +419,7 @@ class EffectiveQualityResolver:
                     resolution.observed_at,
                     observed_at,
                     evaluated_at,
+                    request.capability,
                 )
                 and (
                     record.normalized_digest is None

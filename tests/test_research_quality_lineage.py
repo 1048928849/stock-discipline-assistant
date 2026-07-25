@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import event
@@ -11,6 +11,11 @@ from app.data_hub.research_subjects import (
     company_profile_subject,
 )
 from app.data_hub.router import DataHubRouter
+from app.data_hub.trading_calendar import (
+    SHANGHAI_TZ,
+    market_storage_naive_to_aware,
+    utc_storage_naive_to_aware,
+)
 from app.models import (
     CompanyAnnouncement,
     CompanyProfile,
@@ -88,6 +93,12 @@ def _router(session):
     registry = ProviderRegistry()
     registry.register(ResearchProvider())
     return DataHubRouter(session, registry)
+
+
+def _router_at(session, now, provider=None):
+    registry = ProviderRegistry()
+    registry.register(provider or ResearchProvider())
+    return DataHubRouter(session, registry, now_fn=lambda: now)
 
 
 class MutatingProfileRouter(DataHubRouter):
@@ -309,6 +320,115 @@ def test_profile_selector_dynamically_ages(session):
     assert selected.executable is False
 
 
+def _persist_profile_at(session, acquired_at):
+    router = _router_at(session, acquired_at)
+    result = router.company_profile("300502")
+    profile = persist_company_profile(session, router, result)
+    session.commit()
+    return result, profile
+
+
+def _persist_catalog_at(session, acquired_at):
+    start = acquired_at.date() - timedelta(days=30)
+    end = acquired_at.date()
+    router = _router_at(session, acquired_at)
+    result = router.company_announcements("300502", start, end)
+    refresh = persist_announcement_catalog(
+        session,
+        router,
+        result,
+        start=start,
+        end=end,
+    )
+    session.commit()
+    return start, end, result, refresh
+
+
+def test_profile_utc_naive_storage_does_not_age_eight_hours_early(session):
+    acquired_at = datetime(2026, 6, 1, 10, 0, tzinfo=SHANGHAI_TZ)
+    result, profile = _persist_profile_at(session, acquired_at)
+    record = session.get(DataQualityRecord, result.quality_record_id)
+    assert profile.fetched_at == datetime(2026, 6, 1, 2, 0)
+    assert record.observed_at == datetime(2026, 6, 1, 2, 0)
+    selected = resolve_cached_company_profile(
+        session,
+        "300502",
+        evaluated_at=acquired_at + timedelta(days=29, hours=23, minutes=59),
+    )
+    assert selected.executable is True
+    assert selected.effective_quality.effective_quality == DataQualityStatus.SINGLE_SOURCE
+
+
+def test_profile_stales_only_after_exact_30_days(session):
+    acquired_at = datetime(2026, 6, 1, 10, 0, tzinfo=SHANGHAI_TZ)
+    _persist_profile_at(session, acquired_at)
+    at_boundary = resolve_cached_company_profile(
+        session,
+        "300502",
+        evaluated_at=acquired_at + timedelta(days=30),
+    )
+    after_boundary = resolve_cached_company_profile(
+        session,
+        "300502",
+        evaluated_at=acquired_at + timedelta(days=30, seconds=1),
+    )
+    assert at_boundary.executable is True
+    assert after_boundary.effective_quality.effective_quality == DataQualityStatus.STALE
+    assert after_boundary.executable is False
+
+
+def test_announcement_utc_naive_storage_remains_fresh_for_24_hours(session):
+    acquired_at = datetime(2026, 7, 24, 10, 0, tzinfo=SHANGHAI_TZ)
+    start, end, result, refresh = _persist_catalog_at(session, acquired_at)
+    record = session.get(DataQualityRecord, result.quality_record_id)
+    assert refresh.checked_at == datetime(2026, 7, 24, 2, 0)
+    assert record.observed_at == datetime(2026, 7, 24, 2, 0)
+    selected = resolve_cached_announcement_catalog(
+        session,
+        "300502",
+        start,
+        end,
+        evaluated_at=acquired_at + timedelta(hours=23, minutes=59),
+    )
+    assert selected.executable is True
+
+
+def test_announcement_stales_only_after_exact_24_hours(session):
+    acquired_at = datetime(2026, 7, 24, 10, 0, tzinfo=SHANGHAI_TZ)
+    start, end, _, _ = _persist_catalog_at(session, acquired_at)
+    at_boundary = resolve_cached_announcement_catalog(
+        session,
+        "300502",
+        start,
+        end,
+        evaluated_at=acquired_at + timedelta(hours=24),
+    )
+    after_boundary = resolve_cached_announcement_catalog(
+        session,
+        "300502",
+        start,
+        end,
+        evaluated_at=acquired_at + timedelta(hours=24, seconds=1),
+    )
+    assert at_boundary.executable is True
+    assert after_boundary.effective_quality.effective_quality == DataQualityStatus.STALE
+    assert after_boundary.executable is False
+
+
+def test_market_naive_storage_is_interpreted_as_shanghai():
+    stored = datetime(2026, 7, 24, 10, 0)
+    assert market_storage_naive_to_aware(stored) == datetime(
+        2026, 7, 24, 10, 0, tzinfo=SHANGHAI_TZ
+    )
+
+
+def test_research_naive_storage_is_interpreted_as_utc():
+    stored = datetime(2026, 7, 24, 2, 0)
+    converted = utc_storage_naive_to_aware(stored)
+    assert converted == datetime(2026, 7, 24, 10, 0, tzinfo=SHANGHAI_TZ)
+    assert stored.replace(tzinfo=timezone.utc).astimezone(SHANGHAI_TZ) == converted
+
+
 def test_profile_conflict_does_not_overwrite_cache(session):
     router = _router(session)
     original = router.company_profile("300502")
@@ -406,7 +526,8 @@ def test_catalog_freshness_uses_checked_at_not_publication_date(session):
         "300502",
         start,
         end,
-        evaluated_at=refresh.checked_at + timedelta(hours=25),
+        evaluated_at=utc_storage_naive_to_aware(refresh.checked_at)
+        + timedelta(hours=25),
     )
     assert selected.effective_quality.effective_quality.value == "STALE"
     assert selected.executable is False

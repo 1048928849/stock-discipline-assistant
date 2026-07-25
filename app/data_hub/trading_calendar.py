@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 from enum import Enum
 from functools import lru_cache
 from typing import Protocol
@@ -11,6 +11,11 @@ import pandas as pd
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+
+
+class TimeStorageSemantics(str, Enum):
+    MARKET_SHANGHAI_NAIVE = "market_shanghai_naive"
+    UTC_NAIVE = "utc_naive"
 
 
 def shanghai_now() -> datetime:
@@ -44,6 +49,68 @@ def to_storage_naive(
         value,
         naive_is_shanghai=naive_is_shanghai,
     ).replace(tzinfo=None)
+
+
+def to_market_storage_naive(
+    value: datetime,
+    *,
+    naive_is_shanghai: bool = False,
+) -> datetime:
+    return to_storage_naive(value, naive_is_shanghai=naive_is_shanghai)
+
+
+def to_utc_storage_naive(
+    value: datetime,
+    *,
+    naive_is_utc: bool = False,
+) -> datetime:
+    if not isinstance(value, datetime):
+        raise TypeError("value must be a datetime")
+    if value.tzinfo is None:
+        if not naive_is_utc:
+            raise ValueError("naive datetime requires explicit UTC storage semantics")
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def storage_naive_to_aware(
+    value: datetime,
+    *,
+    semantics: TimeStorageSemantics,
+) -> datetime:
+    if not isinstance(value, datetime):
+        raise TypeError("value must be a datetime")
+    if value.tzinfo is not None:
+        return value.astimezone(SHANGHAI_TZ)
+    if semantics == TimeStorageSemantics.MARKET_SHANGHAI_NAIVE:
+        return value.replace(tzinfo=SHANGHAI_TZ)
+    if semantics == TimeStorageSemantics.UTC_NAIVE:
+        return value.replace(tzinfo=timezone.utc).astimezone(SHANGHAI_TZ)
+    raise ValueError(f"unsupported time storage semantics: {semantics}")
+
+
+def market_storage_naive_to_aware(value: datetime) -> datetime:
+    return storage_naive_to_aware(
+        value,
+        semantics=TimeStorageSemantics.MARKET_SHANGHAI_NAIVE,
+    )
+
+
+def utc_storage_naive_to_aware(value: datetime) -> datetime:
+    return storage_naive_to_aware(
+        value,
+        semantics=TimeStorageSemantics.UTC_NAIVE,
+    )
+
+
+def time_storage_semantics_for_capability(
+    capability: str,
+) -> TimeStorageSemantics:
+    return (
+        TimeStorageSemantics.MARKET_SHANGHAI_NAIVE
+        if capability.startswith("market.")
+        else TimeStorageSemantics.UTC_NAIVE
+    )
 
 
 class TradingPhase(str, Enum):

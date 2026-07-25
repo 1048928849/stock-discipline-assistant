@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time
 import json
 
 from sqlalchemy import delete, select
@@ -16,6 +16,7 @@ from app.data_hub.research_subjects import (
     company_profile_subject,
 )
 from app.data_hub.router import DataHubRouter, ProviderResult
+from app.data_hub.trading_calendar import to_utc_storage_naive
 from app.domain.quality_subject import EffectiveQualityResult, SubjectRef
 from app.models import (
     CompanyAnnouncement,
@@ -77,9 +78,7 @@ class _PreparedAnnouncementRow:
 def _naive_utc(value: datetime | None) -> datetime | None:
     if value is None:
         return None
-    if value.tzinfo is None:
-        return value
-    return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return to_utc_storage_naive(value, naive_is_utc=value.tzinfo is None)
 
 
 def _json_value(value):

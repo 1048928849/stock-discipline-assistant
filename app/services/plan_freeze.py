@@ -18,17 +18,27 @@ from app.services.research_cache import (
     resolve_cached_announcement_catalog,
     resolve_cached_company_profile,
 )
-from app.data_hub.trading_calendar import shanghai_now, to_shanghai_aware
+from app.data_hub.trading_calendar import (
+    market_storage_naive_to_aware,
+    shanghai_now,
+    to_shanghai_aware,
+)
 
 
 MAX_ANALYSIS_AGE = timedelta(hours=24)
 
 
-def _comparable_time(value: datetime) -> datetime:
-    return to_shanghai_aware(value, naive_is_shanghai=value.tzinfo is None)
+def _package_time(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return market_storage_naive_to_aware(value)
+    return to_shanghai_aware(value)
 
 
-def _validated_package(value: dict[str, Any] | None) -> DecisionPackage:
+def _validated_package(
+    value: dict[str, Any] | None,
+    *,
+    evaluated_at: datetime,
+) -> DecisionPackage:
     if not value:
         raise AppError(
             422,
@@ -72,7 +82,7 @@ def _validated_package(value: dict[str, Any] | None) -> DecisionPackage:
             "DECISION_PACKAGE_CHANGED",
             "DecisionPackage integrity validation failed; run a new analysis.",
         ) from exc
-    if _comparable_time(package.expires_at) <= shanghai_now():
+    if _package_time(package.expires_at) <= evaluated_at:
         raise AppError(
             422,
             "DECISION_PACKAGE_EXPIRED",
@@ -96,11 +106,13 @@ def freeze_trade_plan(
     analysis_created_at: datetime | None = None,
     analysis_run_id: int | None = None,
 ) -> dict:
-    package = _validated_package(decision_package)
-    now = shanghai_now()
+    now = to_shanghai_aware(shanghai_now())
+    package = _validated_package(decision_package, evaluated_at=now)
     if (
-        analysis_created_at
-        and now - _comparable_time(analysis_created_at) > MAX_ANALYSIS_AGE
+        package.generated_at.tzinfo is None
+        and analysis_created_at
+        and now - market_storage_naive_to_aware(analysis_created_at)
+        > MAX_ANALYSIS_AGE
     ):
         raise AppError(
             422,

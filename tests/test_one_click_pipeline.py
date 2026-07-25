@@ -477,6 +477,35 @@ def seed_profile(session):
     session.commit()
 
 
+def seed_profile_with_research_times(session, profile_at, announcement_at):
+    registry = ProviderRegistry()
+    registry.register(SeedResearchProvider())
+    profile_router = DataHubRouter(session, registry, now_fn=lambda: profile_at)
+    profile_result = profile_router.company_profile("300502")
+    persist_company_profile(session, profile_router, profile_result)
+
+    announcement_router = DataHubRouter(
+        session,
+        registry,
+        now_fn=lambda: announcement_at,
+    )
+    start = date.today() - timedelta(days=3 * 366)
+    end = date.today()
+    announcement_result = announcement_router.company_announcements(
+        "300502",
+        start,
+        end,
+    )
+    persist_announcement_catalog(
+        session,
+        announcement_router,
+        announcement_result,
+        start=start,
+        end=end,
+    )
+    session.commit()
+
+
 def _age_profile_for_refresh(session):
     profile = session.query(CompanyProfile).filter_by(symbol="300502").one()
     record = session.get(DataQualityRecord, profile.quality_record_id)
@@ -856,9 +885,11 @@ def test_confirm_rechecks_quality_after_analysis_age(
             "enable_ai": False,
         },
     ).json()
-    run = session.get(PlanAnalysisRun, analyzed["run_id"])
-    run.created_at = datetime.now() - timedelta(days=2)
-    session.commit()
+    expires_at = datetime.fromisoformat(analyzed["decision_package"]["expires_at"])
+    monkeypatch.setattr(
+        "app.services.plan_freeze.shanghai_now",
+        lambda: expires_at + timedelta(seconds=1),
+    )
     confirmed = client.post(
         f"/api/v1/trade-plan-generator/analyze/{analyzed['run_id']}/confirm"
     )
@@ -1135,6 +1166,33 @@ def _analyze_bound_plan(client, session, monkeypatch):
     return response.json()
 
 
+def _analyze_with_research_near_boundaries(client, session, monkeypatch):
+    current = datetime(2026, 7, 24, 10, 0, tzinfo=SHANGHAI_TZ)
+    _patch_market_clock(
+        monkeypatch,
+        current.astimezone(timezone.utc),
+    )
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    seed_profile_with_research_times(
+        session,
+        profile_at=current - timedelta(days=30) + timedelta(minutes=1),
+        announcement_at=current - timedelta(hours=24) + timedelta(minutes=1),
+    )
+    patch_benchmarks(monkeypatch)
+    response = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json(), current
+
+
 def _confirm_bound_plan(client, analyzed):
     return client.post(
         f"/api/v1/trade-plan-generator/analyze/{analyzed['run_id']}/confirm"
@@ -1188,6 +1246,16 @@ def _patch_market_clock(monkeypatch, instant):
         "app.services.one_click_pipeline.shanghai_today",
         lambda: shanghai_instant.date(),
     )
+    monkeypatch.setattr(
+        "app.services.one_click_pipeline.shanghai_now", lambda: shanghai_instant
+    )
+    monkeypatch.setattr(
+        "app.services.trade_plan_generator.shanghai_now", lambda: shanghai_instant
+    )
+    monkeypatch.setattr(
+        "app.services.trade_plan_generator.shanghai_today",
+        lambda: shanghai_instant.date(),
+    )
     monkeypatch.setattr(__name__ + ".shanghai_now", lambda: shanghai_instant)
 
 
@@ -1238,6 +1306,98 @@ def test_confirm_at_utc_0700_is_treated_as_shanghai_close(
     response = _confirm_bound_plan(client, analyzed)
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "MARKET_BINDING_NOT_EXECUTABLE"
+
+
+def test_decision_package_times_are_shanghai_aware(
+    client, session, monkeypatch
+):
+    utc_morning = datetime(2026, 7, 24, 2, 0, tzinfo=timezone.utc)
+    _patch_market_clock(monkeypatch, utc_morning)
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    package = analyzed["decision_package"]
+    for field in ("created_at", "generated_at", "expires_at"):
+        value = datetime.fromisoformat(package[field])
+        assert value.utcoffset() == timedelta(hours=8)
+
+
+def test_package_expiry_is_exactly_24_hours(client, session, monkeypatch):
+    utc_morning = datetime(2026, 7, 24, 2, 0, tzinfo=timezone.utc)
+    _patch_market_clock(monkeypatch, utc_morning)
+    package = _analyze_bound_plan(client, session, monkeypatch)["decision_package"]
+    generated_at = datetime.fromisoformat(package["generated_at"])
+    expires_at = datetime.fromisoformat(package["expires_at"])
+    assert expires_at - generated_at == timedelta(hours=24)
+
+
+def test_package_expiry_does_not_shorten_on_utc_host(
+    client, session, monkeypatch
+):
+    utc_morning = datetime(2026, 7, 24, 2, 0, tzinfo=timezone.utc)
+    _patch_market_clock(monkeypatch, utc_morning)
+    package = _analyze_bound_plan(client, session, monkeypatch)["decision_package"]
+    assert datetime.fromisoformat(package["generated_at"]) == datetime(
+        2026, 7, 24, 10, 0, tzinfo=SHANGHAI_TZ
+    )
+    assert datetime.fromisoformat(package["expires_at"]) == datetime(
+        2026, 7, 25, 10, 0, tzinfo=SHANGHAI_TZ
+    )
+
+
+def test_confirm_package_age_is_host_timezone_independent(
+    client, session, monkeypatch
+):
+    utc_morning = datetime(2026, 7, 24, 2, 0, tzinfo=timezone.utc)
+    _patch_market_clock(monkeypatch, utc_morning)
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    run = session.get(PlanAnalysisRun, analyzed["run_id"])
+    run.created_at = datetime(2026, 7, 23, 2, 0)
+    session.commit()
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 201, response.text
+
+
+def test_missing_research_attempt_still_allows_fresh_bound_cache_near_boundary(
+    client, session, monkeypatch
+):
+    analyzed, current = _analyze_with_research_near_boundaries(
+        client,
+        session,
+        monkeypatch,
+    )
+    evidence = _research_evidence(analyzed)["announcements"]
+    binding = evidence["source_quality_binding"]
+    registry = ProviderRegistry()
+    registry.register(
+        ResearchBindingScenarioProvider(
+            "missing-near-boundary",
+            fail=True,
+        )
+    )
+    router = DataHubRouter(session, registry, now_fn=lambda: current)
+    missing = router.company_announcements(
+        "300502",
+        datetime.fromisoformat(binding["scan_start"]).date(),
+        datetime.fromisoformat(binding["scan_end"]).date(),
+    )
+    assert missing.quality_status.value == "MISSING"
+    session.commit()
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 201, response.text
+
+
+def test_source_binding_confirm_near_freshness_boundary(
+    client, session, monkeypatch
+):
+    analyzed, _ = _analyze_with_research_near_boundaries(
+        client,
+        session,
+        monkeypatch,
+    )
+    research = _research_evidence(analyzed)
+    assert research["company_profile"]["source_quality_binding"]
+    assert research["announcements"]["source_quality_binding"]
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 201, response.text
 
 
 def _research_evidence(analyzed):

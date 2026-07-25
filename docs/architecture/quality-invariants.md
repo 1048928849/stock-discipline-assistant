@@ -81,11 +81,23 @@ It is not a permanent property copied from acquisition time.
 
 All market decisions use timezone-aware `Asia/Shanghai` timestamps from the
 central clock helpers: `shanghai_now`, `shanghai_today`, and
-`to_shanghai_aware`. A naive datetime is accepted only at an explicitly
-declared compatibility or persistence boundary. Existing database `DateTime`
-columns store naive Shanghai wall time through `to_storage_naive`; values are
-converted back to aware Shanghai time before comparison. UTC or another aware
-timezone is converted by instant, never by replacing `tzinfo`.
+`to_shanghai_aware`. The central `Quote` contract rejects naive
+`observed_at`, `fetched_at`, and evaluation timestamps. UTC and other aware
+timezones are accepted and converted by instant; the contract must never use
+`replace(tzinfo=...)` to guess provider semantics.
+
+Database `DateTime` columns retain two explicit historical storage contracts:
+
+- `market.*` quality and cache timestamps are naive Shanghai wall time.
+- `fundamental.profile`, `announcement.catalog`, and other non-market quality
+  timestamps are naive UTC.
+
+Persistence and restoration must use the centralized capability-specific
+conversion helpers. A naive datetime is accepted only at an explicitly
+declared storage or legacy compatibility boundary. Effective quality converts
+stored values according to capability before freshness, supersession, and
+future-time comparisons; it must not interpret all historical naive values as
+Shanghai time.
 
 `observed_at` is the business time represented by the quote or bar;
 `fetched_at` is when this system completed the request. A missing business
@@ -125,6 +137,14 @@ produce the same downstream daily-bar contract.
   announcement publication date is business content and does not determine scan freshness.
 - A successful empty announcement scan is fresh Evidence with `row_count=0`; a failed or absent
   scan is `MISSING`.
+
+Preview `generated_at` and all new `DecisionPackage` `created_at`,
+`generated_at`, and `expires_at` values are aware Shanghai timestamps. Package
+expiry is exactly 24 hours after package generation and is the authoritative
+confirmation-age gate. `AnalysisRun.created_at` is explicitly stored as naive
+Shanghai wall time, but it is only a secondary compatibility check for legacy
+packages with naive generation timestamps. Host timezone must not influence
+preview hashes, package hashes, expiry, or confirmation.
 
 If freshness expires after analysis, freeze must reject the package and require a new analysis.
 

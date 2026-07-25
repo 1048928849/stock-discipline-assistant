@@ -16,7 +16,7 @@ from app.data_hub.quality import (
 )
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
-from app.data_hub.trading_calendar import XSHGTradingCalendar
+from app.data_hub.trading_calendar import XSHGTradingCalendar, shanghai_now
 
 
 class StubProvider(DataProvider):
@@ -54,7 +54,7 @@ def router_for(session, capability, *providers):
 
 
 def test_data_hub_real_router_verified(session):
-    now = datetime.now()
+    now = shanghai_now()
     first = Quote(
         "300502", "test", Decimal("10.00"), "realtime", now, "CNY", "a", "a", now
     )
@@ -78,7 +78,7 @@ def test_data_hub_real_router_verified(session):
 
 
 def test_data_hub_real_router_conflicted(session):
-    now = datetime.now()
+    now = shanghai_now()
     router, capability = router_for(
         session,
         "market.quote.realtime",
@@ -105,7 +105,7 @@ def test_data_hub_real_router_conflicted(session):
 
 
 def test_data_hub_single_valid_source(session):
-    now = datetime.now()
+    now = shanghai_now()
     router, capability = router_for(
         session,
         "market.quote.realtime",

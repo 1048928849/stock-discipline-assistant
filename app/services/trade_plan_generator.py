@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal, ROUND_FLOOR
 from types import SimpleNamespace
 
@@ -12,6 +12,11 @@ from sqlalchemy.orm import Session
 
 from app.errors import AppError
 from app.data_hub.market_subjects import stock_daily_subject
+from app.data_hub.trading_calendar import (
+    shanghai_now,
+    shanghai_today,
+    to_market_storage_naive,
+)
 from app.models import (
     Account,
     CompanyProfile,
@@ -80,7 +85,7 @@ def ensure_generator_rule_version(db: Session) -> RuleVersion:
         parameters=parameters,
         rules={**current.rules, **GENERATOR_RULES},
         change_note="集中一键计划的账户、风险、分批仓位和市场降风险参数；旧计划保持原规则版本。",
-        effective_from=date.today(),
+        effective_from=shanghai_today(),
         active=True,
     )
     db.add(version)
@@ -318,7 +323,8 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
     except ValueError as exc:
         frame, pattern = None, None
         missing.append(str(exc))
-    now = datetime.now()
+    now = shanghai_now()
+    current_date = shanghai_today()
     data_time = latest_bar.fetched_at.isoformat() if latest_bar else "数据不足"
     data_date = latest_bar.trade_date.isoformat() if latest_bar else None
     stale = not daily_selection.executable
@@ -685,7 +691,7 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
         {
             "source_id": "account",
             "name": "本地账户设置",
-            "data_date": date.today().isoformat(),
+            "data_date": current_date.isoformat(),
             "fetched_at": now.isoformat(),
             "stale": False,
         },
@@ -699,7 +705,7 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
         {
             "source_id": "market_sector_context",
             "name": "自动市场/行业规则" if request.market_evidence else "用户判断（旧入口）",
-            "data_date": date.today().isoformat(),
+            "data_date": current_date.isoformat(),
             "fetched_at": now.isoformat(),
             "stale": False,
         },
@@ -952,7 +958,7 @@ def _persist_generated_plan(
                 basis=gate["evidence"],
                 missing_data=gate["missing_conditions"],
                 rule_version=rule.version,
-                checked_at=datetime.now(),
+                checked_at=to_market_storage_naive(shanghai_now()),
             )
         )
     from app.services.plan_execution import initialize_plan_execution

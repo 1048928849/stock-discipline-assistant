@@ -17,7 +17,11 @@ from app.data_hub.market_subjects import (
     stock_daily_subject,
 )
 from app.data_hub.router import DataHubRouter
-from app.data_hub.trading_calendar import shanghai_today
+from app.data_hub.trading_calendar import (
+    shanghai_now,
+    shanghai_today,
+    to_market_storage_naive,
+)
 from app.domain.package_builder import build_decision_package
 from app.errors import AppError
 from app.models import (
@@ -1104,6 +1108,7 @@ def _decision(preview: dict, position_mode: str) -> dict:
 
 
 def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
+    analysis_started_at = shanghai_now()
     account, created_account = _default_account(db, payload)
     run = PlanAnalysisRun(
         symbol=payload.symbol,
@@ -1114,6 +1119,8 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
         pipeline_steps=[],
         result_snapshot=None,
         user_confirmed=False,
+        created_at=to_market_storage_naive(analysis_started_at),
+        updated_at=to_market_storage_naive(analysis_started_at),
     )
     db.add(run)
     db.commit()
@@ -1130,7 +1137,7 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
             f"使用账户“{account.name}”，权益 {float(account.total_assets):.2f} 元。"
             + (" 已自动建立默认研究账户。" if created_account else ""),
             source="本地账户设置",
-            data_time=datetime.now().isoformat(),
+            data_time=analysis_started_at.isoformat(),
         )
     ]
     try:
@@ -1212,10 +1219,10 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
             holding_cost_price=payload.holding_cost_price,
             market_evidence=market_step["detail"],
             market_source=market_step.get("source", "数据不足"),
-            market_data_time=market_step.get("data_time", datetime.now().isoformat()),
+            market_data_time=market_step.get("data_time", shanghai_now().isoformat()),
             sector_evidence=sector_step["detail"],
             sector_source=sector_step.get("source", "数据不足"),
-            sector_data_time=sector_step.get("data_time", datetime.now().isoformat()),
+            sector_data_time=sector_step.get("data_time", shanghai_now().isoformat()),
         )
         preview = generate_trade_plan_preview(db, generator_request)
         decision = _decision(preview, payload.position_mode)
@@ -1250,7 +1257,7 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
                     if preview["position_calculation"]
                     else ["有效买入触发价", "硬止损价"],
                     source="确定性规则引擎 + 本地账户",
-                    data_time=datetime.now().isoformat(),
+                    data_time=shanghai_now().isoformat(),
                 ),
             ]
         )
@@ -1276,7 +1283,7 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
                     if ai_result.get("status") == "success"
                     else ["AI辅助解释"],
                     source=f"{ai_result.get('provider', '未配置')}/{ai_result.get('model', '未配置')}",
-                    data_time=ai_result.get("created_at", datetime.now().isoformat()),
+                    data_time=ai_result.get("created_at", shanghai_now().isoformat()),
                 )
             )
         else:
