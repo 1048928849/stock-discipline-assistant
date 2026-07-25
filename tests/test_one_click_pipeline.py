@@ -32,6 +32,7 @@ from app.models import (
 )
 from app.schemas_workflow import OneClickPlanRequest, TradePlanPreviewRequest
 from app.services.one_click_pipeline import (
+    _ensure_profile,
     confirm_one_click_plan,
     run_one_click_analysis,
 )
@@ -374,6 +375,25 @@ class ResearchBindingScenarioProvider(SeedResearchProvider):
         return super().company_announcements(symbol, start, end)
 
 
+class OneClickMutatingProfileRouter(DataHubRouter):
+    def __init__(self, session, registry, mutation):
+        super().__init__(session, registry)
+        self.mutation = mutation
+        self.profile_result = None
+
+    def company_profile(self, symbol):
+        result = super().company_profile(symbol)
+        self.profile_result = result
+        self.mutation(self, result)
+        return result
+
+
+def one_click_profile_router(session, mutation=lambda _router, _result: None):
+    registry = ProviderRegistry()
+    registry.register(SeedResearchProvider())
+    return OneClickMutatingProfileRouter(session, registry, mutation)
+
+
 def seed_profile(session):
     registry = ProviderRegistry()
     registry.register(SeedResearchProvider())
@@ -391,6 +411,110 @@ def seed_profile(session):
         end=end,
     )
     session.commit()
+
+
+def _age_profile_for_refresh(session):
+    profile = session.query(CompanyProfile).filter_by(symbol="300502").one()
+    record = session.get(DataQualityRecord, profile.quality_record_id)
+    old_time = datetime.now() - timedelta(days=45)
+    profile.fetched_at = old_time
+    record.observed_at = old_time
+    record.fetched_at = old_time
+    record.cached_at = old_time
+    session.commit()
+    return {
+        "name": profile.name,
+        "industry": profile.industry,
+        "source": profile.source,
+        "raw_data": profile.raw_data,
+        "fetched_at": profile.fetched_at,
+        "quality_record_id": profile.quality_record_id,
+    }
+
+
+def _stored_profile_state(session):
+    session.expire_all()
+    profile = session.query(CompanyProfile).filter_by(symbol="300502").one()
+    return profile, {
+        "name": profile.name,
+        "industry": profile.industry,
+        "source": profile.source,
+        "raw_data": profile.raw_data,
+        "fetched_at": profile.fetched_at,
+        "quality_record_id": profile.quality_record_id,
+    }
+
+
+def test_one_click_profile_refresh_has_no_prevalidated_profile_write(
+    session, monkeypatch
+):
+    router = one_click_profile_router(session)
+    original_persist = persist_company_profile
+
+    def assert_clean_entry(db, current_router, result):
+        assert not any(
+            isinstance(item, CompanyProfile) and item.symbol == "300502"
+            for item in db.new | db.dirty
+        )
+        return original_persist(db, current_router, result)
+
+    monkeypatch.setattr(
+        "app.services.one_click_pipeline.persist_company_profile", assert_clean_entry
+    )
+    profile, step = _ensure_profile(session, "300502", router)
+    record = session.get(DataQualityRecord, router.profile_result.quality_record_id)
+    assert step["status"] == "success"
+    assert profile.quality_record_id == record.id
+    assert profile.raw_data == router.profile_result.value
+    assert record.persisted is True
+
+
+def test_one_click_tampered_profile_preserves_existing_profile(session):
+    seed_profile(session)
+    old_state = _age_profile_for_refresh(session)
+
+    def tamper(_router, result):
+        result.value["name"] = "tampered"
+
+    router = one_click_profile_router(session, tamper)
+    profile, step = _ensure_profile(session, "300502", router)
+    _, stored_state = _stored_profile_state(session)
+    assert step["status"] == "partial"
+    assert profile is None
+    assert stored_state == old_state
+    assert session.get(
+        DataQualityRecord, router.profile_result.quality_record_id
+    ).persisted is False
+
+
+def test_one_click_successful_profile_refresh_binds_exact_lineage(session):
+    router = one_click_profile_router(session)
+    profile, step = _ensure_profile(session, "300502", router)
+    binding = step["source_quality_binding"]
+    record = session.get(DataQualityRecord, profile.quality_record_id)
+    assert binding["quality_record_id"] == profile.quality_record_id
+    assert record.persisted is True
+
+
+def test_one_click_profile_mark_persisted_failure_preserves_cache(
+    session, monkeypatch
+):
+    seed_profile(session)
+    old_state = _age_profile_for_refresh(session)
+    router = one_click_profile_router(session)
+
+    def fail_mark_persisted(_result, cached_at=None):
+        raise ValueError("simulated profile mark_persisted failure")
+
+    monkeypatch.setattr(router, "mark_persisted", fail_mark_persisted)
+    profile, step = _ensure_profile(session, "300502", router)
+    _, stored_state = _stored_profile_state(session)
+    assert step["status"] == "partial"
+    assert profile is None
+    assert stored_state == old_state
+    assert session.get(
+        DataQualityRecord, router.profile_result.quality_record_id
+    ).persisted is False
 
 
 def patch_benchmarks(monkeypatch, market="up", sector="up"):

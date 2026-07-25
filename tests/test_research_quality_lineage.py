@@ -25,6 +25,7 @@ from app.services.research_cache import (
     resolve_cached_announcement_catalog,
     resolve_cached_company_profile,
 )
+from app.services.company_research import sync_company_research
 
 
 class ResearchProvider(DataProvider):
@@ -87,6 +88,31 @@ def _router(session):
     registry = ProviderRegistry()
     registry.register(ResearchProvider())
     return DataHubRouter(session, registry)
+
+
+class MutatingProfileRouter(DataHubRouter):
+    def __init__(self, session, registry, mutation):
+        super().__init__(session, registry)
+        self.mutation = mutation
+        self.profile_result = None
+
+    def company_profile(self, symbol):
+        result = super().company_profile(symbol)
+        self.profile_result = result
+        self.mutation(self, result)
+        return result
+
+
+def _mutating_profile_router(session, mutation, *, profile=None):
+    registry = ProviderRegistry()
+    registry.register(
+        ScenarioResearchProvider(
+            "mutating-profile",
+            profile=profile
+            or {"name": "replacement", "industry": "replacement-industry"},
+        )
+    )
+    return MutatingProfileRouter(session, registry, mutation)
 
 
 def _announcement_row(index, published, *, url=None, title=None):
@@ -947,3 +973,159 @@ def test_successful_empty_catalog_remains_executable(session):
     selected = resolve_cached_announcement_catalog(session, "300502", start, end)
     assert selected.announcements == []
     assert selected.executable is True
+
+
+def _profile_state(profile):
+    return {
+        "name": profile.name,
+        "industry": profile.industry,
+        "source": profile.source,
+        "raw_data": profile.raw_data,
+        "fetched_at": profile.fetched_at,
+        "quality_record_id": profile.quality_record_id,
+    }
+
+
+def _seed_profile_for_production_path(session):
+    router = _scenario_router(
+        session,
+        ScenarioResearchProvider(
+            "old-profile",
+            profile={"name": "old", "industry": "old-industry"},
+        ),
+    )
+    result = router.company_profile("300502")
+    profile = persist_company_profile(session, router, result)
+    session.commit()
+    return result, _profile_state(profile)
+
+
+def test_sync_company_research_datahub_profile_uses_unified_persistence(
+    session, monkeypatch
+):
+    router = _scenario_router(
+        session,
+        ScenarioResearchProvider(
+            "production-profile",
+            profile={"name": "canonical", "industry": "canonical-industry"},
+        ),
+    )
+    original_persist = persist_company_profile
+
+    def assert_clean_entry(db, current_router, result):
+        assert not any(
+            isinstance(item, CompanyProfile) and item.symbol == "300502"
+            for item in db.new | db.dirty
+        )
+        return original_persist(db, current_router, result)
+
+    monkeypatch.setattr(
+        "app.services.company_research.persist_company_profile", assert_clean_entry
+    )
+    sync = sync_company_research(
+        session, "300502", provider=router, include_documents=False
+    )
+    result = router.calls["fundamental.profile"]
+    profile = session.query(CompanyProfile).filter_by(symbol="300502").one()
+    record = session.get(DataQualityRecord, result.quality_record_id)
+    assert sync["sections"]["profile"]["status"] == "success"
+    assert profile.quality_record_id == record.id
+    assert profile.raw_data == result.value
+    assert record.persisted is True
+
+
+def test_sync_company_research_tampered_profile_preserves_existing_cache(session):
+    old_result, old_state = _seed_profile_for_production_path(session)
+
+    def tamper(_router, result):
+        result.value["name"] = "tampered"
+
+    router = _mutating_profile_router(session, tamper)
+    sync = sync_company_research(
+        session, "300502", provider=router, include_documents=False
+    )
+    session.expire_all()
+    stored = session.query(CompanyProfile).filter_by(symbol="300502").one()
+    assert sync["sections"]["profile"]["status"] == "cache_fallback"
+    assert _profile_state(stored) == old_state
+    assert stored.quality_record_id == old_result.quality_record_id
+    assert session.get(
+        DataQualityRecord, router.profile_result.quality_record_id
+    ).persisted is False
+    assert resolve_cached_company_profile(session, "300502").executable is True
+
+
+def test_sync_company_research_rejected_new_profile_creates_no_business_row(session):
+    def tamper(_router, result):
+        result.value["name"] = "tampered"
+
+    router = _mutating_profile_router(session, tamper)
+    sync = sync_company_research(
+        session, "300502", provider=router, include_documents=False
+    )
+    assert sync["sections"]["profile"]["status"] == "unavailable"
+    assert session.query(CompanyProfile).filter_by(symbol="300502").count() == 0
+    record = session.get(DataQualityRecord, router.profile_result.quality_record_id)
+    assert record is not None
+    assert record.persisted is False
+
+
+def test_sync_company_research_row_count_mismatch_preserves_profile(session):
+    _, old_state = _seed_profile_for_production_path(session)
+
+    def alter_row_count(router, result):
+        router.db.get(DataQualityRecord, result.quality_record_id).row_count += 1
+        router.db.flush()
+
+    router = _mutating_profile_router(session, alter_row_count)
+    sync_company_research(session, "300502", provider=router, include_documents=False)
+    session.expire_all()
+    stored = session.query(CompanyProfile).filter_by(symbol="300502").one()
+    assert _profile_state(stored) == old_state
+    assert session.get(
+        DataQualityRecord, router.profile_result.quality_record_id
+    ).persisted is False
+
+
+def test_sync_company_research_digest_mismatch_preserves_profile(session):
+    _, old_state = _seed_profile_for_production_path(session)
+
+    def alter_digest(router, result):
+        router.db.get(
+            DataQualityRecord, result.quality_record_id
+        ).normalized_digest = "0" * 64
+        router.db.flush()
+
+    router = _mutating_profile_router(session, alter_digest)
+    sync_company_research(session, "300502", provider=router, include_documents=False)
+    session.expire_all()
+    stored = session.query(CompanyProfile).filter_by(symbol="300502").one()
+    assert _profile_state(stored) == old_state
+    assert session.get(
+        DataQualityRecord, router.profile_result.quality_record_id
+    ).persisted is False
+
+
+def test_sync_company_research_profile_mark_persisted_failure_rolls_back_business_write(
+    session, monkeypatch
+):
+    _, old_state = _seed_profile_for_production_path(session)
+    router = _mutating_profile_router(session, lambda _router, _result: None)
+    original_mark_persisted = router.mark_persisted
+
+    def fail_profile(result, cached_at=None):
+        if result.capability == "fundamental.profile":
+            raise ValueError("simulated profile mark_persisted failure")
+        return original_mark_persisted(result, cached_at=cached_at)
+
+    monkeypatch.setattr(router, "mark_persisted", fail_profile)
+    sync = sync_company_research(
+        session, "300502", provider=router, include_documents=False
+    )
+    session.expire_all()
+    stored = session.query(CompanyProfile).filter_by(symbol="300502").one()
+    assert sync["sections"]["profile"]["status"] == "cache_fallback"
+    assert _profile_state(stored) == old_state
+    assert session.get(
+        DataQualityRecord, router.profile_result.quality_record_id
+    ).persisted is False

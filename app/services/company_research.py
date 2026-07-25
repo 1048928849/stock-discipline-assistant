@@ -397,35 +397,41 @@ def sync_company_research(
 
     try:
         profile_call = provider.company_profile(symbol)
-        raw_profile = _provider_value(profile_call)
         if isinstance(provider, DataHubRouter):
             exact_calls["profile"] = profile_call
-            profile_source = profile_call.provider_id
+            profile = persist_company_profile(db, provider, profile_call)
         else:
+            # Legacy providers do not expose Router lineage and retain their old upsert.
+            raw_profile = _provider_value(profile_call)
             profile_source = _provider_source(
                 provider, "fundamental.profile", "巨潮资讯公司概况"
             )
-        profile = db.scalar(select(CompanyProfile).where(CompanyProfile.symbol == symbol))
-        values = {
-            "name": str(raw_profile.get("A股简称") or raw_profile.get("公司名称") or symbol),
-            "industry": raw_profile.get("细分行业") or raw_profile.get("所属行业"),
-            "market": raw_profile.get("所属市场"),
-            "main_business": raw_profile.get("主营业务"),
-            "business_scope": raw_profile.get("经营范围"),
-            "website": raw_profile.get("官方网站"),
-            "source": profile_source,
-            "source_url": PROFILE_URL,
-            "raw_data": raw_profile,
-            "fetched_at": fetched_at,
-        }
-        if profile is None:
-            profile = CompanyProfile(symbol=symbol, **values)
-            db.add(profile)
-        else:
-            for key, value in values.items():
-                setattr(profile, key, value)
-        if isinstance(provider, DataHubRouter):
-            profile = persist_company_profile(db, provider, profile_call)
+            profile = db.scalar(
+                select(CompanyProfile).where(CompanyProfile.symbol == symbol)
+            )
+            values = {
+                "name": str(
+                    raw_profile.get("A股简称")
+                    or raw_profile.get("公司名称")
+                    or symbol
+                ),
+                "industry": raw_profile.get("细分行业")
+                or raw_profile.get("所属行业"),
+                "market": raw_profile.get("所属市场"),
+                "main_business": raw_profile.get("主营业务"),
+                "business_scope": raw_profile.get("经营范围"),
+                "website": raw_profile.get("官方网站"),
+                "source": profile_source,
+                "source_url": PROFILE_URL,
+                "raw_data": raw_profile,
+                "fetched_at": fetched_at,
+            }
+            if profile is None:
+                profile = CompanyProfile(symbol=symbol, **values)
+                db.add(profile)
+            else:
+                for key, value in values.items():
+                    setattr(profile, key, value)
         if profile.main_business:
             _upsert_evidence(
                 db,
@@ -433,11 +439,11 @@ def sync_company_research(
                 topic="主营业务",
                 information_type="事实",
                 content=profile.main_business,
-                source_name=profile_source,
+                source_name=profile.source,
                 source_url=PROFILE_URL,
                 source_date=None,
                 raw_data={"field": "主营业务"},
-                fetched_at=fetched_at,
+                fetched_at=profile.fetched_at,
             )
         sections["profile"] = {"status": "success", "rows": 1}
     except Exception as exc:

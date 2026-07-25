@@ -654,26 +654,6 @@ def _ensure_profile(
     try:
         profile_result = provider.company_profile(symbol)
         db.commit()
-        raw = profile_result.require_value()
-        now = datetime.now()
-        values = {
-            "name": str(_pick(raw, "A股简称", "公司名称") or symbol),
-            "industry": _pick(raw, "细分行业", "所属行业"),
-            "market": _pick(raw, "所属市场"),
-            "main_business": _pick(raw, "主营业务"),
-            "business_scope": _pick(raw, "经营范围"),
-            "website": _pick(raw, "官方网站"),
-            "source": "巨潮资讯公司概况（AKShare）",
-            "source_url": "http://www.cninfo.com.cn/new/commonUrl?url=data/stock/stockDetail",
-            "raw_data": raw,
-            "fetched_at": now,
-        }
-        if profile is None:
-            profile = CompanyProfile(symbol=symbol, **values)
-            db.add(profile)
-        else:
-            for key, value in values.items():
-                setattr(profile, key, value)
         profile = persist_company_profile(db, provider, profile_result)
         selected = resolve_cached_company_profile(db, symbol)
         if not selected.executable:
@@ -688,7 +668,7 @@ def _ensure_profile(
             "success" if profile.industry else "partial",
             f"识别为 {profile.name}；行业：{profile.industry or '暂无可靠数据'}。",
             source=profile.source,
-            data_time=now.isoformat(),
+            data_time=profile.fetched_at.isoformat(),
             observed_at=profile_result.observed_at.isoformat()
             if profile_result.observed_at
             else None,
