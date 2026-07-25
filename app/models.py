@@ -392,6 +392,9 @@ class CompanyProfile(TimestampMixin, Base):
     source_url: Mapped[str | None] = mapped_column(String(500))
     raw_data: Mapped[dict | None] = mapped_column(JSON)
     fetched_at: Mapped[datetime] = mapped_column(DateTime)
+    quality_record_id: Mapped[int | None] = mapped_column(
+        ForeignKey("data_quality_records.id"), nullable=True, index=True
+    )
 
 
 class CompanyFinancialPeriod(Base):
@@ -507,6 +510,9 @@ class CompanyResearchRefresh(Base):
     provider_observations: Mapped[list | None] = mapped_column(JSON)
     conflict_fields: Mapped[list | None] = mapped_column(JSON)
     error: Mapped[str | None] = mapped_column(Text)
+    quality_record_id: Mapped[int | None] = mapped_column(
+        ForeignKey("data_quality_records.id"), nullable=True, index=True
+    )
 
 
 class RuleSet(TimestampMixin, Base):
