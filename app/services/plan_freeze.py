@@ -7,35 +7,40 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.data_hub.quality import observation_is_stale, policy_for
-from app.domain.models import DecisionPackage
+from app.domain.models import (
+    MARKET_EVIDENCE_CAPABILITIES,
+    DecisionPackage,
+)
 from app.errors import AppError
 from app.models import (
     CompanyProfile,
     CompanyResearchRefresh,
-    DataQualityRecord,
-    MarketDailyBar,
 )
 from app.schemas_workflow import TradePlanPreviewRequest, TradePlanSaveRequest
+from app.services.market_cache import resolve_market_quality_binding
 
 
 MAX_ANALYSIS_AGE = timedelta(hours=24)
-CAPABILITY_POLICY = {
-    "stock_daily_bars": "market.daily.qfq",
-    "market_quote": "market.quote.realtime",
-    "benchmark_daily_bars": "market.index_daily",
-    "sector_daily_bars": "market.sector_daily",
-    "company_profile": "fundamental.profile",
-    "announcements": "announcement.catalog",
-}
-
-
 def _validated_package(value: dict[str, Any] | None) -> DecisionPackage:
     if not value:
         raise AppError(
             422,
             "DECISION_PACKAGE_REQUIRED",
             "A valid DecisionPackage is required to freeze a formal trade plan.",
+        )
+    raw_evidence = value.get("evidence", []) if isinstance(value, dict) else []
+    required_market_evidence = [
+        item
+        for item in raw_evidence
+        if isinstance(item, dict)
+        and item.get("required")
+        and item.get("capability") in MARKET_EVIDENCE_CAPABILITIES
+    ]
+    if any(not item.get("market_quality_binding") for item in required_market_evidence):
+        raise AppError(
+            422,
+            "DECISION_PACKAGE_MARKET_BINDING_REQUIRED",
+            "Legacy DecisionPackage has no exact market quality binding; run a new analysis.",
         )
     try:
         package = DecisionPackage.model_validate(value)
@@ -84,24 +89,21 @@ def freeze_trade_plan(
         )
     now = datetime.now()
     for evidence in package.evidence:
-        policy_name = CAPABILITY_POLICY.get(evidence.capability)
-        if not evidence.required or not policy_name:
+        if not evidence.required or evidence.capability not in MARKET_EVIDENCE_CAPABILITIES:
             continue
-        observed_at = evidence.observed_at
-        if observed_at:
-            try:
-                parsed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
-            except ValueError:
-                parsed = datetime.fromisoformat(f"{observed_at[:10]}T00:00:00")
-        else:
-            parsed = None
-        if observation_is_stale(parsed, policy_for(policy_name), now=now):
+        validation = resolve_market_quality_binding(
+            db,
+            evidence.market_quality_binding,
+            evaluated_at=now,
+        )
+        if not validation.executable:
             raise AppError(
                 422,
-                "DECISION_PACKAGE_EXPIRED",
-                f"Required Evidence {evidence.evidence_id} is no longer fresh.",
+                validation.error_code or "MARKET_BINDING_NOT_EXECUTABLE",
+                f"Market Evidence {evidence.evidence_id} changed: {validation.reason}",
             )
 
+    # Company profile and announcement checks remain on the legacy C.2 path.
     changed_after_analysis = [
         db.scalar(
             select(CompanyProfile).where(
@@ -114,19 +116,6 @@ def freeze_trade_plan(
                 CompanyResearchRefresh.symbol == request.symbol,
                 CompanyResearchRefresh.section == "announcements",
                 CompanyResearchRefresh.checked_at > package.generated_at,
-            )
-        ),
-        db.scalar(
-            select(MarketDailyBar).where(
-                MarketDailyBar.symbol.in_((request.symbol, "CSI000300")),
-                MarketDailyBar.fetched_at > package.generated_at,
-            )
-        ),
-        db.scalar(
-            select(DataQualityRecord).where(
-                DataQualityRecord.symbol == request.symbol,
-                DataQualityRecord.created_at > package.generated_at,
-                DataQualityRecord.quality_status.in_(("CONFLICTED", "STALE", "MISSING")),
             )
         ),
     ]

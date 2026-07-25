@@ -19,6 +19,7 @@ from app.domain.quality_subject import (
     SubjectRef,
     canonical_semantic_key,
 )
+from app.domain.models import MarketQualityBinding
 from app.models import DataQualityRecord, MarketDailyBar, MarketQuote
 
 
@@ -51,6 +52,16 @@ class CachedSeriesSelection:
     executable: bool
     blocking_reason: str | None
     structure_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class BindingValidationResult:
+    binding: MarketQualityBinding
+    executable: bool
+    error_code: str | None
+    reason: str | None
+    selected_quality_record_id: int | None
+    selected_observed_at: datetime | date | None
 
 
 @dataclass(frozen=True)
@@ -693,10 +704,119 @@ def resolve_cached_series(
     )
 
 
+def resolve_market_quality_binding(
+    db: Session,
+    binding: MarketQualityBinding,
+    *,
+    evaluated_at: datetime | None = None,
+) -> BindingValidationResult:
+    subject = SubjectRef(
+        subject_type=binding.subject_type,
+        subject_id=binding.subject_id,
+        semantic_key=binding.semantic_key,
+    )
+    record = db.get(DataQualityRecord, binding.quality_record_id)
+    if record is None or not record.persisted:
+        return BindingValidationResult(
+            binding, False, "MARKET_BINDING_NOT_EXECUTABLE",
+            "bound quality lineage is missing or was not persisted", None, None,
+        )
+    if not _scope_matches(
+        record, capability=binding.data_capability, subject=subject
+    ):
+        return BindingValidationResult(
+            binding, False, "MARKET_BINDING_SCOPE_MISMATCH",
+            "bound quality lineage scope does not match the package", None, None,
+        )
+
+    if binding.data_capability == "market.quote.realtime":
+        parts = canonical_semantic_key(binding.semantic_key).split("/")
+        if len(parts) != 2 or parts[0] != "realtime" or not parts[1]:
+            return BindingValidationResult(
+                binding, False, "MARKET_BINDING_SCOPE_MISMATCH",
+                "realtime quote binding has invalid semantic scope", None, None,
+            )
+        selection = resolve_cached_quote(
+            db,
+            symbol=subject.subject_id,
+            capability=binding.data_capability,
+            price_unit=parts[1],
+            evaluated_at=evaluated_at,
+        )
+        selected_subject = selection.subject
+    else:
+        policies = {
+            "market.daily.qfq": ("stock", 250),
+            "market.index_daily": ("index", 60),
+            "market.sector_daily": ("sector", 60),
+        }
+        policy = policies.get(binding.data_capability)
+        if policy is None or subject.subject_type != policy[0]:
+            return BindingValidationResult(
+                binding, False, "MARKET_BINDING_SCOPE_MISMATCH",
+                "market series binding has invalid capability or subject type", None, None,
+            )
+        try:
+            adjustment, price_unit, volume_unit = _series_semantics(subject)
+        except ValueError:
+            return BindingValidationResult(
+                binding, False, "MARKET_BINDING_SCOPE_MISMATCH",
+                "market series binding has invalid semantic scope", None, None,
+            )
+        selection = resolve_cached_series(
+            db,
+            cache_symbol=subject.subject_id,
+            capability=binding.data_capability,
+            subject=subject,
+            adjustment=adjustment,
+            price_unit=price_unit,
+            volume_unit=volume_unit,
+            min_rows=policy[1],
+            evaluated_at=evaluated_at,
+        )
+        selected_subject = selection.subject
+
+    if selected_subject != subject:
+        return BindingValidationResult(
+            binding, False, "MARKET_BINDING_SCOPE_MISMATCH",
+            "current market selection has a different subject scope",
+            selection.quality_record_id, selection.observed_at,
+        )
+    if not selection.executable:
+        return BindingValidationResult(
+            binding, False, "MARKET_BINDING_NOT_EXECUTABLE",
+            selection.blocking_reason or "bound market lineage is not executable",
+            selection.quality_record_id, selection.observed_at,
+        )
+    if selection.quality_record_id != binding.quality_record_id:
+        return BindingValidationResult(
+            binding, False, "MARKET_BINDING_CHANGED",
+            "current market selection uses a different quality lineage",
+            selection.quality_record_id, selection.observed_at,
+        )
+    if _as_datetime(record.observed_at) != _as_datetime(binding.observed_at):
+        return BindingValidationResult(
+            binding, False, "MARKET_BINDING_CHANGED",
+            "bound quality lineage has a different observed time",
+            selection.quality_record_id, selection.observed_at,
+        )
+    if _as_datetime(selection.observed_at) != _as_datetime(binding.observed_at):
+        return BindingValidationResult(
+            binding, False, "MARKET_BINDING_CHANGED",
+            "current market selection has a different observed time",
+            selection.quality_record_id, selection.observed_at,
+        )
+    return BindingValidationResult(
+        binding, True, None, None,
+        selection.quality_record_id, selection.observed_at,
+    )
+
+
 __all__ = [
     "CanonicalSeriesRow",
     "CachedQuoteSelection",
     "CachedSeriesSelection",
+    "BindingValidationResult",
     "canonical_series_row",
     "effective_quality_metadata",
     "mapping_series_bars",
@@ -704,5 +824,6 @@ __all__ = [
     "replace_market_series",
     "resolve_cached_quote",
     "resolve_cached_series",
+    "resolve_market_quality_binding",
     "validate_series_for_persistence",
 ]
