@@ -40,6 +40,10 @@ from app.services.market_cache import (
     persist_market_quote,
     replace_market_series,
 )
+from app.services.research_cache import (
+    persist_announcement_catalog,
+    persist_company_profile,
+)
 from app.services.trade_plan_generator import generate_trade_plan_preview
 
 
@@ -308,61 +312,83 @@ class PatternRefreshProvider(BindingScenarioProvider):
         ]
 
 
+class SeedResearchProvider(DataProvider):
+    metadata = ProviderMetadata(
+        provider_id="research-seed",
+        supported_capabilities=("fundamental.profile", "announcement.catalog"),
+        priority=1,
+    )
+
+    def health_check(self, probe: bool = False):
+        return {"status": "healthy"}
+
+    def company_profile(self, symbol):
+        return {
+            "name": "测试公司",
+            "industry": "测试行业",
+            "market": "创业板",
+            "main_business": "测试业务",
+        }
+
+    def company_announcements(self, symbol, start, end):
+        return [
+            {
+                "公告标题": "测试公司最新公告",
+                "公告日期": end,
+                "公告链接": "https://example.test/announcement",
+                "目录来源": "exchange_test",
+            }
+        ]
+
+
+class ResearchBindingScenarioProvider(SeedResearchProvider):
+    def __init__(
+        self,
+        provider_id,
+        *,
+        profile_name="测试公司",
+        announcements=None,
+        fail=False,
+        priority=1,
+    ):
+        self.metadata = ProviderMetadata(
+            provider_id=provider_id,
+            supported_capabilities=("fundamental.profile", "announcement.catalog"),
+            priority=priority,
+        )
+        self.profile_name = profile_name
+        self.announcements = announcements
+        self.fail = fail
+
+    def company_profile(self, symbol):
+        if self.fail:
+            raise ProviderUnavailableError("profile unavailable")
+        value = super().company_profile(symbol)
+        return {**value, "name": self.profile_name}
+
+    def company_announcements(self, symbol, start, end):
+        if self.fail:
+            raise ProviderUnavailableError("catalog unavailable")
+        if self.announcements is not None:
+            return self.announcements
+        return super().company_announcements(symbol, start, end)
+
+
 def seed_profile(session):
-    session.add(
-        CompanyProfile(
-            symbol="300502",
-            name="测试公司",
-            industry="测试行业",
-            market="创业板",
-            main_business="测试业务",
-            business_scope=None,
-            website=None,
-            source="巨潮资讯",
-            source_url="https://example.test/profile",
-            raw_data={},
-            fetched_at=datetime.now(),
-        )
-    )
-    session.add(
-        CompanyAnnouncement(
-            symbol="300502",
-            title="测试公司最新公告",
-            announcement_category="其他公告",
-            risk_level="无",
-            published_date=date.today(),
-            catalog_source="exchange_test",
-            exchange="SZSE",
-            url="https://example.test/announcement",
-            source_document_url=None,
-            raw_data={},
-            fetched_at=datetime.now(),
-        )
-    )
-    now = datetime.now()
-    session.add(
-        CompanyResearchRefresh(
-            symbol="300502",
-            section="announcements",
-            status="success",
-            provider_id="exchange_test",
-            source_name="exchange_test",
-            row_count=1,
-            cache_used=False,
-            last_attempt_at=now,
-            last_success_at=now,
-            data_date=date.today(),
-            stale_after=now + timedelta(hours=24),
-            quality_status="SINGLE_SOURCE",
-            observed_at=now,
-            fetched_at=now,
-            checked_at=now,
-            scan_start=now,
-            scan_end=now,
-            normalized_digest="a" * 64,
-            provider_observations=[],
-            conflict_fields=[],
-        )
+    registry = ProviderRegistry()
+    registry.register(SeedResearchProvider())
+    router = DataHubRouter(session, registry)
+    profile_result = router.company_profile("300502")
+    persist_company_profile(session, router, profile_result)
+    start = date.today() - timedelta(days=3 * 366)
+    end = date.today()
+    announcement_result = router.company_announcements("300502", start, end)
+    persist_announcement_catalog(
+        session,
+        router,
+        announcement_result,
+        start=start,
+        end=end,
     )
     session.commit()
 
@@ -925,6 +951,218 @@ def _confirm_bound_plan(client, analyzed):
     return client.post(
         f"/api/v1/trade-plan-generator/analyze/{analyzed['run_id']}/confirm"
     )
+
+
+def _research_evidence(analyzed):
+    return {
+        item["capability"]: item
+        for item in analyzed["decision_package"]["evidence"]
+        if item["capability"] in {"company_profile", "announcements"}
+    }
+
+
+def test_profile_evidence_contains_exact_source_binding(
+    client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    evidence = _research_evidence(analyzed)["company_profile"]
+    binding = evidence["source_quality_binding"]
+    profile = session.query(CompanyProfile).filter_by(symbol="300502").one()
+    assert binding["data_capability"] == "fundamental.profile"
+    assert binding["quality_record_id"] == profile.quality_record_id
+    assert binding["semantic_key"] == "profile"
+
+
+def test_announcement_evidence_contains_exact_source_binding(
+    client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    evidence = _research_evidence(analyzed)["announcements"]
+    binding = evidence["source_quality_binding"]
+    refresh = session.query(CompanyResearchRefresh).filter_by(
+        symbol="300502", section="announcements"
+    ).one()
+    assert binding["data_capability"] == "announcement.catalog"
+    assert binding["quality_record_id"] == refresh.quality_record_id
+    assert binding["checked_at"] == binding["observed_at"]
+
+
+def test_source_binding_is_included_in_evidence_digest(
+    client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    package = DecisionPackage.model_validate(analyzed["decision_package"])
+    evidence = list(package.evidence)
+    target = next(item for item in evidence if item.capability == "company_profile")
+    changed_binding = target.source_quality_binding.model_copy(
+        update={"quality_record_id": target.source_quality_binding.quality_record_id + 1}
+    )
+    evidence[evidence.index(target)] = target.model_copy(
+        update={"source_quality_binding": changed_binding}
+    )
+    changed = package.model_copy(update={"evidence": evidence})
+    assert changed.evidence_digest_value() != package.evidence_digest
+
+
+def test_source_binding_is_included_in_package_hash(client, session, monkeypatch):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    package = DecisionPackage.model_validate(analyzed["decision_package"])
+    evidence = list(package.evidence)
+    target = next(item for item in evidence if item.capability == "company_profile")
+    changed_binding = target.source_quality_binding.model_copy(
+        update={"quality_record_id": target.source_quality_binding.quality_record_id + 1}
+    )
+    evidence[evidence.index(target)] = target.model_copy(
+        update={"source_quality_binding": changed_binding}
+    )
+    changed = package.model_copy(update={"evidence": evidence})
+    assert changed.package_hash_value() != package.package_hash
+
+
+@pytest.mark.parametrize("capability", ["company_profile", "announcements"])
+def test_flat_source_fields_cannot_create_binding(
+    client, session, monkeypatch, capability
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    payload = analyzed["decision_package"]
+    target = next(item for item in payload["evidence"] if item["capability"] == capability)
+    binding = target.pop("source_quality_binding")
+    target.update(binding)
+    with pytest.raises(ValueError):
+        DecisionPackage.model_validate(payload)
+
+
+def test_legacy_package_without_source_binding_cannot_confirm(
+    client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    run = session.get(PlanAnalysisRun, analyzed["run_id"])
+    snapshot = dict(run.result_snapshot)
+    package = dict(snapshot["decision_package"])
+    package["evidence"] = [dict(item) for item in package["evidence"]]
+    for item in package["evidence"]:
+        if item["capability"] in {"company_profile", "announcements"}:
+            item.pop("source_quality_binding", None)
+    snapshot["decision_package"] = package
+    run.result_snapshot = snapshot
+    session.commit()
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "DECISION_PACKAGE_SOURCE_BINDING_REQUIRED"
+
+
+def _add_research_conflict(session, capability):
+    announcements = [
+        {
+            "公告标题": "冲突公告",
+            "公告日期": date.today().isoformat(),
+            "公告链接": "https://example.test/conflict",
+        }
+    ]
+    router = _router_for_binding(
+        session,
+        ResearchBindingScenarioProvider("research-a", priority=1),
+        ResearchBindingScenarioProvider(
+            "research-b",
+            profile_name="不同公司",
+            announcements=announcements,
+            priority=2,
+        ),
+    )
+    if capability == "company_profile":
+        result = router.company_profile("300502")
+    else:
+        result = router.company_announcements(
+            "300502", date.today() - timedelta(days=3 * 366), date.today()
+        )
+    assert result.quality_status.value == "CONFLICTED"
+    session.commit()
+
+
+@pytest.mark.parametrize("capability", ["company_profile", "announcements"])
+def test_research_conflict_after_analysis_blocks_confirm(
+    client, session, monkeypatch, capability
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    _add_research_conflict(session, capability)
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert session.query(TradePlan).count() == 0
+
+
+def test_missing_research_attempt_does_not_block_fresh_bound_cache(
+    client, session, monkeypatch
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    router = _router_for_binding(
+        session, ResearchBindingScenarioProvider("missing", fail=True)
+    )
+    assert router.company_profile("300502").quality_status.value == "MISSING"
+    assert router.company_announcements(
+        "300502", date.today() - timedelta(days=3 * 366), date.today()
+    ).quality_status.value == "MISSING"
+    session.commit()
+    assert _confirm_bound_plan(client, analyzed).status_code == 201
+
+
+def test_empty_scan_can_freeze_formal_plan(client, session, monkeypatch):
+    account = create_account(client, assets="300000", cash="300000")
+    seed_pattern(session)
+    router = _router_for_binding(
+        session,
+        ResearchBindingScenarioProvider("empty-catalog", announcements=[]),
+    )
+    profile_result = router.company_profile("300502")
+    persist_company_profile(session, router, profile_result)
+    start, end = date.today() - timedelta(days=3 * 366), date.today()
+    catalog_result = router.company_announcements("300502", start, end)
+    persist_announcement_catalog(
+        session, router, catalog_result, start=start, end=end
+    )
+    session.commit()
+    patch_benchmarks(monkeypatch)
+    analyzed = client.post(
+        "/api/v1/trade-plan-generator/analyze",
+        json={
+            "symbol": "300502",
+            "position_mode": "空仓",
+            "account_id": account["id"],
+            "enable_ai": False,
+        },
+    ).json()
+    company_risk = next(
+        step for step in analyzed["steps"] if step["code"] == "company_risk"
+    )
+    assert "扫描成功" in company_risk["detail"]
+    assert _confirm_bound_plan(client, analyzed).status_code == 201
+
+
+@pytest.mark.parametrize("capability", ["company_profile", "announcements"])
+def test_new_persisted_research_lineage_requires_reanalysis(
+    client, session, monkeypatch, capability
+):
+    analyzed = _analyze_bound_plan(client, session, monkeypatch)
+    router = _router_for_binding(
+        session,
+        ResearchBindingScenarioProvider(
+            "research-replacement",
+            profile_name="替换公司",
+            announcements=[],
+        ),
+    )
+    if capability == "company_profile":
+        result = router.company_profile("300502")
+        persist_company_profile(session, router, result)
+    else:
+        start, end = date.today() - timedelta(days=3 * 366), date.today()
+        result = router.company_announcements("300502", start, end)
+        persist_announcement_catalog(
+            session, router, result, start=start, end=end
+        )
+    session.commit()
+    response = _confirm_bound_plan(client, analyzed)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "SOURCE_BINDING_CHANGED"
 
 
 def _router_for_binding(session, *providers):

@@ -9,15 +9,17 @@ from app.data_hub.market_subjects import stock_daily_subject
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
 from app.models import (
-    CompanyAnnouncement,
     CompanyProfile,
-    CompanyResearchRefresh,
     DataQualityRecord,
     MarketDailyBar,
     MarketQuote,
 )
 from app.providers.llm_provider import OpenAICompatibleProvider
 from app.services.market_cache import persist_market_quote, replace_market_series
+from app.services.research_cache import (
+    persist_announcement_catalog,
+    persist_company_profile,
+)
 from app.services.trade_plan_ai import validate_ai_output
 from app.services.trade_plan_generator import _floor_lot, ensure_generator_rule_version
 
@@ -258,60 +260,51 @@ def _holding_preview(client, session, scenario: str, **holding_changes):
 
 
 def seed_governed_analysis(session, monkeypatch):
-    now = datetime.now()
-    session.add(
-        CompanyProfile(
-            symbol="300502",
-            name="测试公司",
-            industry="测试行业",
-            market="创业板",
-            main_business="测试业务",
-            business_scope=None,
-            website=None,
-            source="test",
-            source_url="https://example.test/profile",
-            raw_data={},
-            fetched_at=datetime.now(),
+    class GovernedResearchProvider(DataProvider):
+        metadata = ProviderMetadata(
+            provider_id="governed-research",
+            supported_capabilities=(
+                "fundamental.profile",
+                "announcement.catalog",
+            ),
+            priority=1,
         )
-    )
-    session.add(
-        CompanyAnnouncement(
-            symbol="300502",
-            title="最新公告",
-            announcement_category="其他公告",
-            risk_level="无",
-            published_date=date.today(),
-            catalog_source="exchange_test",
-            exchange="SZSE",
-            url="https://example.test/announcement",
-            source_document_url=None,
-            raw_data={},
-            fetched_at=datetime.now(),
-        )
-    )
-    session.add(
-        CompanyResearchRefresh(
-            symbol="300502",
-            section="announcements",
-            status="success",
-            provider_id="exchange_test",
-            source_name="exchange_test",
-            row_count=1,
-            cache_used=False,
-            last_attempt_at=now,
-            last_success_at=now,
-            data_date=date.today(),
-            stale_after=now + timedelta(hours=24),
-            quality_status="SINGLE_SOURCE",
-            observed_at=now,
-            fetched_at=now,
-            checked_at=now,
-            scan_start=now,
-            scan_end=now,
-            normalized_digest="a" * 64,
-            provider_observations=[],
-            conflict_fields=[],
-        )
+
+        def health_check(self, probe: bool = False):
+            return {"status": "healthy"}
+
+        def company_profile(self, symbol):
+            return {
+                "name": "测试公司",
+                "industry": "测试行业",
+                "market": "创业板",
+                "main_business": "测试业务",
+            }
+
+        def company_announcements(self, symbol, start, end):
+            return [
+                {
+                    "公告标题": "最新公告",
+                    "公告日期": end.isoformat(),
+                    "公告链接": "https://example.test/announcement",
+                    "目录来源": "exchange_test",
+                }
+            ]
+
+    registry = ProviderRegistry()
+    registry.register(GovernedResearchProvider())
+    router = DataHubRouter(session, registry)
+    profile_result = router.company_profile("300502")
+    persist_company_profile(session, router, profile_result)
+    start = date.today() - timedelta(days=3 * 366)
+    end = date.today()
+    announcement_result = router.company_announcements("300502", start, end)
+    persist_announcement_catalog(
+        session,
+        router,
+        announcement_result,
+        start=start,
+        end=end,
     )
     session.commit()
     rows = {

@@ -117,6 +117,39 @@ def test_0010_downgrade_and_reupgrade(tmp_path):
     assert {"subject_type", "subject_id", "semantic_key", "supersedes_record_id"} <= columns
     assert "data_quality_subject_heads" in tables
 
+
+def test_0011_research_lineage_roundtrip(tmp_path):
+    database = tmp_path / "research-lineage-roundtrip.db"
+    _alembic(database, "upgrade", "20260724_0010")
+    _alembic(database, "upgrade", "20260725_0011")
+    with sqlite3.connect(database) as connection:
+        profile_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(company_profiles)")
+        }
+        refresh_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(company_research_refreshes)")
+        }
+        profile_fks = list(connection.execute("PRAGMA foreign_key_list(company_profiles)"))
+        refresh_fks = list(
+            connection.execute("PRAGMA foreign_key_list(company_research_refreshes)")
+        )
+    assert "quality_record_id" in profile_columns
+    assert "quality_record_id" in refresh_columns
+    assert any(row[2] == "data_quality_records" and row[3] == "quality_record_id" for row in profile_fks)
+    assert any(row[2] == "data_quality_records" and row[3] == "quality_record_id" for row in refresh_fks)
+
+    _alembic(database, "downgrade", "20260724_0010")
+    with sqlite3.connect(database) as connection:
+        assert "quality_record_id" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(company_profiles)")
+        }
+        assert "quality_record_id" not in {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(company_research_refreshes)")
+        }
+    _alembic(database, "upgrade", "head")
+
     _alembic(database, "downgrade", "20260724_0009")
     with sqlite3.connect(database) as connection:
         columns = {
