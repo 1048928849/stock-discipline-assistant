@@ -19,7 +19,7 @@
     return `<div class="product-quality-grid">${items.map(item => `
       <article class="quality-item ${qualityTone(item.quality_status)}">
         <div><b>${text(item.capability)}</b><span class="quality-code">${text(item.quality_status)}</span></div>
-        <small>${text(item.action)} · ${item.cache_used ? "缓存" : "本次数据"}${item.fallback_used ? " · 回退" : ""}</small>
+        <small><b>${item.required ? "REQUIRED" : "OPTIONAL"}</b> · ${text(item.action)} · ${item.cache_used ? "缓存" : "本次数据"}${item.fallback_used ? " · 回退" : ""}</small>
         <span>${text(item.reason)}</span>
       </article>`).join("")}</div>`;
   }
@@ -32,6 +32,25 @@
         <span>${text(item.capability)}</span>
         <small>${text(item.source_name)} · ${text(item.observed_at)}</small>
       </article>`).join("")}</div>`;
+  }
+
+  function renderStrategyBindings(data) {
+    const bindings = data.decision_package?.strategy_bindings || [];
+    if (!bindings.length) return "";
+    return `
+      <section class="product-band">
+        <div class="section-heading"><div><small>STRATEGY BINDING</small><h3>策略执行绑定</h3></div><span>${bindings.length}</span></div>
+        <div class="strategy-binding-list">${bindings.map(binding => `
+          <article>
+            <div><b>${text(binding.strategy_id)}@${text(binding.strategy_version)}</b><span class="quality-code">BOUND</span></div>
+            <dl>
+              <dt>implementation_hash</dt><dd>${text(binding.implementation_hash)}</dd>
+              <dt>parameter_hash</dt><dd>${text(binding.parameter_hash)}</dd>
+              <dt>signal_hash</dt><dd>${text(binding.signal_hash)}</dd>
+              <dt>binding_hash</dt><dd>${text(binding.binding_hash)}</dd>
+            </dl>
+          </article>`).join("")}</div>
+      </section>`;
   }
 
   function renderProductOneClick(data, result, actions) {
@@ -95,6 +114,7 @@
           <article><h4>下一交易日观察</h4><ul>${list(trade.next_session_observations)}</ul></article>
         </div>
       </section>
+      ${renderStrategyBindings(data)}
       <section class="product-band">
         <div class="section-heading"><div><small>DATA QUALITY</small><h3>数据质量与 Evidence</h3></div><span>${text(decision_package.quality_status)}</span></div>
         ${renderRequiredData(data)}${renderEvidence(data)}

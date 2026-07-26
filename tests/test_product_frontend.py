@@ -17,6 +17,12 @@ def test_product_renderer_is_loaded_after_legacy_application_script():
     assert html.index('/static/app.js') < html.index('/static/product-v1.js')
 
 
+def test_product_assets_have_a_release_cache_key():
+    html = TEMPLATE.read_text(encoding="utf-8")
+    assert '/static/product-v1.css?v=20260726' in html
+    assert '/static/product-v1.js?v=20260726' in html
+
+
 def test_product_renderer_consumes_complete_api_contract_without_rule_math():
     source = PRODUCT_JS.read_text(encoding="utf-8")
     for field in (
@@ -48,6 +54,31 @@ def test_product_renderer_keeps_confirm_authority_on_server():
     source = PRODUCT_JS.read_text(encoding="utf-8")
     assert "confirm-one-click-plan" in source
     assert "freeze_allowed" in source
+
+
+def test_product_renderer_displays_strategy_binding_lineage():
+    source = PRODUCT_JS.read_text(encoding="utf-8")
+    for field in (
+        "strategy_bindings",
+        "strategy_id",
+        "strategy_version",
+        "implementation_hash",
+        "parameter_hash",
+        "signal_hash",
+        "binding_hash",
+    ):
+        assert field in source
+
+
+def test_product_renderer_labels_optional_quality_items():
+    source = PRODUCT_JS.read_text(encoding="utf-8")
+    assert 'item.required ? "REQUIRED" : "OPTIONAL"' in source
+
+
+def test_product_layout_wraps_long_provider_failures():
+    source = PRODUCT_CSS.read_text(encoding="utf-8")
+    assert ".pipeline-step small" in source
+    assert "overflow-wrap:anywhere" in source
 
 
 def test_product_mobile_layout_keeps_primary_navigation_compact():
