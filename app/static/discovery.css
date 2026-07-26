@@ -1,0 +1,14 @@
+.opportunity-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+.opportunity-heading h2{margin:3px 0}.discovery-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:18px 0}
+.discovery-summary article,.discovery-industry,.discovery-candidate{border:1px solid var(--line);border-radius:6px;background:#fff;padding:14px}
+.opportunity-layout{display:grid;grid-template-columns:minmax(250px,.65fr) minmax(0,1.65fr);gap:22px}
+.discovery-industries,.discovery-candidates{display:grid;gap:10px}.discovery-industry{display:grid;gap:5px;border-left:5px solid #557568}
+.discovery-industry.blocked,.discovery-candidate.blocked{border-left-color:var(--rise)}.discovery-candidate{display:grid;gap:12px;border-left:5px solid var(--gold)}
+.discovery-candidate header{display:flex;justify-content:space-between;gap:12px}.discovery-candidate h4{margin:0}.candidate-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+.candidate-metrics span{display:grid;gap:3px;padding:8px;background:#f5f7f6;overflow-wrap:anywhere}.candidate-metrics small{color:var(--muted)}
+.candidate-reasons,.candidate-risks{display:flex;flex-wrap:wrap;gap:6px}.candidate-reasons span,.candidate-risks span{font-size:12px;border:1px solid var(--line);padding:3px 6px;border-radius:4px}
+.candidate-risks span{border-color:#c9897d;color:#8d2d20}.candidate-actions{display:flex;flex-wrap:wrap;gap:8px}.candidate-actions button{min-height:38px}
+#candidate-promote-dialog{width:min(560px,calc(100% - 24px));border:1px solid var(--line);border-radius:6px;padding:20px}#candidate-promote-dialog::backdrop{background:rgba(24,31,29,.45)}
+#candidate-promote-form{display:grid;gap:14px}#candidate-promote-form label{display:grid;gap:6px}#candidate-promote-form textarea{min-height:90px}
+@media(max-width:900px){.opportunity-layout{grid-template-columns:1fr}.discovery-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:520px){.opportunity-heading{align-items:stretch;flex-direction:column}.discovery-summary{grid-template-columns:1fr 1fr}.candidate-metrics{grid-template-columns:1fr 1fr}.discovery-candidate header{flex-direction:column}.candidate-actions button{flex:1 1 120px}.opportunity-layout{gap:12px}}
