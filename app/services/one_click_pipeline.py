@@ -63,6 +63,10 @@ from app.services.research_cache import (
     resolve_cached_company_profile,
 )
 from app.services.plan_freeze import freeze_trade_plan
+from app.services.product_pipeline import (
+    run_product_pipeline,
+    should_run_product_pipeline,
+)
 from app.services.trade_plan_generator import (
     GENERATOR_PARAMETERS,
     generate_trade_plan_preview,
@@ -1397,6 +1401,40 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
             ai_result=ai_result,
             orchestrator_id=research_orchestrator.orchestrator_id,
         )
+        product_result = None
+        if should_run_product_pipeline(db, provider, payload.symbol):
+            risk_levels = {
+                str(item.get("risk_level"))
+                for item in research.get("risk_events", [])
+            }
+            announcement_risk = (
+                "HIGH"
+                if "红" in risk_levels
+                else "MEDIUM"
+                if "黄" in risk_levels
+                else "LOW"
+                if research.get("announcement_scan_completed")
+                else "UNKNOWN"
+            )
+            product_result = run_product_pipeline(
+                db,
+                provider,
+                symbol=payload.symbol,
+                industry=getattr(profile, "industry", None),
+                analysis_started_at=analysis_started_at,
+                force_refresh=payload.refresh,
+                preview=preview,
+                legacy_evidence=tuple(decision_package.evidence),
+                announcement_risk=announcement_risk,
+            )
+            decision_package = build_decision_package(
+                preview=preview,
+                decision=decision,
+                steps=steps,
+                ai_result=ai_result,
+                orchestrator_id=research_orchestrator.orchestrator_id,
+                product_result=product_result.model_dump(mode="json"),
+            )
         if decision_package.quality_status.blocks_execution and preview["status"] == "READY":
             preview = deepcopy(preview)
             preview["deterministic_rule_status"] = "READY"
@@ -1442,6 +1480,20 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
                 else "；".join(decision_package.blocked_reasons)
             ),
         }
+        if product_result is not None:
+            result.update(
+                {
+                    "required_data": product_result.required_data.model_dump(mode="json"),
+                    "data_completeness": str(product_result.data_completeness),
+                    "market_regime": product_result.market_regime.model_dump(mode="json"),
+                    "industry_context": product_result.industry_context.model_dump(mode="json"),
+                    "concept_chain_context": product_result.concept_chain_context.model_dump(
+                        mode="json"
+                    ),
+                    "technical_context": product_result.technical_context.model_dump(mode="json"),
+                    "trade_decision": product_result.trade_decision.model_dump(mode="json"),
+                }
+            )
         run.status = "success"
         run.pipeline_steps = steps
         run.result_snapshot = result

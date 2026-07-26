@@ -48,6 +48,21 @@ from app.services.workflow import ensure_default_rule_version
 
 pytestmark = pytest.mark.mysql_integration
 _TEST_DATABASE_NAME = re.compile(r"^stock_discipline_test_[0-9A-Za-z_]+$")
+_PRODUCT_TABLES = (
+    "market_intraday_bars",
+    "market_turnover_snapshots",
+    "market_breadth_snapshots",
+    "market_amount_snapshots",
+    "industry_market_snapshots",
+    "industry_constituent_snapshots",
+    "market_regime_snapshots",
+    "concepts",
+    "company_concepts",
+    "industry_chains",
+    "industry_chain_nodes",
+    "company_chain_positions",
+    "mapping_evidence",
+)
 
 
 def _safe_error(exc: BaseException) -> str:
@@ -296,7 +311,9 @@ def _seed_mysql_analysis_runs(
                     enable_ai=False,
                 ),
             )
-            assert result["decision_package"]["freeze_allowed"] is True
+            assert result["decision_package"]["freeze_allowed"] is True, result[
+                "decision_package"
+            ]["blocked_reasons"]
             run_ids.append(result["run_id"])
         return account.id, run_ids
 
@@ -340,10 +357,36 @@ def test_mysql8_version_empty_upgrade_and_idempotency(mysql_database: URL):
     assert session_tz
     _alembic(mysql_database, "upgrade", "head")
     current = _alembic(mysql_database, "current")
-    assert "20260725_0011" in current.stdout
+    assert "20260726_0012" in current.stdout
     heads = _alembic(mysql_database, "heads")
-    assert "20260725_0011" in heads.stdout
+    assert "20260726_0012" in heads.stdout
     _alembic(mysql_database, "upgrade", "head")
+
+
+def test_mysql_0012_product_tables_legacy_upgrade_round_trip(mysql_database: URL):
+    _alembic(mysql_database, "upgrade", "20260725_0011")
+    engine = create_engine(mysql_database, pool_pre_ping=True)
+    with engine.begin() as connection:
+        connection.exec_driver_sql("SET FOREIGN_KEY_CHECKS=0")
+        for table in reversed(_PRODUCT_TABLES):
+            connection.exec_driver_sql(f"DROP TABLE IF EXISTS `{table}`")
+        connection.exec_driver_sql("SET FOREIGN_KEY_CHECKS=1")
+    _alembic(mysql_database, "upgrade", "head")
+    inspector = inspect(engine)
+    assert set(_PRODUCT_TABLES) <= set(inspector.get_table_names())
+    intraday_constraints = {
+        item["name"] for item in inspector.get_unique_constraints("market_intraday_bars")
+    }
+    assert "uq_intraday_symbol_start_adjustment" in intraday_constraints
+    assert any(
+        item["constrained_columns"] == ["quality_record_id"]
+        and item["referred_table"] == "data_quality_records"
+        for item in inspector.get_foreign_keys("market_intraday_bars")
+    )
+    _alembic(mysql_database, "downgrade", "20260725_0011")
+    assert not set(_PRODUCT_TABLES) & set(inspect(engine).get_table_names())
+    _alembic(mysql_database, "upgrade", "head")
+    engine.dispose()
 
 
 def test_mysql_legacy_0008_upgrade_preserves_data_and_backfills_subjects(
