@@ -23,6 +23,7 @@ from app.domain.models import (
     RiskDecision,
     SourceQualityBinding,
     StrategyDecision,
+    StrategyBinding,
 )
 from app.domain.quality import DataQualityStatus, worst_quality
 
@@ -463,7 +464,10 @@ def build_decision_package(
         product_snapshot_hash=(product_result or {}).get("snapshot", {}).get(
             "snapshot_hash"
         ),
-        strategy_bindings=(product_result or {}).get("strategy_bindings", []),
+        strategy_bindings=[
+            StrategyBinding.model_validate(item)
+            for item in (product_result or {}).get("strategy_bindings", [])
+        ],
         strategy_signals=(product_result or {}).get("strategy_signals", []),
         legacy_preview_hash=preview["preview_hash"],
         package_hash="0" * 64,

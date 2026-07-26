@@ -30,7 +30,7 @@ from app.data_hub.trading_calendar import (
 )
 from app.domain.quality_subject import SubjectRef
 from app.models import DataQualityRecord
-from app.strategies import CoreDisciplineStrategy
+from app.composition.strategies import get_strategy_registry
 from app.strategies.contracts import StrategySignal
 
 
@@ -114,6 +114,48 @@ def _validated_package(
             or "Data quality does not allow a formal plan to be frozen.",
         )
     return package
+
+
+def _validate_strategy_bindings(package: DecisionPackage) -> None:
+    signals = {}
+    for raw_signal in package.strategy_signals:
+        try:
+            signal = StrategySignal.model_validate(raw_signal)
+        except ValidationError as exc:
+            raise AppError(
+                422,
+                "STRATEGY_BINDING_CHANGED",
+                "Strategy signal integrity changed; run a new analysis.",
+            ) from exc
+        signals[(signal.strategy_id, signal.strategy_version)] = signal
+    registry = get_strategy_registry()
+    for binding in package.strategy_bindings:
+        signal = signals.get((binding.strategy_id, binding.strategy_version))
+        if signal is None or (
+            binding.parameter_hash != signal.parameter_hash
+            or binding.signal_hash != signal.signal_hash
+        ):
+            raise AppError(
+                422,
+                "STRATEGY_BINDING_CHANGED",
+                "Strategy binding has no exact signal; run a new analysis.",
+            )
+        try:
+            strategy = registry.get_enabled(
+                binding.strategy_id, binding.strategy_version
+            )
+        except KeyError as exc:
+            raise AppError(
+                422,
+                "STRATEGY_NOT_REGISTERED",
+                "Strategy is not registered and enabled; run a new analysis.",
+            ) from exc
+        if binding.implementation_hash != strategy.manifest().implementation_hash:
+            raise AppError(
+                422,
+                "STRATEGY_IMPLEMENTATION_CHANGED",
+                "Strategy implementation changed; run a new analysis.",
+            )
 
 
 def freeze_trade_plan(
@@ -212,43 +254,7 @@ def freeze_trade_plan(
                 f"Product Evidence {evidence.evidence_id} uses different lineage.",
             )
 
-    signals = {}
-    for raw_signal in package.strategy_signals:
-        try:
-            signal = StrategySignal.model_validate(raw_signal)
-        except ValidationError as exc:
-            raise AppError(
-                422,
-                "STRATEGY_BINDING_CHANGED",
-                "Strategy signal integrity changed; run a new analysis.",
-            ) from exc
-        signals[(signal.strategy_id, signal.strategy_version)] = signal
-    current_core = CoreDisciplineStrategy()
-    for binding in package.strategy_bindings:
-        signal = signals.get((binding.strategy_id, binding.strategy_version))
-        if signal is None:
-            raise AppError(
-                422,
-                "STRATEGY_BINDING_CHANGED",
-                "Strategy binding has no exact signal; run a new analysis.",
-            )
-        if binding.strategy_id == current_core.strategy_id:
-            manifest = current_core.manifest()
-            if (
-                binding.strategy_version != manifest.version
-                or binding.implementation_hash != manifest.implementation_hash
-            ):
-                raise AppError(
-                    422,
-                    "STRATEGY_IMPLEMENTATION_CHANGED",
-                    "Strategy implementation changed; run a new analysis.",
-                )
-        else:
-            raise AppError(
-                422,
-                "STRATEGY_NOT_REGISTERED",
-                "Strategy is no longer registered; run a new analysis.",
-            )
+    _validate_strategy_bindings(package)
 
     for evidence in package.evidence:
         if not evidence.required or evidence.capability not in SOURCE_EVIDENCE_CAPABILITIES:
