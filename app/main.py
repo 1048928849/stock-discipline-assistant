@@ -11,6 +11,7 @@ from app.api.advanced import router as advanced_router
 from app.api.company_research import router as company_research_router
 from app.api.technical import router as technical_router
 from app.api.workflow import router as workflow_router
+from app.api.watchlist import router as watchlist_router
 from app.config import get_settings
 from app.errors import install_error_handlers
 from app.logging_config import configure_logging
@@ -52,6 +53,7 @@ def create_app() -> FastAPI:
             "technical",
             "company-research",
             "trade-plans",
+            "watchlist",
         }
         if page_name not in allowed:
             from app.errors import AppError
@@ -66,6 +68,7 @@ def create_app() -> FastAPI:
     app.include_router(technical_router)
     app.include_router(company_research_router)
     app.include_router(workflow_router)
+    app.include_router(watchlist_router)
     install_error_handlers(app)
     return app
 

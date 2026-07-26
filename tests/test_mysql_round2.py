@@ -414,6 +414,45 @@ def test_mysql_0013_watchlist_tables_previous_head_round_trip(mysql_database: UR
     engine.dispose()
 
 
+def test_mysql_watchlist_monitor_lease_is_atomic(mysql_head_url: URL):
+    from app.watchlist.lease import acquire_monitor_lease, release_monitor_lease
+
+    engine = create_engine(mysql_head_url, pool_pre_ping=True)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    now = datetime(2026, 7, 27, 2, 0, tzinfo=timezone.utc)
+    barrier = Barrier(3)
+    outcomes = []
+    result_lock = Lock()
+
+    def worker(token: str) -> None:
+        with factory() as db:
+            barrier.wait()
+            acquired = acquire_monitor_lease(
+                db, owner_token=token, lease_seconds=60, now=now
+            )
+            with result_lock:
+                outcomes.append((token, acquired))
+
+    threads = [
+        Thread(target=worker, args=(token,))
+        for token in ("mysql-worker-a", "mysql-worker-b")
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+    assert sorted(acquired for _, acquired in outcomes) == [False, True]
+    winner = next(token for token, acquired in outcomes if acquired)
+    with factory() as first, factory() as second:
+        assert release_monitor_lease(first, owner_token=winner)
+        assert acquire_monitor_lease(
+            second, owner_token="mysql-worker-b", lease_seconds=60, now=now
+        )
+    engine.dispose()
+
+
 def test_mysql_legacy_0008_upgrade_preserves_data_and_backfills_subjects(
     mysql_database: URL,
 ):

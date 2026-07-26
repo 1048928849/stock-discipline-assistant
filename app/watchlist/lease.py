@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import case, update
+from sqlalchemy import update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
@@ -58,30 +58,29 @@ def acquire_monitor_lease(
             ),
         )
     elif dialect == "mysql":
-        statement = mysql_insert(WatchlistMonitorLease).values(**values)
+        insert_result = db.execute(
+            mysql_insert(WatchlistMonitorLease).values(**values).prefix_with("IGNORE")
+        )
+        if insert_result.rowcount:
+            db.commit()
+            return True
         available = (
             (WatchlistMonitorLease.acquired_until.is_(None))
             | (WatchlistMonitorLease.acquired_until <= acquired_at)
             | (WatchlistMonitorLease.owner_token == owner_token)
         )
-        statement = statement.on_duplicate_key_update(
-            owner_token=case(
-                (available, statement.inserted.owner_token),
-                else_=WatchlistMonitorLease.owner_token,
-            ),
-            acquired_until=case(
-                (available, statement.inserted.acquired_until),
-                else_=WatchlistMonitorLease.acquired_until,
-            ),
-            lease_version=case(
-                (available, WatchlistMonitorLease.lease_version + 1),
-                else_=WatchlistMonitorLease.lease_version,
-            ),
-            updated_at=case(
-                (available, statement.inserted.updated_at),
-                else_=WatchlistMonitorLease.updated_at,
-            ),
+        result = db.execute(
+            update(WatchlistMonitorLease)
+            .where(WatchlistMonitorLease.name == LEASE_NAME, available)
+            .values(
+                owner_token=owner_token,
+                acquired_until=acquired_until,
+                lease_version=WatchlistMonitorLease.lease_version + 1,
+                updated_at=acquired_at,
+            )
         )
+        db.commit()
+        return bool(result.rowcount)
     else:
         result = db.execute(
             update(WatchlistMonitorLease)

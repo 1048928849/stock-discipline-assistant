@@ -6,7 +6,7 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.composition.data_hub import build_provider_registry
+from app.composition.data_hub import build_data_hub
 from app.config import Settings, get_settings
 from app.data_hub.contracts import ProviderUnavailableError
 from app.data_hub.router import DataHubRouter
@@ -95,9 +95,8 @@ class WatchlistMonitoringService:
                 summary.unchanged = len(items)
                 return summary
             if self.router is None:
-                self.router = DataHubRouter(
+                self.router = build_data_hub(
                     self.db,
-                    build_provider_registry(),
                     calendar=self.calendar,
                     now_fn=lambda: now,
                 )
@@ -252,7 +251,20 @@ class WatchlistMonitoringService:
             summary.reanalysis_requested += int(created)
         self.db.commit()
         if request is not None and request.status == "PENDING":
-            execute_reanalysis(self.db, request.id)
+            reanalysis = execute_reanalysis(self.db, request.id)
+            if reanalysis.status == "BLOCKED":
+                summary.blocked += 1
+            elif reanalysis.status == "FAILED":
+                summary.failures.append(
+                    {
+                        "item_id": item.id,
+                        "symbol": item.symbol,
+                        "error": (
+                            f"reanalysis failed: {reanalysis.error_code}: "
+                            f"{reanalysis.error_message}"
+                        )[:1000],
+                    }
+                )
 
     def _record_blocked(
         self,

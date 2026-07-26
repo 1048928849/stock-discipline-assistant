@@ -234,6 +234,22 @@ def patch_watchlist_item(
     payload: WatchlistPatchRequest,
 ) -> WatchlistItem:
     changed = payload.model_dump(exclude_unset=True)
+    if changed.get("monitoring_enabled") is True and (
+        WatchlistStatus(item.status)
+        not in {
+            WatchlistStatus.WATCHING,
+            WatchlistStatus.NEAR_ENTRY,
+            WatchlistStatus.ENTRY_TRIGGERED,
+        }
+        or item.entry_low is None
+        or item.entry_high is None
+        or item.hard_stop is None
+    ):
+        raise AppError(
+            409,
+            "WATCHLIST_MONITORING_PLAN_REQUIRED",
+            "只有包含完整价格计划的有效观察项才能启用监控",
+        )
     revision_change = any(key in REVISION_FIELDS for key in changed)
     for field, value in changed.items():
         setattr(item, field, value)

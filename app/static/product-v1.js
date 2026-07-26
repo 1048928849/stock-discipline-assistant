@@ -134,6 +134,16 @@
       ? "关键 Evidence 将在确认时重新验证。"
       : data.save_disabled_reason || "当前计划不可冻结。";
     oneClickRuns[actions.id] = data.run_id;
+    let watchAction = actions.querySelector(".watchlist-add-action");
+    if (!watchAction) {
+      actions.insertAdjacentHTML("beforeend", `
+        <span class="watchlist-add-action">
+          <input class="watchlist-thesis" maxlength="4000" placeholder="观察理由" aria-label="观察理由">
+          <button type="button" class="add-analysis-to-watchlist">加入观察名单</button>
+        </span>`);
+      watchAction = actions.querySelector(".watchlist-add-action");
+    }
+    watchAction.dataset.runId = String(data.run_id);
     const output = document.querySelector("#trade-plan-json");
     if (output) output.textContent = JSON.stringify(data, null, 2);
     if (plan.chart?.length && page === "trade-plans") {
@@ -149,4 +159,88 @@
     }
     renderProductOneClick(data, result, actions);
   };
+
+  const healthTone = value => ["MISSING", "STALE", "CONFLICTED", "DATA_BLOCKED", "PROVIDER_UNAVAILABLE"].includes(value) ? "blocked" : "verified";
+  const formatTime = value => value ? new Date(value.endsWith?.("Z") ? value : `${value}Z`).toLocaleString("zh-CN") : "—";
+
+  function watchlistCard(item) {
+    return `<button type="button" class="watchlist-card" data-watchlist-id="${item.id}">
+      <span><b>${text(item.symbol)} ${text(item.name || "")}</b><small>${text(item.strategy_id)}@${text(item.strategy_version)}</small></span>
+      <span><b>${text(item.status)}</b><small class="quality-code ${healthTone(item.monitoring_health)}">${text(item.monitoring_health)}</small></span>
+      <span><small>现价 / 买入区</small><b>${text(item.current_price)} / ${text(item.entry_low)}–${text(item.entry_high)}</b></span>
+      <span><small>最后扫描</small><b>${formatTime(item.last_scanned_at)}</b></span>
+      ${item.unread_event_count ? `<i>${item.unread_event_count}</i>` : ""}
+    </button>`;
+  }
+
+  async function loadWatchlist() {
+    const [items, events] = await Promise.all([json("/api/watchlist/items"), json("/api/watchlist/events?limit=100")]);
+    const itemNode = document.querySelector("#watchlist-items");
+    if (!itemNode) return;
+    itemNode.innerHTML = items.length ? items.map(watchlistCard).join("") : '<div class="missing-data">尚无观察项。请先完成 Product 分析并加入观察名单。</div>';
+    document.querySelector("#watchlist-summary").innerHTML = `
+      <article><small>观察项</small><b>${items.length}</b></article>
+      <article><small>接近 / 触发</small><b>${items.filter(x => ["NEAR_ENTRY", "ENTRY_TRIGGERED"].includes(x.status)).length}</b></article>
+      <article><small>数据阻断</small><b>${items.filter(x => healthTone(x.monitoring_health) === "blocked").length}</b></article>
+      <article><small>未读事件</small><b>${events.filter(x => !x.acknowledged_at).length}</b></article>`;
+    document.querySelector("#watchlist-events").innerHTML = events.length ? events.map(event => `
+      <article class="watchlist-event ${event.severity.toLowerCase()}">
+        <div><b>${text(event.title)}</b><span>${text(event.severity)}</span></div>
+        <small>${formatTime(event.observed_at)} · ${text(event.event_type)}</small>
+        <p>${(event.reason_codes || []).map(text).join("；")}</p>
+        ${event.acknowledged_at ? "" : `<button type="button" data-ack-event="${event.id}">标记已读</button>`}
+      </article>`).join("") : '<div class="missing-data">暂无监控事件。</div>';
+  }
+
+  async function showWatchlistDetail(id) {
+    const [item, revisions, transitions, events] = await Promise.all([
+      json(`/api/watchlist/items/${id}`),
+      json(`/api/watchlist/items/${id}/revisions`),
+      json(`/api/watchlist/items/${id}/transitions`),
+      json(`/api/watchlist/events?item_id=${id}&limit=100`),
+    ]);
+    const pkg = item.latest_decision_package || {};
+    const bindings = pkg.strategy_bindings || [];
+    const optionalMissing = pkg.research_decision?.missing_optional_evidence || [];
+    document.querySelector("#watchlist-detail").innerHTML = `
+      <div class="watchlist-detail-head"><div><small>${text(item.symbol)}</small><h3>${text(item.thesis)}</h3></div><span class="quality-code ${healthTone(item.monitoring_health)}">${text(item.monitoring_health)}</span></div>
+      <div class="product-field-grid">
+        ${field("状态", item.status, true)}${field("数据质量", item.data_quality)}${field("数据时间", formatTime(item.current_price_observed_at))}${field("当前价格", item.current_price)}
+        ${field("买入区间", `${text(item.entry_low)} – ${text(item.entry_high)}`, true)}${field("距离买入区", item.distance_to_entry_pct == null ? "—" : `${item.distance_to_entry_pct}%`)}${field("硬止损", item.hard_stop, true)}${field("分析资金", item.analysis_capital)}
+        ${field("市场状态", item.market_state)}${field("行业状态", item.industry_state)}${field("最后分析", formatTime(item.last_analyzed_at))}${field("最后扫描", formatTime(item.last_scanned_at))}
+      </div>
+      <div class="condition-columns"><article><h4>等待条件</h4><ul>${list(item.waiting_conditions)}</ul></article><article><h4>失效条件</h4><ul>${list(item.invalidation_conditions)}</ul></article><article><h4>可选数据缺失</h4><ul>${list(optionalMissing)}</ul></article></div>
+      <h4>StrategyBinding</h4>${bindings.length ? `<div class="strategy-binding-list">${bindings.map(binding => `<article><b>${text(binding.strategy_id)}@${text(binding.strategy_version)}</b><small>${text(binding.binding_hash)}</small></article>`).join("")}</div>` : '<div class="missing-data">暂无策略绑定。</div>'}
+      <div class="action-row"><button type="button" data-reanalyze-item="${id}">重新分析</button><button type="button" data-archive-item="${id}">归档</button></div>
+      <h4>Revision 历史</h4><div class="watchlist-timeline">${revisions.map(x => `<p><b>v${x.revision_number}</b> ${text(x.change_reason)} <small>${formatTime(x.created_at)}</small></p>`).join("") || "—"}</div>
+      <h4>状态迁移</h4><div class="watchlist-timeline">${transitions.map(x => `<p><b>${text(x.from_status)} → ${text(x.to_status)}</b> ${(x.reason_codes || []).map(text).join("；")} <small>${formatTime(x.observed_at)}</small></p>`).join("") || "—"}</div>
+      <h4>监控事件</h4><div class="watchlist-timeline">${events.map(x => `<p><b>${text(x.title)}</b> <small>${formatTime(x.observed_at)}</small></p>`).join("") || "—"}</div>`;
+  }
+
+  document.addEventListener("click", async event => {
+    const add = event.target.closest?.(".add-analysis-to-watchlist");
+    if (add) {
+      const action = add.closest(".watchlist-add-action");
+      const thesis = action.querySelector(".watchlist-thesis").value.trim();
+      if (!thesis) return toast("请填写观察理由");
+      add.disabled = true;
+      try {
+        await json("/api/watchlist/items", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({source_type: "PRODUCT_ANALYSIS", analysis_run_id: Number(action.dataset.runId), thesis})});
+        toast("已加入观察名单");
+      } catch (error) { toast(error.message); } finally { add.disabled = false; }
+    }
+    const card = event.target.closest?.("[data-watchlist-id]");
+    if (card) await showWatchlistDetail(card.dataset.watchlistId);
+    const ack = event.target.closest?.("[data-ack-event]");
+    if (ack) { await json(`/api/watchlist/events/${ack.dataset.ackEvent}/acknowledge`, {method: "POST"}); await loadWatchlist(); }
+    const reanalyze = event.target.closest?.("[data-reanalyze-item]");
+    if (reanalyze) { reanalyze.disabled = true; await json(`/api/watchlist/items/${reanalyze.dataset.reanalyzeItem}/reanalyze`, {method: "POST"}); await loadWatchlist(); await showWatchlistDetail(reanalyze.dataset.reanalyzeItem); }
+    const archive = event.target.closest?.("[data-archive-item]");
+    if (archive) { await json(`/api/watchlist/items/${archive.dataset.archiveItem}/archive`, {method: "POST"}); await loadWatchlist(); document.querySelector("#watchlist-detail").innerHTML = '<div class="missing-data">观察项已归档。</div>'; }
+  });
+  document.querySelector("#watchlist-scan")?.addEventListener("click", async event => {
+    event.currentTarget.disabled = true;
+    try { const result = await json("/api/watchlist/scan", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"}); toast(`扫描完成：${result.scanned} 项，${result.transitioned} 项变化`); await loadWatchlist(); } catch (error) { toast(error.message); } finally { event.currentTarget.disabled = false; }
+  });
+  if (page === "watchlist") loadWatchlist().catch(error => toast(error.message));
 })();

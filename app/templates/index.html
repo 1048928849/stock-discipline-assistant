@@ -13,7 +13,7 @@
     <nav>
       <span class="nav-group">今日</span><a href="/dashboard">今日工作台</a>
       <span class="nav-group">研究中心</span><a href="/market">市场与主线</a><a href="/company-research">公司与财报</a><a href="/technical">技术研究</a><a href="/x-monitor">产业线索 / X</a>
-      <span class="nav-group">计划与执行</span><a href="/trade-plans">交易计划</a><a href="/holdings">持仓管理</a><a href="/trades">交易记录</a>
+      <span class="nav-group">计划与执行</span><a href="/trade-plans">交易计划</a><a href="/watchlist">观察名单</a><a href="/holdings">持仓管理</a><a href="/trades">交易记录</a>
       <span class="nav-group">复盘与验证</span><a href="/reviews">每日 / 每周复盘</a><a href="/backtests">策略回测</a>
       <span class="nav-group">系统</span><a href="/settings">数据源与设置</a>
     </nav>
@@ -84,6 +84,16 @@
         <div id="plan-execution-result"><div class="missing-data">保存计划后选择计划版本查看执行跟踪。</div></div>
       </section>
       <h3>已有计划</h3><div id="trade-plan-list" class="risk-grid"></div><details class="developer-details"><summary>技术详情 / 调试信息（默认隐藏）</summary><pre id="trade-plan-json"></pre></details>
+    </section>
+
+    <section class="panel" data-view="watchlist">
+      <div class="watchlist-heading"><div><p class="eyebrow">DETERMINISTIC MONITORING</p><h2>观察名单</h2><p>监控只生成状态变化、事件和重新分析；确认与冻结始终由用户完成。</p></div><button id="watchlist-scan" type="button" title="立即扫描"><span aria-hidden="true">↻</span> 扫描</button></div>
+      <div id="watchlist-summary" class="cards"></div>
+      <div class="watchlist-layout">
+        <div><h3>观察项</h3><div id="watchlist-items" class="watchlist-items"><div class="missing-data">加载中…</div></div></div>
+        <div><h3>观察详情</h3><div id="watchlist-detail" class="watchlist-detail"><div class="missing-data">选择一个观察项查看计划、版本、迁移和事件。</div></div></div>
+      </div>
+      <h3>事件中心</h3><div id="watchlist-events" class="watchlist-events"></div>
     </section>
 
     <section class="panel" data-view="trades"><h2>交易记录</h2><form id="trade-form" class="form-grid"><input name="account_id" type="number" placeholder="账户 ID" required><input name="symbol" pattern="\d{6}" placeholder="股票代码" required><select name="side"><option value="BUY">买入</option><option value="SELL">卖出</option></select><input name="quantity" type="number" placeholder="数量" required><input name="price" type="number" step="0.0001" placeholder="价格" required><input name="fee" type="number" step="0.01" value="0" placeholder="费用"><input name="reason" placeholder="交易理由"><select name="is_planned"><option value="true">计划内</option><option value="false">计划外</option></select><input name="emotion" placeholder="情绪"><button>记录交易</button></form><div id="trades-table" class="table-wrap"></div><p class="hint">同时支持 UTF-8 CSV 导入：<code>POST /api/v1/trades/import-csv</code>。</p></section>
