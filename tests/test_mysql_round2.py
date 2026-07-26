@@ -357,9 +357,9 @@ def test_mysql8_version_empty_upgrade_and_idempotency(mysql_database: URL):
     assert session_tz
     _alembic(mysql_database, "upgrade", "head")
     current = _alembic(mysql_database, "current")
-    assert "20260726_0012" in current.stdout
+    assert "20260727_0013" in current.stdout
     heads = _alembic(mysql_database, "heads")
-    assert "20260726_0012" in heads.stdout
+    assert "20260727_0013" in heads.stdout
     _alembic(mysql_database, "upgrade", "head")
 
 
@@ -385,6 +385,31 @@ def test_mysql_0012_product_tables_legacy_upgrade_round_trip(mysql_database: URL
     )
     _alembic(mysql_database, "downgrade", "20260725_0011")
     assert not set(_PRODUCT_TABLES) & set(inspect(engine).get_table_names())
+    _alembic(mysql_database, "upgrade", "head")
+    engine.dispose()
+
+
+def test_mysql_0013_watchlist_tables_previous_head_round_trip(mysql_database: URL):
+    watchlist_tables = (
+        "monitoring_events",
+        "reanalysis_runs",
+        "reanalysis_requests",
+        "watchlist_transitions",
+        "watchlist_revisions",
+        "watchlist_monitor_leases",
+        "watchlist_items",
+    )
+    _alembic(mysql_database, "upgrade", "20260726_0012")
+    engine = create_engine(mysql_database, pool_pre_ping=True)
+    with engine.begin() as connection:
+        connection.exec_driver_sql("SET FOREIGN_KEY_CHECKS=0")
+        for table in watchlist_tables:
+            connection.exec_driver_sql(f"DROP TABLE IF EXISTS `{table}`")
+        connection.exec_driver_sql("SET FOREIGN_KEY_CHECKS=1")
+    _alembic(mysql_database, "upgrade", "head")
+    assert set(watchlist_tables) <= set(inspect(engine).get_table_names())
+    _alembic(mysql_database, "downgrade", "20260726_0012")
+    assert not set(watchlist_tables) & set(inspect(engine).get_table_names())
     _alembic(mysql_database, "upgrade", "head")
     engine.dispose()
 

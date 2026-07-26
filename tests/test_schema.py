@@ -49,6 +49,13 @@ def test_initial_schema_contains_required_tables(session):
         "data_quality_subject_heads",
         "company_research_refreshes",
         "plan_execution_events",
+        "watchlist_items",
+        "watchlist_revisions",
+        "watchlist_transitions",
+        "monitoring_events",
+        "reanalysis_requests",
+        "reanalysis_runs",
+        "watchlist_monitor_leases",
         "plan_execution_fills",
     }
     assert required == set(inspect(session.bind).get_table_names())
