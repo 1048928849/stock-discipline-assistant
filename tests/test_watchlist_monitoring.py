@@ -5,14 +5,19 @@ import pytest
 
 from app.data_hub.trading_calendar import SHANGHAI_TZ
 from app.watchlist.contracts import (
+    InvalidationRuleType,
     MonitoringHealth,
     WatchlistCreateRequest,
     WatchlistSourceType,
     WatchlistStatus,
 )
 from app.watchlist.state_machine import (
+    INDUSTRY_RISK_ORDER,
+    MARKET_RISK_ORDER,
     PriceStateInput,
     determine_price_transition,
+    matching_invalidation_rule,
+    risk_increased,
     validate_transition,
 )
 
@@ -57,6 +62,50 @@ def test_price_below_entry_is_not_interpreted_as_cheaper_entry():
     )
     assert outcome.to_status == WatchlistStatus.WATCHING
     assert "BELOW_ENTRY_REQUIRES_REASSESSMENT" in outcome.reason_codes
+    assert outcome.trigger_reanalysis is True
+
+
+def test_explicit_market_and_industry_risk_orders_are_deterministic():
+    assert risk_increased("EXPANSION", "CONTRACTION", MARKET_RISK_ORDER)
+    assert not risk_increased("PANIC", "REPAIR", MARKET_RISK_ORDER)
+    assert risk_increased("MAINLINE", "FADING", INDUSTRY_RISK_ORDER)
+    assert not risk_increased("NONE", "ROTATION", INDUSTRY_RISK_ORDER)
+
+
+def test_structured_invalidation_rules_do_not_parse_display_text():
+    rule = {
+        "rule_type": InvalidationRuleType.MARKET_REGIME_AT_OR_WORSE_THAN.value,
+        "threshold": "CONTRACTION",
+        "source": "USER",
+        "evidence_reference": "evidence:market",
+        "created_at": NOW.isoformat(),
+    }
+    matched = matching_invalidation_rule(
+        [rule],
+        current_price=Decimal("10.50"),
+        market_state="PANIC",
+        industry_state="MAINLINE",
+    )
+    assert matched is not None
+    assert matched.rule_type == InvalidationRuleType.MARKET_REGIME_AT_OR_WORSE_THAN
+    with pytest.raises(ValueError):
+        WatchlistCreateRequest.model_validate(
+            {
+                "source_type": "MANUAL",
+                "symbol": "300502",
+                "thesis": "test",
+                "invalidation_conditions": ["跌破趋势就失效"],
+                "invalidation_rule_specs": [
+                    {
+                        "rule_type": "NATURAL_LANGUAGE_EXPRESSION",
+                        "threshold": "PANIC",
+                        "source": "LLM",
+                        "evidence_reference": "text:1",
+                        "created_at": NOW.isoformat(),
+                    }
+                ],
+            }
+        )
 
 
 def test_hard_stop_permanently_invalidates_watchlist_item():

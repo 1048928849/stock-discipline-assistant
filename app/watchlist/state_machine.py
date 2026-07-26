@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 from app.watchlist.contracts import (
+    IndustryStatusInvalidationRule,
+    InvalidationRuleSpec,
+    MarketRegimeInvalidationRule,
     MonitoringHealth,
     MonitoringRuleType,
+    PriceInvalidationRule,
     PriceStateInput,
     PriceStateOutcome,
     WatchlistStatus,
 )
+from pydantic import TypeAdapter
 
 
 _AUTOMATIC_TRANSITIONS = {
     WatchlistStatus.DISCOVERED: {WatchlistStatus.RESEARCHING},
     WatchlistStatus.RESEARCHING: {
         WatchlistStatus.WATCHING,
+        WatchlistStatus.NEAR_ENTRY,
+        WatchlistStatus.ENTRY_TRIGGERED,
         WatchlistStatus.INVALIDATED,
     },
     WatchlistStatus.WATCHING: {
@@ -33,6 +40,61 @@ _AUTOMATIC_TRANSITIONS = {
     WatchlistStatus.INVALIDATED: set(),
     WatchlistStatus.ARCHIVED: set(),
 }
+
+
+MARKET_RISK_ORDER = {
+    "EXPANSION": 0,
+    "REPAIR": 1,
+    "DIVERGENCE": 2,
+    "CONTRACTION": 3,
+    "PANIC": 4,
+}
+INDUSTRY_RISK_ORDER = {
+    "MAINLINE": 0,
+    "SECONDARY": 1,
+    "ROTATION": 2,
+    "FADING": 3,
+    "NONE": 4,
+}
+_RULE_ADAPTER = TypeAdapter(InvalidationRuleSpec)
+
+
+def risk_increased(previous: str | None, current: str | None, order: dict[str, int]) -> bool:
+    return (
+        previous in order
+        and current in order
+        and order[current] > order[previous]
+    )
+
+
+def matching_invalidation_rule(
+    specs: list[dict],
+    *,
+    current_price,
+    market_state: str | None,
+    industry_state: str | None,
+) -> InvalidationRuleSpec | None:
+    for raw in specs:
+        rule = _RULE_ADAPTER.validate_python(raw)
+        if isinstance(rule, PriceInvalidationRule):
+            matched = current_price is not None and current_price <= rule.threshold
+        elif isinstance(rule, MarketRegimeInvalidationRule):
+            matched = (
+                market_state in MARKET_RISK_ORDER
+                and MARKET_RISK_ORDER[market_state]
+                >= MARKET_RISK_ORDER[rule.threshold]
+            )
+        elif isinstance(rule, IndustryStatusInvalidationRule):
+            matched = (
+                industry_state in INDUSTRY_RISK_ORDER
+                and INDUSTRY_RISK_ORDER[industry_state]
+                >= INDUSTRY_RISK_ORDER[rule.threshold]
+            )
+        else:  # pragma: no cover - the discriminated union is exhaustive
+            matched = False
+        if matched:
+            return rule
+    return None
 
 
 def validate_transition(
@@ -95,7 +157,7 @@ def determine_price_transition(value: PriceStateInput) -> PriceStateOutcome:
             reasons = ("PRICE_ABOVE_NEAR_ENTRY_DISTANCE",)
             severity = "INFO"
     else:
-        target = current
+        target = WatchlistStatus.WATCHING if value.reassessment else current
         rule = None
         reasons = ("BELOW_ENTRY_REQUIRES_REASSESSMENT",)
         severity = "ATTENTION"
@@ -108,15 +170,26 @@ def determine_price_transition(value: PriceStateInput) -> PriceStateOutcome:
         reason_codes=reasons,
         severity=severity,
         trigger_reanalysis=(
-            target != current
-            and target
-            in {
-                WatchlistStatus.NEAR_ENTRY,
-                WatchlistStatus.ENTRY_TRIGGERED,
-                WatchlistStatus.INVALIDATED,
-            }
+            "BELOW_ENTRY_REQUIRES_REASSESSMENT" in reasons
+            or (
+                target != current
+                and target
+                in {
+                    WatchlistStatus.NEAR_ENTRY,
+                    WatchlistStatus.ENTRY_TRIGGERED,
+                    WatchlistStatus.INVALIDATED,
+                }
+            )
         ),
     )
 
 
-__all__ = ["PriceStateInput", "determine_price_transition", "validate_transition"]
+__all__ = [
+    "INDUSTRY_RISK_ORDER",
+    "MARKET_RISK_ORDER",
+    "PriceStateInput",
+    "determine_price_transition",
+    "matching_invalidation_rule",
+    "risk_increased",
+    "validate_transition",
+]

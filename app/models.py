@@ -324,6 +324,25 @@ class MarketRegimeSnapshot(Base):
     transition: Mapped[str] = mapped_column(String(50))
     product_snapshot_hash: Mapped[str] = mapped_column(String(64))
     observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    quality_status: Mapped[str | None] = mapped_column(String(20))
+    quality_bindings: Mapped[list] = mapped_column(JSON, default=list)
+
+
+class IndustryAnalysisSnapshot(Base):
+    __tablename__ = "industry_analysis_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "industry_name", "trade_date", name="uq_industry_analysis_name_date"
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    industry_name: Mapped[str] = mapped_column(String(200), index=True)
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    classification: Mapped[str] = mapped_column(String(20), index=True)
+    product_snapshot_hash: Mapped[str] = mapped_column(String(64))
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    quality_status: Mapped[str] = mapped_column(String(20))
+    quality_bindings: Mapped[list] = mapped_column(JSON, default=list)
 
 
 class Concept(Base):
@@ -971,6 +990,7 @@ class WatchlistItem(TimestampMixin, Base):
     hard_stop: Mapped[Decimal | None] = mapped_column(PRICE)
     waiting_conditions: Mapped[list] = mapped_column(JSON, default=list)
     invalidation_conditions: Mapped[list] = mapped_column(JSON, default=list)
+    invalidation_rule_specs: Mapped[list] = mapped_column(JSON, default=list)
     latest_snapshot_hash: Mapped[str | None] = mapped_column(String(64))
     latest_package_hash: Mapped[str | None] = mapped_column(String(64))
     latest_analysis_id: Mapped[int | None] = mapped_column(
@@ -980,6 +1000,7 @@ class WatchlistItem(TimestampMixin, Base):
     current_price: Mapped[Decimal | None] = mapped_column(PRICE)
     current_price_observed_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
     market_state: Mapped[str | None] = mapped_column(String(30))
+    industry_name: Mapped[str | None] = mapped_column(String(200), index=True)
     industry_state: Mapped[str | None] = mapped_column(String(30))
     data_quality: Mapped[str | None] = mapped_column(String(20))
     last_analyzed_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)

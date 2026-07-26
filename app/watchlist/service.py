@@ -42,8 +42,10 @@ REVISION_FIELDS = (
     "hard_stop",
     "waiting_conditions",
     "invalidation_conditions",
+    "invalidation_rule_specs",
     "latest_snapshot_hash",
     "latest_package_hash",
+    "industry_name",
 )
 
 
@@ -103,6 +105,39 @@ def _binding(package: DecisionPackage) -> StrategyBinding:
     return package.strategy_bindings[0]
 
 
+def _selected_industry_name(result: dict[str, Any], symbol: str) -> str | None:
+    product = result.get("product_analysis") or {}
+    snapshot = product.get("snapshot") or {}
+    for capability in snapshot.get("capabilities") or []:
+        if capability.get("capability") != "market.industry.constituents":
+            continue
+        for row in capability.get("rows") or []:
+            if str(row.get("symbol") or "").zfill(6) == symbol:
+                value = str(row.get("industry_name") or row.get("industry") or "").strip()
+                return value or None
+    return None
+
+
+def _price_observed_at(package: DecisionPackage) -> datetime | None:
+    for evidence in package.evidence:
+        if (
+            evidence.capability != "market.quote.realtime"
+            or evidence.evidence_id not in package.market_snapshot.evidence_ids
+            or not evidence.observed_at
+        ):
+            continue
+        parsed = datetime.fromisoformat(evidence.observed_at.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            return to_utc_storage_naive(parsed)
+    if package.market_snapshot.as_of:
+        parsed = datetime.fromisoformat(
+            package.market_snapshot.as_of.replace("Z", "+00:00")
+        )
+        if parsed.tzinfo is not None:
+            return to_utc_storage_naive(parsed)
+    return None
+
+
 def extract_product_analysis(
     db: Session, analysis_run_id: int
 ) -> tuple[PlanAnalysisRun, dict[str, Any]]:
@@ -128,6 +163,7 @@ def extract_product_analysis(
     if entry_low <= 0 or entry_high < entry_low or not (0 < hard_stop < entry_low):
         raise AppError(422, "WATCHLIST_ANALYSIS_PLAN_INVALID", "分析计划价格区间无效")
     binding = _binding(package)
+    price_observed_at = _price_observed_at(package)
     health = {
         "CONFLICTED": MonitoringHealth.CONFLICTED.value,
         "STALE": MonitoringHealth.STALE.value,
@@ -151,10 +187,13 @@ def extract_product_analysis(
         "entry_low": entry_low,
         "entry_high": entry_high,
         "hard_stop": hard_stop,
+        "current_price": package.market_snapshot.current_price,
+        "current_price_observed_at": price_observed_at,
         "latest_snapshot_hash": package.product_snapshot_hash,
         "latest_package_hash": package.package_hash,
         "latest_analysis_id": run.id,
         "market_state": package.market_snapshot.market_state,
+        "industry_name": _selected_industry_name(result, run.symbol),
         "industry_state": package.market_snapshot.sector_state,
         "data_quality": package.quality_status.value,
         "last_analyzed_at": to_utc_storage_naive(package.created_at),
@@ -166,6 +205,15 @@ def extract_product_analysis(
                 buy_plan.get("invalidation_condition"),
             ]
             if value
+        ],
+        "invalidation_rule_specs": [
+            {
+                "rule_type": "PRICE_AT_OR_BELOW_HARD_STOP",
+                "threshold": str(hard_stop),
+                "source": "PRODUCT_ANALYSIS",
+                "evidence_reference": f"package:{package.package_hash}",
+                "created_at": package.created_at.isoformat(),
+            }
         ],
     }
 
@@ -199,6 +247,10 @@ def create_watchlist_item(
             "analysis_capital": payload.analysis_capital or Decimal("300000"),
             "waiting_conditions": payload.waiting_conditions,
             "invalidation_conditions": payload.invalidation_conditions,
+            "invalidation_rule_specs": [
+                rule.model_dump(mode="json")
+                for rule in payload.invalidation_rule_specs
+            ],
         }
     if payload.analysis_capital is not None:
         values["analysis_capital"] = payload.analysis_capital
@@ -234,6 +286,11 @@ def patch_watchlist_item(
     payload: WatchlistPatchRequest,
 ) -> WatchlistItem:
     changed = payload.model_dump(exclude_unset=True)
+    if "invalidation_rule_specs" in changed and changed["invalidation_rule_specs"] is not None:
+        changed["invalidation_rule_specs"] = [
+            rule.model_dump(mode="json")
+            for rule in payload.invalidation_rule_specs or []
+        ]
     if changed.get("monitoring_enabled") is True and (
         WatchlistStatus(item.status)
         not in {

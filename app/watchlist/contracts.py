@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -58,6 +58,55 @@ class ReanalysisStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class InvalidationRuleType(str, Enum):
+    PRICE_AT_OR_BELOW_HARD_STOP = "PRICE_AT_OR_BELOW_HARD_STOP"
+    MARKET_REGIME_AT_OR_WORSE_THAN = "MARKET_REGIME_AT_OR_WORSE_THAN"
+    INDUSTRY_STATUS_AT_OR_WORSE_THAN = "INDUSTRY_STATUS_AT_OR_WORSE_THAN"
+
+
+class InvalidationRuleBase(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source: str = Field(min_length=1, max_length=100)
+    evidence_reference: str = Field(min_length=1, max_length=200)
+    created_at: datetime
+
+    @model_validator(mode="after")
+    def validate_created_at(self):
+        if self.created_at.tzinfo is None:
+            raise ValueError("invalidation rule created_at must be timezone-aware")
+        return self
+
+
+class PriceInvalidationRule(InvalidationRuleBase):
+    rule_type: Literal[
+        InvalidationRuleType.PRICE_AT_OR_BELOW_HARD_STOP
+    ] = InvalidationRuleType.PRICE_AT_OR_BELOW_HARD_STOP
+    threshold: Decimal = Field(gt=0)
+
+
+class MarketRegimeInvalidationRule(InvalidationRuleBase):
+    rule_type: Literal[
+        InvalidationRuleType.MARKET_REGIME_AT_OR_WORSE_THAN
+    ] = InvalidationRuleType.MARKET_REGIME_AT_OR_WORSE_THAN
+    threshold: Literal["EXPANSION", "REPAIR", "DIVERGENCE", "CONTRACTION", "PANIC"]
+
+
+class IndustryStatusInvalidationRule(InvalidationRuleBase):
+    rule_type: Literal[
+        InvalidationRuleType.INDUSTRY_STATUS_AT_OR_WORSE_THAN
+    ] = InvalidationRuleType.INDUSTRY_STATUS_AT_OR_WORSE_THAN
+    threshold: Literal["MAINLINE", "SECONDARY", "ROTATION", "FADING", "NONE"]
+
+
+InvalidationRuleSpec = Annotated[
+    PriceInvalidationRule
+    | MarketRegimeInvalidationRule
+    | IndustryStatusInvalidationRule,
+    Field(discriminator="rule_type"),
+]
+
+
 class WatchlistCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -68,12 +117,20 @@ class WatchlistCreateRequest(BaseModel):
     analysis_capital: Decimal | None = Field(default=None, gt=0)
     waiting_conditions: list[str] = Field(default_factory=list, max_length=50)
     invalidation_conditions: list[str] = Field(default_factory=list, max_length=50)
+    invalidation_rule_specs: list[InvalidationRuleSpec] = Field(
+        default_factory=list,
+        max_length=50,
+    )
 
     @model_validator(mode="after")
     def validate_source_reference(self):
         if self.source_type == WatchlistSourceType.PRODUCT_ANALYSIS:
             if self.analysis_run_id is None or self.symbol is not None:
                 raise ValueError("product analysis source requires only analysis_run_id")
+            if self.invalidation_rule_specs:
+                raise ValueError(
+                    "product analysis invalidation rules must be loaded by the server"
+                )
         elif self.symbol is None:
             raise ValueError("manual and strategy signal sources require symbol")
         return self
@@ -86,6 +143,10 @@ class WatchlistPatchRequest(BaseModel):
     analysis_capital: Decimal | None = Field(default=None, gt=0)
     waiting_conditions: list[str] | None = Field(default=None, max_length=50)
     invalidation_conditions: list[str] | None = Field(default=None, max_length=50)
+    invalidation_rule_specs: list[InvalidationRuleSpec] | None = Field(
+        default=None,
+        max_length=50,
+    )
     monitoring_enabled: bool | None = None
 
 
@@ -125,6 +186,7 @@ class PriceStateInput(BaseModel):
     observed_at: datetime
     monitoring_health: MonitoringHealth = MonitoringHealth.HEALTHY
     invalidation_triggered: bool = False
+    reassessment: bool = False
 
     @model_validator(mode="after")
     def validate_price_plan(self):
@@ -150,8 +212,13 @@ class PriceStateOutcome(BaseModel):
 
 __all__ = [
     "EventSeverity",
+    "IndustryStatusInvalidationRule",
+    "InvalidationRuleSpec",
+    "InvalidationRuleType",
+    "MarketRegimeInvalidationRule",
     "MonitoringHealth",
     "MonitoringRuleType",
+    "PriceInvalidationRule",
     "PriceStateInput",
     "PriceStateOutcome",
     "ReanalysisStatus",

@@ -357,9 +357,9 @@ def test_mysql8_version_empty_upgrade_and_idempotency(mysql_database: URL):
     assert session_tz
     _alembic(mysql_database, "upgrade", "head")
     current = _alembic(mysql_database, "current")
-    assert "20260727_0013" in current.stdout
+    assert "20260727_0014" in current.stdout
     heads = _alembic(mysql_database, "heads")
-    assert "20260727_0013" in heads.stdout
+    assert "20260727_0014" in heads.stdout
     _alembic(mysql_database, "upgrade", "head")
 
 
@@ -411,6 +411,23 @@ def test_mysql_0013_watchlist_tables_previous_head_round_trip(mysql_database: UR
     _alembic(mysql_database, "downgrade", "20260726_0012")
     assert not set(watchlist_tables) & set(inspect(engine).get_table_names())
     _alembic(mysql_database, "upgrade", "head")
+    engine.dispose()
+
+
+def test_mysql_0014_watchlist_semantics_round_trip(mysql_database: URL):
+    _alembic(mysql_database, "upgrade", "head")
+    _alembic(mysql_database, "downgrade", "20260727_0013")
+    engine = create_engine(mysql_database, pool_pre_ping=True)
+    inspector = inspect(engine)
+    assert "industry_analysis_snapshots" not in inspector.get_table_names()
+    columns = {item["name"] for item in inspector.get_columns("watchlist_items")}
+    assert "invalidation_rule_specs" not in columns
+    assert "industry_name" not in columns
+    _alembic(mysql_database, "upgrade", "head")
+    inspector = inspect(engine)
+    assert "industry_analysis_snapshots" in inspector.get_table_names()
+    columns = {item["name"] for item in inspector.get_columns("watchlist_items")}
+    assert {"invalidation_rule_specs", "industry_name"} <= columns
     engine.dispose()
 
 

@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     watchlist_monitor_interval_seconds: int = Field(default=300, ge=1, le=86400)
     watchlist_monitor_batch_size: int = Field(default=100, ge=1, le=500)
     watchlist_monitor_lease_seconds: int = Field(default=240, ge=1, le=86400)
+    watchlist_plan_max_age_seconds: int = Field(
+        default=86400,
+        ge=60,
+        le=31_536_000,
+    )
     watchlist_near_entry_distance_pct: Decimal = Field(
         default=Decimal("2"), ge=0, le=100
     )

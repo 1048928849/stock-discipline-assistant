@@ -282,3 +282,51 @@ def test_0013_uses_explicit_immutable_table_definitions():
     ).read_text(encoding="utf-8")
     assert "Base.metadata" not in source
     assert source.count("op.create_table") == len(WATCHLIST_TABLES)
+
+
+def test_0014_watchlist_semantics_downgrade_and_reupgrade(tmp_path):
+    database = tmp_path / "watchlist-semantics-roundtrip.db"
+    _alembic(database, "upgrade", "head")
+    _alembic(database, "downgrade", "20260727_0013")
+    with sqlite3.connect(database) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        watchlist_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(watchlist_items)")
+        }
+        regime_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(market_regime_snapshots)")
+        }
+    assert "industry_analysis_snapshots" not in tables
+    assert "invalidation_rule_specs" not in watchlist_columns
+    assert "industry_name" not in watchlist_columns
+    assert "quality_bindings" not in regime_columns
+    _alembic(database, "upgrade", "head")
+    with sqlite3.connect(database) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        watchlist_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(watchlist_items)")
+        }
+    assert "industry_analysis_snapshots" in tables
+    assert {"invalidation_rule_specs", "industry_name"} <= watchlist_columns
+
+
+def test_0014_uses_explicit_immutable_definitions():
+    source = (
+        ROOT
+        / "alembic"
+        / "versions"
+        / "20260727_0014_watchlist_monitoring_semantics.py"
+    ).read_text(encoding="utf-8")
+    assert "Base.metadata" not in source
+    assert "op.create_table" in source

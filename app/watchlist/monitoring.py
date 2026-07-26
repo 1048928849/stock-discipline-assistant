@@ -16,8 +16,9 @@ from app.data_hub.trading_calendar import (
     get_trading_calendar,
     market_storage_naive_to_aware,
     to_utc_storage_naive,
+    utc_storage_naive_to_aware,
 )
-from app.domain.quality import DataQualityStatus
+from app.domain.quality import DataQualityStatus, worst_quality
 from app.models import WatchlistItem
 from app.services.market_cache import persist_market_quote, resolve_cached_quote
 from app.watchlist.contracts import (
@@ -29,10 +30,17 @@ from app.watchlist.contracts import (
     WatchlistStatus,
 )
 from app.watchlist.events import create_event_once, create_reanalysis_request_once
+from app.watchlist.context import latest_industry_state, latest_market_state
 from app.watchlist.lease import acquire_monitor_lease, release_monitor_lease
 from app.watchlist.reanalysis import execute_reanalysis
 from app.watchlist.service import transition_item
-from app.watchlist.state_machine import determine_price_transition
+from app.watchlist.state_machine import (
+    INDUSTRY_RISK_ORDER,
+    MARKET_RISK_ORDER,
+    determine_price_transition,
+    matching_invalidation_rule,
+    risk_increased,
+)
 
 
 _QUALITY_HEALTH = {
@@ -182,69 +190,296 @@ class WatchlistMonitoringService:
 
         quote = selection.value
         quote_observed_at = market_storage_naive_to_aware(quote.observed_at)
-        item.monitoring_health = MonitoringHealth.HEALTHY.value
-        item.data_quality = quality.value
+        initial_status = item.status
         item.current_price = quote.price
         item.current_price_observed_at = quote.observed_at
         item.last_scanned_at = to_utc_storage_naive(now)
         item.next_scan_at = to_utc_storage_naive(
             now + timedelta(seconds=self.settings.watchlist_monitor_interval_seconds)
         )
-        outcome = determine_price_transition(
-            PriceStateInput(
-                current_status=WatchlistStatus(item.status),
-                current_price=quote.price,
-                entry_low=item.entry_low,
-                entry_high=item.entry_high,
-                hard_stop=item.hard_stop,
-                near_entry_distance_pct=self.settings.watchlist_near_entry_distance_pct,
-                observed_at=quote_observed_at,
-                monitoring_health=MonitoringHealth.HEALTHY,
-            )
+
+        market_context = (
+            latest_market_state(self.db, evaluated_at=now)
+            if item.market_state is not None
+            else None
         )
-        transitioned = outcome.to_status != outcome.from_status
+        industry_context = (
+            latest_industry_state(
+                self.db,
+                industry_name=item.industry_name,
+                evaluated_at=now,
+            )
+            if item.industry_state is not None and item.industry_name
+            else None
+        )
+        context_missing = item.industry_state is not None and not item.industry_name
+        contexts = [
+            context
+            for context in (market_context, industry_context)
+            if context is not None
+        ]
+        blocked_contexts = [context for context in contexts if not context.executable]
+        context_health = MonitoringHealth.HEALTHY
+        if context_missing:
+            context_health = MonitoringHealth.DATA_BLOCKED
+        elif blocked_contexts:
+            context_health = max(
+                (context.health for context in blocked_contexts),
+                key=lambda value: {
+                    MonitoringHealth.DATA_BLOCKED: 1,
+                    MonitoringHealth.STALE: 2,
+                    MonitoringHealth.CONFLICTED: 3,
+                }.get(value, 0),
+            )
+        item.monitoring_health = context_health.value
+        item.data_quality = worst_quality(
+            [quality, *[context.quality_status for context in contexts]]
+        ).value
+
         evidence = (
             [f"quality_record:{selection.quality_record_id}"]
             if selection.quality_record_id
             else []
         )
-        if transitioned:
+        reanalysis_reasons: set[str] = set()
+        event_rows: list[tuple] = []
+
+        if context_health != MonitoringHealth.HEALTHY:
+            blocked_reason = (
+                "industry_subject_missing"
+                if context_missing
+                else next(
+                    (
+                        context.blocking_reason
+                        for context in blocked_contexts
+                        if context.blocking_reason
+                    ),
+                    context_health.value,
+                )
+            )
+            event_rows.append(
+                (
+                    MonitoringRuleType.DATA_QUALITY_DEGRADED,
+                    EventSeverity.ATTENTION.value,
+                    [context_health.value],
+                    now,
+                    {
+                        "quality_status": item.data_quality,
+                        "reason": blocked_reason,
+                        "scope": "MARKET_OR_INDUSTRY_STATE",
+                    },
+                    False,
+                    self.settings.watchlist_monitor_interval_seconds,
+                )
+            )
+            summary.blocked += 1
+
+        if market_context and market_context.executable and risk_increased(
+            item.market_state,
+            market_context.value,
+            MARKET_RISK_ORDER,
+        ):
+            reanalysis_reasons.add("MARKET_REGIME_DOWNGRADE")
+            event_rows.append(
+                (
+                    MonitoringRuleType.MARKET_REGIME_DOWNGRADE,
+                    EventSeverity.ATTENTION.value,
+                    ["MARKET_REGIME_DOWNGRADE"],
+                    market_context.observed_at or now,
+                    {
+                        "previous_state": item.market_state,
+                        "current_state": market_context.value,
+                        "snapshot_hash": market_context.snapshot_hash,
+                        "quality_status": market_context.quality_status.value,
+                        "evidence_references": list(
+                            market_context.evidence_references
+                        ),
+                    },
+                    True,
+                    self.settings.watchlist_monitor_interval_seconds,
+                )
+            )
+
+        if industry_context and industry_context.executable and risk_increased(
+            item.industry_state,
+            industry_context.value,
+            INDUSTRY_RISK_ORDER,
+        ):
+            reanalysis_reasons.add("INDUSTRY_STATUS_DOWNGRADE")
+            event_rows.append(
+                (
+                    MonitoringRuleType.INDUSTRY_STATUS_DOWNGRADE,
+                    EventSeverity.ATTENTION.value,
+                    ["INDUSTRY_STATUS_DOWNGRADE"],
+                    industry_context.observed_at or now,
+                    {
+                        "industry_name": item.industry_name,
+                        "previous_state": item.industry_state,
+                        "current_state": industry_context.value,
+                        "snapshot_hash": industry_context.snapshot_hash,
+                        "quality_status": industry_context.quality_status.value,
+                        "evidence_references": list(
+                            industry_context.evidence_references
+                        ),
+                    },
+                    True,
+                    self.settings.watchlist_monitor_interval_seconds,
+                )
+            )
+
+        if item.last_analyzed_at is not None:
+            analyzed_at = utc_storage_naive_to_aware(item.last_analyzed_at)
+            if now - analyzed_at > timedelta(
+                seconds=self.settings.watchlist_plan_max_age_seconds
+            ):
+                reanalysis_reasons.add("PLAN_BECAME_STALE")
+                event_rows.append(
+                    (
+                        MonitoringRuleType.PLAN_BECAME_STALE,
+                        EventSeverity.ATTENTION.value,
+                        ["PLAN_BECAME_STALE"],
+                        now,
+                        {
+                            "last_analyzed_at": analyzed_at.isoformat(),
+                            "max_age_seconds": (
+                                self.settings.watchlist_plan_max_age_seconds
+                            ),
+                        },
+                        True,
+                        self.settings.watchlist_plan_max_age_seconds,
+                    )
+                )
+
+        current_market_state = (
+            market_context.value
+            if market_context and market_context.executable
+            else None
+        )
+        current_industry_state = (
+            industry_context.value
+            if industry_context and industry_context.executable
+            else None
+        )
+        invalidation = matching_invalidation_rule(
+            item.invalidation_rule_specs or [],
+            current_price=quote.price,
+            market_state=current_market_state,
+            industry_state=current_industry_state,
+        )
+        if invalidation is not None:
+            rule_payload = invalidation.model_dump(mode="json")
+            event_type = (
+                MonitoringRuleType.PRICE_BREAK_HARD_STOP
+                if invalidation.rule_type.value == "PRICE_AT_OR_BELOW_HARD_STOP"
+                else MonitoringRuleType.PLAN_INVALIDATION_TRIGGERED
+            )
+            rule_evidence = [invalidation.evidence_reference, *evidence]
             transition_item(
                 self.db,
                 item,
-                outcome.to_status,
-                reason_codes=list(outcome.reason_codes),
-                evidence_references=evidence,
+                WatchlistStatus.INVALIDATED,
+                reason_codes=[invalidation.rule_type.value],
+                evidence_references=rule_evidence,
                 observed_at=quote_observed_at,
             )
             summary.transitioned += 1
-        else:
+            event_rows.append(
+                (
+                    event_type,
+                    EventSeverity.CRITICAL.value,
+                    [invalidation.rule_type.value],
+                    quote_observed_at,
+                    {
+                        "matched_rule": rule_payload,
+                        "price": str(quote.price),
+                        "market_state": current_market_state,
+                        "industry_state": current_industry_state,
+                        "evidence_references": rule_evidence,
+                    },
+                    False,
+                    self.settings.watchlist_monitor_interval_seconds,
+                )
+            )
+
+        outcome = None
+        if invalidation is None:
+            outcome = determine_price_transition(
+                PriceStateInput(
+                    current_status=WatchlistStatus(item.status),
+                    current_price=quote.price,
+                    entry_low=item.entry_low,
+                    entry_high=item.entry_high,
+                    hard_stop=item.hard_stop,
+                    near_entry_distance_pct=(
+                        self.settings.watchlist_near_entry_distance_pct
+                    ),
+                    observed_at=quote_observed_at,
+                    monitoring_health=context_health,
+                )
+            )
+            transitioned = outcome.to_status != outcome.from_status
+            if transitioned:
+                transition_item(
+                    self.db,
+                    item,
+                    outcome.to_status,
+                    reason_codes=list(outcome.reason_codes),
+                    evidence_references=evidence,
+                    observed_at=quote_observed_at,
+                )
+                summary.transitioned += 1
+            if outcome.rule_type and transitioned:
+                event_rows.append(
+                    (
+                        outcome.rule_type,
+                        outcome.severity,
+                        list(outcome.reason_codes),
+                        quote_observed_at,
+                        {
+                            "price": str(quote.price),
+                            "quality_record_id": selection.quality_record_id,
+                            "from_status": outcome.from_status.value,
+                            "to_status": outcome.to_status.value,
+                        },
+                        outcome.trigger_reanalysis,
+                        self.settings.watchlist_monitor_interval_seconds,
+                    )
+                )
+            if outcome.trigger_reanalysis:
+                reanalysis_reasons.update(outcome.reason_codes)
+
+        if item.status == initial_status:
             summary.unchanged += 1
-        request = None
-        if outcome.rule_type and transitioned:
+
+        for event_row in event_rows:
+            (
+                event_type,
+                severity,
+                reason_codes,
+                event_observed_at,
+                payload,
+                reanalysis_required,
+                cooldown,
+            ) = event_row
             _, created = create_event_once(
                 self.db,
                 item,
-                event_type=outcome.rule_type,
-                severity=outcome.severity,
-                title=self._event_title(outcome.rule_type, item.symbol),
-                reason_codes=list(outcome.reason_codes),
-                observed_at=quote_observed_at,
-                payload={
-                    "price": str(quote.price),
-                    "quality_record_id": selection.quality_record_id,
-                    "from_status": outcome.from_status.value,
-                    "to_status": outcome.to_status.value,
-                },
-                reanalysis_required=outcome.trigger_reanalysis,
-                cooldown_seconds=self.settings.watchlist_monitor_interval_seconds,
+                event_type=event_type,
+                severity=severity,
+                title=self._event_title(event_type, item.symbol),
+                reason_codes=reason_codes,
+                observed_at=event_observed_at,
+                payload=payload,
+                reanalysis_required=reanalysis_required,
+                cooldown_seconds=cooldown,
             )
             summary.events_created += int(created)
-        if outcome.trigger_reanalysis:
+        request = None
+        if reanalysis_reasons and invalidation is None:
             request, created = create_reanalysis_request_once(
                 self.db,
                 item,
-                reason_codes=list(outcome.reason_codes),
+                reason_codes=sorted(reanalysis_reasons),
                 observed_at=quote_observed_at,
                 cooldown_seconds=self.settings.watchlist_monitor_interval_seconds,
             )
