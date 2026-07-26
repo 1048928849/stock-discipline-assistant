@@ -179,11 +179,13 @@ class ObservedRows(list):
         observed_at: datetime,
         fetched_at: datetime | None = None,
         cache_used: bool = False,
+        provider_lineage: dict[str, Any] | None = None,
     ):
         super().__init__(rows)
         self.observed_at = observed_at
         self.fetched_at = fetched_at
         self.cache_used = cache_used
+        self.provider_lineage = dict(provider_lineage or {})
 
 
 @dataclass(frozen=True)

@@ -933,6 +933,7 @@ class DataHubRouter:
                         "stale": stale,
                         "normalized_digest": digest,
                         "error": None,
+                        **self._provider_lineage(value),
                     }
                 )
                 self._log(
@@ -1116,6 +1117,28 @@ class DataHubRouter:
         ) = self._result_dimensions(None, subject)
         result = self._record_quality(result, symbol)
         return self._remember_result(result)
+
+    @staticmethod
+    def _provider_lineage(value: Any) -> dict[str, Any]:
+        raw = getattr(value, "provider_lineage", None)
+        if raw is None and isinstance(value, dict):
+            raw = value.get("provider_lineage")
+        if not isinstance(raw, dict):
+            return {}
+        allowed = {
+            "adapter_version",
+            "source_service",
+            "requested_start",
+            "requested_end",
+            "requested_fields",
+            "requested_adjustment",
+            "row_count",
+            "response_schema_version",
+            "schema_fingerprint",
+            "raw_response_digest",
+            "source_url",
+        }
+        return {key: raw[key] for key in sorted(raw) if key in allowed}
 
     def get_history(self, symbol: str, start: date, end: date, cache_loader=None):
         subject = stock_daily_subject(symbol, "qfq", "CNY", "share")

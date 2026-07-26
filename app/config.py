@@ -72,6 +72,22 @@ class Settings(BaseSettings):
     candidate_min_history_coverage_ratio: Decimal = Field(
         default=Decimal("0.8"), ge=0, le=1
     )
+    freestockdb_enabled: bool = False
+    freestockdb_base_url: str = "http://127.0.0.1:7899"
+    freestockdb_timeout_seconds: float = Field(default=10, gt=0, le=120)
+    freestockdb_max_retries: int = Field(default=2, ge=0, le=5)
+    freestockdb_batch_size: int = Field(default=50, ge=1, le=500)
+    freestockdb_max_response_bytes: int = Field(
+        default=5_000_000, ge=1, le=100_000_000
+    )
+    freestockdb_allow_remote: bool = False
+    freestockdb_history_lookback_sessions: int = Field(default=80, ge=1, le=500)
+    freestockdb_refresh_rewrite_sessions: int = Field(default=120, ge=1, le=1000)
+    freestockdb_csi300_symbol: str = ""
+    freestockdb_adapter_version: str = "1.0.0"
+    history_bootstrap_max_symbols: int = Field(default=500, ge=1, le=7000)
+    history_bootstrap_max_rows: int = Field(default=100_000, ge=1, le=5_000_000)
+    history_bootstrap_max_duration_seconds: int = Field(default=900, ge=1, le=86400)
 
 
 @lru_cache

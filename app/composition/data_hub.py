@@ -15,6 +15,7 @@ from app.providers.external_http_provider import (
     ConfiguredNewsApiProvider,
     ProfessionalMarketApiProvider,
 )
+from app.providers.freestockdb import FreeStockDBProvider
 from app.providers.tushare_provider import TushareProvider
 from app.providers.x_social_provider import XSocialClueProvider
 
@@ -22,6 +23,7 @@ from app.providers.x_social_provider import XSocialClueProvider
 def build_provider_registry() -> ProviderRegistry:
     settings = get_settings()
     registry = ProviderRegistry()
+    registry.register(FreeStockDBProvider(settings))
     registry.register(AStockDiscoveryProvider(settings))
     registry.register(ProfessionalMarketApiProvider(settings))
     registry.register(TushareProvider(settings))
