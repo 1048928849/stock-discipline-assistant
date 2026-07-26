@@ -45,6 +45,10 @@
     const market = data.market_regime || {};
     const industry = data.industry_context || {};
     const concept = data.concept_chain_context || {};
+    concept.chain = concept.chain_name;
+    concept.chain_node = concept.node_name;
+    concept.revenue_relevance = [concept.relevance, concept.stage, concept.revenue_relevance]
+      .filter(Boolean).join(" / ");
     const decision_package = data.decision_package || {};
     const allowed = trade.buy_allowed === true;
     const zone = Array.isArray(trade.buy_zone) ? trade.buy_zone.join(" ～ ") : "数据不足";

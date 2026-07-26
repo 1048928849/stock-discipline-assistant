@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.data_hub.contracts import ProviderUnavailableError
 from app.data_hub.effective_quality import resolve_effective_quality
 from app.data_hub.router import DataHubRouter, ProviderResult
+from app.data_hub.market_subjects import sector_daily_subject
 from app.data_hub.trading_calendar import (
     market_storage_naive_to_aware,
     to_market_storage_naive,
@@ -222,11 +223,24 @@ def _persist_amount(db: Session, result: ProviderResult, rows: list[dict]) -> in
 
 
 def _persist_industry(db: Session, result: ProviderResult, rows: list[dict]) -> int:
-    key = result.subject.subject_id
+    universe = result.subject.subject_type == "market"
+    keys = {
+        sector_daily_subject(str(row["industry"]), "unadjusted", "CNY", "share").subject_id
+        for row in rows
+    }
+    if not universe:
+        keys = {result.subject.subject_id}
     db.execute(
-        delete(IndustryMarketSnapshot).where(IndustryMarketSnapshot.industry_key == key)
+        delete(IndustryMarketSnapshot).where(IndustryMarketSnapshot.industry_key.in_(keys))
     )
     for row in rows:
+        key = (
+            sector_daily_subject(
+                str(row["industry"]), "unadjusted", "CNY", "share"
+            ).subject_id
+            if universe
+            else result.subject.subject_id
+        )
         db.add(
             IndustryMarketSnapshot(
                 industry_key=key,
@@ -249,13 +263,26 @@ def _persist_industry(db: Session, result: ProviderResult, rows: list[dict]) -> 
 
 
 def _persist_constituents(db: Session, result: ProviderResult, rows: list[dict]) -> int:
-    key = result.subject.subject_id
+    universe = result.subject.subject_type == "market"
+    keys = {
+        sector_daily_subject(str(row["industry"]), "unadjusted", "CNY", "share").subject_id
+        for row in rows
+    }
+    if not universe:
+        keys = {result.subject.subject_id}
     db.execute(
         delete(IndustryConstituentSnapshot).where(
-            IndustryConstituentSnapshot.industry_key == key
+            IndustryConstituentSnapshot.industry_key.in_(keys)
         )
     )
     for row in rows:
+        key = (
+            sector_daily_subject(
+                str(row["industry"]), "unadjusted", "CNY", "share"
+            ).subject_id
+            if universe
+            else result.subject.subject_id
+        )
         observed = row.get("observed_at") or result.observed_at
         if not isinstance(observed, datetime):
             raise ProviderUnavailableError("constituent snapshot requires observed_at")
@@ -266,6 +293,10 @@ def _persist_constituents(db: Session, result: ProviderResult, rows: list[dict])
                 symbol=str(row["symbol"]).zfill(6),
                 name=row["name"],
                 weight=row.get("weight"),
+                change_pct=row.get("change_pct"),
+                latest_price=row.get("latest_price"),
+                high_52w=row.get("high_52w"),
+                is_new_high=row.get("is_new_high"),
                 snapshot_date=to_shanghai_aware(
                     observed, naive_is_shanghai=observed.tzinfo is None
                 ).date(),
@@ -336,8 +367,8 @@ def _persist_chain(db: Session, result: ProviderResult, rows: list[dict]) -> int
         )
     )
     for row in rows:
-        chain_name = str(row.get("chain") or "").strip()
-        node_name = str(row.get("node") or "").strip()
+        chain_name = str(row.get("chain_name") or row.get("chain") or "").strip()
+        node_name = str(row.get("node_name") or row.get("node") or "").strip()
         if not chain_name or not node_name:
             raise ProviderUnavailableError("industry-chain mapping requires chain and node")
         chain = db.scalar(select(IndustryChain).where(IndustryChain.name == chain_name))
@@ -494,6 +525,17 @@ def _stored_rows(
             )
         )
     if capability == "market.industry.daily":
+        if subject.subject_type == "market":
+            return list(
+                db.scalars(
+                    select(IndustryMarketSnapshot)
+                    .where(IndustryMarketSnapshot.quality_record_id == quality_record_id)
+                    .order_by(
+                        IndustryMarketSnapshot.industry_name,
+                        IndustryMarketSnapshot.trade_date,
+                    )
+                )
+            )
         return list(
             db.scalars(
                 select(IndustryMarketSnapshot)
@@ -505,6 +547,20 @@ def _stored_rows(
             )
         )
     if capability == "market.industry.constituents":
+        if subject.subject_type == "market":
+            return list(
+                db.scalars(
+                    select(IndustryConstituentSnapshot)
+                    .where(
+                        IndustryConstituentSnapshot.quality_record_id
+                        == quality_record_id
+                    )
+                    .order_by(
+                        IndustryConstituentSnapshot.industry_name,
+                        IndustryConstituentSnapshot.symbol,
+                    )
+                )
+            )
         return list(
             db.scalars(
                 select(IndustryConstituentSnapshot)

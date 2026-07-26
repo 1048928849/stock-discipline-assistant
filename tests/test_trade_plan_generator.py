@@ -339,6 +339,8 @@ def _holding_preview(client, session, scenario: str, **holding_changes):
 
 
 def seed_governed_analysis(session, monkeypatch):
+    from test_one_click_pipeline import patch_benchmarks
+
     class GovernedResearchProvider(DataProvider):
         metadata = ProviderMetadata(
             provider_id="governed-research",
@@ -430,6 +432,7 @@ def seed_governed_analysis(session, monkeypatch):
             "freshness": [],
         },
     )
+    patch_benchmarks(monkeypatch)
 
 
 def analyze_and_confirm(client, account_id, **changes):
@@ -443,7 +446,9 @@ def analyze_and_confirm(client, account_id, **changes):
     analyzed = client.post(
         "/api/v1/trade-plan-generator/analyze", json=request
     ).json()
-    assert analyzed["can_save"] is True, analyzed
+    assert analyzed["can_save"] is True, analyzed["decision_package"][
+        "blocked_reasons"
+    ]
     saved = client.post(
         f"/api/v1/trade-plan-generator/analyze/{analyzed['run_id']}/confirm"
     )

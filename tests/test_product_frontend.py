@@ -30,6 +30,9 @@ def test_product_renderer_consumes_complete_api_contract_without_rule_math():
         "exit_plan",
         "required_data",
         "decision_package",
+        "chain_name",
+        "node_name",
+        "stage",
     ):
         assert field in source
     for prohibited in (

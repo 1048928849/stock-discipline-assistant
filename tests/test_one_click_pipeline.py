@@ -11,9 +11,15 @@ from sqlalchemy.orm import sessionmaker
 from app.data_hub.contracts import (
     DailyBar,
     DataProvider,
+    IndustryConstituent,
+    IndustryDaily,
+    IntradayBar,
+    MarketAmountDaily,
+    MarketBreadthDaily,
     ProviderMetadata,
     ProviderUnavailableError,
     Quote,
+    TurnoverDaily,
 )
 from app.data_hub.market_subjects import stock_daily_subject
 from app.data_hub.research_subjects import announcement_catalog_window
@@ -652,6 +658,186 @@ def patch_benchmarks(monkeypatch, market="up", sector="up"):
         "app.providers.akshare_provider.AKShareProvider.get_sector_history",
         lambda self, industry, start, end: benchmark_rows(sector),
     )
+
+    def product_times(self, evaluated_at=None):
+        fetched_at = to_shanghai_aware(evaluated_at or shanghai_now())
+        business_date = self.calendar.latest_completed_session(fetched_at)
+        observed_at = self.calendar.session_close_at(business_date)
+        return business_date, observed_at, fetched_at
+
+    def intraday(self, symbol, start, end):
+        del start
+        business_date, observed_at, fetched_at = product_times(self, end)
+        rows = []
+        for index in range(21):
+            close = Decimal("10.00") + Decimal(index) * Decimal("0.02")
+            volume = Decimal("100")
+            if index == 20:
+                close = Decimal("10.82")
+                volume = Decimal("180")
+            bar_end = observed_at - timedelta(hours=20 - index)
+            rows.append(IntradayBar(
+                symbol=symbol,
+                trade_date=business_date,
+                bar_start=bar_end - timedelta(hours=1),
+                bar_end=bar_end,
+                open=close - Decimal("0.01"),
+                high=close + Decimal("0.03"),
+                low=close - Decimal("0.03"),
+                close=close,
+                volume=volume,
+                amount=Decimal("1947.60"),
+                turnover_rate=Decimal("2.5"),
+                adjustment="qfq",
+                price_unit="CNY",
+                volume_unit="share",
+                observed_at=observed_at,
+                source="product-test",
+                fetched_at=fetched_at,
+                completed=True,
+            ))
+        return rows
+
+    def turnover(self, symbol, start, end):
+        del start
+        _, observed_at, fetched_at = product_times(self)
+        return [
+            TurnoverDaily(
+                symbol=symbol,
+                trade_date=end,
+                turnover_rate=Decimal("2.5"),
+                amount=Decimal("1947.60"),
+                observed_at=observed_at,
+                source="product-test",
+                fetched_at=fetched_at,
+            )
+        ]
+
+    def breadth(self, day):
+        _, observed_at, fetched_at = product_times(self)
+        return [
+            MarketBreadthDaily(
+                trade_date=day,
+                advancing=3200,
+                declining=1400,
+                unchanged=100,
+                limit_up=80,
+                limit_down=5,
+                new_highs=120,
+                new_lows=20,
+                median_change_pct=Decimal("0.8"),
+                above_ma20_ratio=Decimal("0.65"),
+                above_ma50_ratio=Decimal("0.55"),
+                observed_at=observed_at,
+                source="product-test",
+                fetched_at=fetched_at,
+            )
+        ]
+
+    def amounts(self, start, end):
+        del start
+        _, observed_at, fetched_at = product_times(self)
+        return [
+            MarketAmountDaily(
+                trade_date=end,
+                total_amount=Decimal("1200000000000"),
+                observed_at=observed_at,
+                source="product-test",
+                fetched_at=fetched_at,
+            )
+        ]
+
+    def industry_universe(self, start, end):
+        del start
+        _, _, fetched_at = product_times(self)
+        trade_dates = []
+        candidate = end
+        while len(trade_dates) < 20:
+            if self.calendar.is_session(candidate):
+                trade_dates.append(candidate)
+            candidate -= timedelta(days=1)
+        trade_dates.reverse()
+        return [
+            IndustryDaily(
+                industry="测试行业",
+                trade_date=trade_date,
+                change_pct=Decimal("2.2"),
+                amount=Decimal("50000000000"),
+                amount_share=Decimal("0.05"),
+                advance_ratio=Decimal("0.75"),
+                limit_up_count=4,
+                leader_strength=Decimal("9.9"),
+                new_high_ratio=Decimal("0.2"),
+                observed_at=self.calendar.session_close_at(trade_date),
+                source="product-test",
+                fetched_at=fetched_at,
+            )
+            for trade_date in trade_dates
+        ]
+
+    def constituent_universe(self):
+        _, observed_at, fetched_at = product_times(self)
+        return [
+            IndustryConstituent(
+                industry="测试行业",
+                symbol="300502",
+                name="测试公司",
+                weight=Decimal("1.5"),
+                observed_at=observed_at,
+                source="product-test",
+                fetched_at=fetched_at,
+                change_pct=Decimal("2.2"),
+                latest_price=Decimal("10.82"),
+                high_52w=Decimal("10.90"),
+                is_new_high=False,
+            )
+        ]
+
+    def concepts(self, symbol):
+        del symbol
+        _, observed_at, fetched_at = product_times(self)
+        return [
+            {
+                "concept": "测试行业",
+                "relevance": "IMPORTANT_BUSINESS",
+                "evidence_summary": "deterministic test profile evidence",
+                "source": "product-test",
+                "observed_at": observed_at,
+                "fetched_at": fetched_at,
+            }
+        ]
+
+    def chains(self, symbol):
+        del symbol
+        _, observed_at, fetched_at = product_times(self)
+        return [
+            {
+                "chain_name": "测试产业链",
+                "node_name": "测试节点",
+                "stage": "CORE",
+                "relevance": "IMPORTANT_BUSINESS",
+                "source": "product-test",
+                "evidence_summary": "deterministic test profile evidence",
+                "observed_at": observed_at,
+                "fetched_at": fetched_at,
+            }
+        ]
+
+    targets = {
+        "get_intraday_60m": intraday,
+        "get_turnover_daily": turnover,
+        "get_market_breadth": breadth,
+        "get_market_amount_history": amounts,
+        "get_industry_universe": industry_universe,
+        "get_industry_constituents_universe": constituent_universe,
+        "company_concepts": concepts,
+        "company_industry_chain": chains,
+    }
+    for name, implementation in targets.items():
+        monkeypatch.setattr(
+            f"app.providers.akshare_provider.AKShareProvider.{name}",
+            implementation,
+        )
     monkeypatch.setattr(
         "app.services.one_click_pipeline.refresh_company_research_if_needed",
         lambda db, symbol, **kwargs: {

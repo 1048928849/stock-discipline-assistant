@@ -54,6 +54,15 @@ class StrategyRegistry:
     def enabled_strategies(self) -> tuple[TradingStrategy, ...]:
         return tuple(self._strategies[key] for key in sorted(self._enabled))
 
+    def is_enabled(self, strategy_id: str, version: str) -> bool:
+        return (strategy_id, version) in self._enabled
+
+    def get_enabled(self, strategy_id: str, version: str) -> TradingStrategy:
+        strategy = self.get(strategy_id, version)
+        if not self.is_enabled(strategy_id, version):
+            raise KeyError(f"strategy is disabled: {strategy_id}@{version}")
+        return strategy
+
     def required_capabilities(self, *, enabled_only: bool = True) -> tuple[str, ...]:
         strategies = (
             self.enabled_strategies()

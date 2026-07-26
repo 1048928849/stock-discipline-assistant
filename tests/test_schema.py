@@ -17,6 +17,7 @@ def test_initial_schema_contains_required_tables(session):
         "market_amount_snapshots",
         "industry_market_snapshots",
         "industry_constituent_snapshots",
+        "market_regime_snapshots",
         "concepts",
         "company_concepts",
         "industry_chains",

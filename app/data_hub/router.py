@@ -23,6 +23,7 @@ from app.data_hub.market_subjects import (
     company_industry_chain_subject,
     index_daily_subject,
     industry_constituents_subject,
+    industry_universe_subject,
     market_amount_subject,
     market_breadth_subject,
     sector_daily_subject,
@@ -1304,6 +1305,32 @@ class DataHubRouter:
             "market.industry.constituents",
             "get_industry_constituents",
             industry,
+            symbol=subject.subject_id,
+            subject=subject,
+            cache_loader=cache_loader,
+            validator=lambda value: isinstance(value, list) and bool(value),
+        )
+
+    def get_industry_universe(
+        self, start: date, end: date, cache_loader=None
+    ):
+        subject = industry_universe_subject()
+        return self.invoke(
+            "market.industry.daily",
+            "get_industry_universe",
+            start,
+            end,
+            symbol=subject.subject_id,
+            subject=subject,
+            cache_loader=cache_loader,
+            validator=lambda value: isinstance(value, list) and bool(value),
+        )
+
+    def get_industry_constituents_universe(self, cache_loader=None):
+        subject = industry_universe_subject(constituents=True)
+        return self.invoke(
+            "market.industry.constituents",
+            "get_industry_constituents_universe",
             symbol=subject.subject_id,
             subject=subject,
             cache_loader=cache_loader,

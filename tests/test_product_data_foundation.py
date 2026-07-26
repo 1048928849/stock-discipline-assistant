@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -37,6 +37,8 @@ from app.models import (
     MarketTurnoverSnapshot,
 )
 from app.providers.akshare_provider import AKShareProvider
+from app.analysis.contracts import IndustryAnalysisInput, IndustryObservation, IndustrySeries
+from app.analysis.industry import analyze_industry_mainlines
 from app.services.product_data import persist_product_result, resolve_product_cache
 
 
@@ -188,6 +190,15 @@ class FullProductProvider(ProductProvider):
                 fetched_at=NOW,
             )
         ]
+
+    def list_industries(self):
+        return ["electronics"]
+
+    def get_industry_universe(self, start, end):
+        return self.get_industry_daily("electronics", start, end)
+
+    def get_industry_constituents_universe(self):
+        return self.get_industry_constituents("electronics")
 
     def company_concepts(self, symbol):
         return [
@@ -447,3 +458,113 @@ def test_akshare_declares_all_product_capabilities():
         "company.concepts",
         "company.industry_chain",
     } <= supported
+
+
+def test_akshare_three_industry_universe_produces_mainline_secondary_and_fading():
+    pd = pytest.importorskip("pandas")
+    industries = ("mainline", "secondary", "fading")
+    calendar = AKShareProvider(now_fn=lambda: NOW).calendar
+    trade_dates = []
+    candidate = NOW.date()
+    while len(trade_dates) < 20:
+        try:
+            calendar.session_close_at(candidate)
+        except ValueError:
+            candidate -= timedelta(days=1)
+            continue
+        trade_dates.append(candidate)
+        candidate -= timedelta(days=1)
+    trade_dates.reverse()
+    changes = {
+        "mainline": [Decimal("0.5")] * 20,
+        "secondary": [Decimal("0")] * 17 + [Decimal("1")] * 3,
+        "fading": [Decimal("1")] * 15 + [Decimal("-2")] * 5,
+    }
+
+    class FakeAkshare:
+        def stock_board_industry_name_em(self):
+            return pd.DataFrame({"\u677f\u5757\u540d\u79f0": industries})
+
+        def stock_board_industry_hist_em(self, symbol, **kwargs):
+            del kwargs
+            return pd.DataFrame(
+                {
+                    "\u65e5\u671f": trade_dates,
+                    "\u6da8\u8dcc\u5e45": changes[symbol],
+                    "\u6210\u4ea4\u989d": [Decimal("100")] * 20,
+                }
+            )
+
+        def stock_board_industry_cons_em(self, symbol):
+            latest_change = changes[symbol][-1]
+            return pd.DataFrame(
+                {
+                    "\u4ee3\u7801": ["300501", "300502", "300503"],
+                    "\u540d\u79f0": ["a", "b", "c"],
+                    "\u6da8\u8dcc\u5e45": [latest_change] * 3,
+                    "\u6700\u65b0\u4ef7": [10, 11, 12],
+                    "52\u5468\u6700\u9ad8": [10, 12, 13],
+                }
+            )
+
+    provider = AKShareProvider(now_fn=lambda: NOW)
+    provider._ak = lambda: FakeAkshare()
+    rows = provider.get_industry_universe(date(2026, 6, 1), date(2026, 7, 24))
+    grouped = {
+        name: tuple(row for row in rows if row.industry == name)
+        for name in industries
+    }
+    context = analyze_industry_mainlines(
+        IndustryAnalysisInput(
+            industries=tuple(
+                IndustrySeries(
+                    name=name,
+                    observations=tuple(
+                        IndustryObservation(
+                            trade_date=row.trade_date,
+                            change_pct=row.change_pct,
+                            amount=row.amount,
+                            amount_share=row.amount_share,
+                            advance_ratio=row.advance_ratio,
+                            limit_up_count=row.limit_up_count,
+                            leader_strength=row.leader_strength,
+                            new_high_ratio=row.new_high_ratio,
+                        )
+                        for row in values
+                    ),
+                )
+                for name, values in grouped.items()
+            ),
+            benchmark_changes=tuple(Decimal("0") for _ in range(20)),
+        )
+    )
+    classifications = {item.name: item.classification for item in context.industries}
+    assert classifications == {
+        "fading": "FADING",
+        "mainline": "MAINLINE",
+        "secondary": "SECONDARY",
+    }
+
+
+def test_akshare_profile_evidence_builds_concept_and_finite_chain_mapping():
+    provider = AKShareProvider(now_fn=lambda: NOW)
+    provider.company_profile = lambda symbol: {
+        "\u4e3b\u8425\u4e1a\u52a1": "\u96c6\u6210\u7535\u8def\u8bbe\u8ba1\u4e0e\u82af\u7247\u8bbe\u8ba1",
+        "\u7ec6\u5206\u884c\u4e1a": "\u534a\u5bfc\u4f53",
+    }
+    concepts = provider.company_concepts("300502")
+    chain = provider.company_industry_chain("300502")
+    assert concepts[0]["relevance"] == "CORE_BUSINESS"
+    assert concepts[0]["evidence_summary"]
+    assert chain[0]["chain_name"] == "\u534a\u5bfc\u4f53\u4ea7\u4e1a\u94fe"
+    assert chain[0]["node_name"] == "\u82af\u7247\u8bbe\u8ba1"
+    assert chain[0]["relevance"] == "CORE_BUSINESS"
+
+
+def test_akshare_unproved_chain_stays_insufficient_instead_of_guessing():
+    provider = AKShareProvider(now_fn=lambda: NOW)
+    provider.company_profile = lambda symbol: {"\u4e3b\u8425\u4e1a\u52a1": "generic services"}
+    chain = provider.company_industry_chain("300502")
+    assert chain[0]["chain_name"] == "UNRESOLVED"
+    assert chain[0]["node_name"] == "UNRESOLVED"
+    assert chain[0]["relevance"] == "INSUFFICIENT_EVIDENCE"

@@ -19,33 +19,31 @@ def _average(values) -> Decimal | None:
     return sum(rows, Decimal("0")) / len(rows) if rows else None
 
 
-def analyze_market_regime(value: MarketRegimeInput) -> MarketRegime:
-    current = value.current
+def infer_market_state_without_history(
+    current,
+    *,
+    amount_history,
+    index_changes,
+) -> str:
     total = current.advancing + current.declining + current.unchanged
     advance_ratio = Decimal(current.advancing) / Decimal(total) if total else None
-    current_amount = value.amount_history[-1] if value.amount_history else None
-    average_5 = _average(value.amount_history[-6:-1])
-    average_20 = _average(value.amount_history[-21:-1])
-    amount_ratio_5 = current_amount / average_5 if current_amount and average_5 else None
+    current_amount = amount_history[-1] if amount_history else None
+    average_20 = _average(amount_history[-21:-1])
     amount_ratio_20 = current_amount / average_20 if current_amount and average_20 else None
-    index_average = _average(value.index_changes.values()) or Decimal("0")
-    supporting = []
-    conflicting = []
-
-    panic = bool(
+    index_average = _average(index_changes.values()) or Decimal("0")
+    if (
         advance_ratio is not None
         and advance_ratio <= Decimal("0.2")
         and current.limit_down >= 30
         and (current.median_change_pct or Decimal("0")) < Decimal("-1")
-    )
-    divergence = bool(
-        advance_ratio is not None
-        and (
-            (index_average > 0 and advance_ratio < Decimal("0.45"))
-            or (current.limit_up >= 40 and advance_ratio < Decimal("0.45"))
-        )
-    )
-    expansion = bool(
+    ):
+        return "PANIC"
+    if advance_ratio is not None and (
+        (index_average > 0 and advance_ratio < Decimal("0.45"))
+        or (current.limit_up >= 40 and advance_ratio < Decimal("0.45"))
+    ):
+        return "DIVERGENCE"
+    if (
         advance_ratio is not None
         and advance_ratio >= Decimal("0.65")
         and current.limit_up >= 50
@@ -55,7 +53,31 @@ def analyze_market_regime(value: MarketRegimeInput) -> MarketRegime:
             current.above_ma20_ratio is None
             or current.above_ma20_ratio >= Decimal("0.55")
         )
+    ):
+        return "EXPANSION"
+    return "CONTRACTION"
+
+
+def analyze_market_regime(value: MarketRegimeInput) -> MarketRegime:
+    current = value.current
+    total = current.advancing + current.declining + current.unchanged
+    advance_ratio = Decimal(current.advancing) / Decimal(total) if total else None
+    current_amount = value.amount_history[-1] if value.amount_history else None
+    average_5 = _average(value.amount_history[-6:-1])
+    average_20 = _average(value.amount_history[-21:-1])
+    amount_ratio_5 = current_amount / average_5 if current_amount and average_5 else None
+    amount_ratio_20 = current_amount / average_20 if current_amount and average_20 else None
+    supporting = []
+    conflicting = []
+
+    base_state = infer_market_state_without_history(
+        current,
+        amount_history=value.amount_history,
+        index_changes=value.index_changes,
     )
+    panic = base_state == "PANIC"
+    divergence = base_state == "DIVERGENCE"
+    expansion = base_state == "EXPANSION"
     repair = bool(
         advance_ratio is not None
         and advance_ratio >= Decimal("0.55")
@@ -109,4 +131,4 @@ def analyze_market_regime(value: MarketRegimeInput) -> MarketRegime:
     )
 
 
-__all__ = ["analyze_market_regime"]
+__all__ = ["analyze_market_regime", "infer_market_state_without_history"]

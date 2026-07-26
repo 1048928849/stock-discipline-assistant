@@ -1,4 +1,5 @@
 import time
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Callable
@@ -762,6 +763,10 @@ class AKShareProvider(
         if not rows:
             raise ProviderUnavailableError("industry daily data returned no rows")
         rows.sort(key=lambda item: item.trade_date)
+        if rows[-1].trade_date != latest_completed:
+            raise ProviderUnavailableError(
+                "industry daily data does not include the latest completed session"
+            )
         return rows
 
     def get_industry_constituents(
@@ -779,6 +784,22 @@ class AKShareProvider(
                 (name for name in ("\u6743\u91cd", "weight") if name in frame.columns),
                 None,
             )
+            change_column = next(
+                (name for name in ("\u6da8\u8dcc\u5e45", "change_pct") if name in frame.columns),
+                None,
+            )
+            price_column = next(
+                (name for name in ("\u6700\u65b0\u4ef7", "latest_price") if name in frame.columns),
+                None,
+            )
+            high_column = next(
+                (
+                    name
+                    for name in ("52\u5468\u6700\u9ad8", "\u6700\u9ad8", "high_52w")
+                    if name in frame.columns
+                ),
+                None,
+            )
             rows = [
                 IndustryConstituent(
                     industry=industry,
@@ -792,6 +813,30 @@ class AKShareProvider(
                     observed_at=fetched_at,
                     source="akshare_eastmoney_industry_members",
                     fetched_at=fetched_at,
+                    change_pct=(
+                        self._optional_decimal(raw[change_column])
+                        if change_column
+                        else None
+                    ),
+                    latest_price=(
+                        self._optional_decimal(raw[price_column])
+                        if price_column
+                        else None
+                    ),
+                    high_52w=(
+                        self._optional_decimal(raw[high_column])
+                        if high_column
+                        else None
+                    ),
+                    is_new_high=(
+                        self._optional_decimal(raw[price_column])
+                        >= self._optional_decimal(raw[high_column])
+                        if price_column
+                        and high_column
+                        and self._optional_decimal(raw[price_column]) is not None
+                        and self._optional_decimal(raw[high_column]) is not None
+                        else None
+                    ),
                 )
                 for _, raw in frame.iterrows()
             ]
@@ -803,20 +848,108 @@ class AKShareProvider(
             raise ProviderUnavailableError("industry constituents returned no rows")
         return rows
 
+    def list_industries(self) -> list[str]:
+        try:
+            frame = self._retry(
+                "eastmoney-industry-list",
+                self._ak().stock_board_industry_name_em,
+            )
+            name_column = self._column(
+                frame, "\u677f\u5757\u540d\u79f0", "\u540d\u79f0", "name", "industry"
+            )
+            names = sorted(
+                {
+                    str(value).strip()
+                    for value in frame[name_column].tolist()
+                    if str(value).strip()
+                }
+            )
+        except Exception as exc:
+            raise ProviderUnavailableError(
+                f"industry universe is unavailable: {type(exc).__name__}"
+            ) from exc
+        if not names:
+            raise ProviderUnavailableError("industry universe returned no industries")
+        return names
+
+    def get_industry_constituents_universe(self) -> list[IndustryConstituent]:
+        rows = [
+            member
+            for industry in self.list_industries()
+            for member in self.get_industry_constituents(industry)
+        ]
+        if not rows:
+            raise ProviderUnavailableError("industry constituent universe is empty")
+        return rows
+
+    def get_industry_universe(
+        self, start: date, end: date
+    ) -> list[IndustryDaily]:
+        series = {
+            industry: self.get_industry_daily(industry, start, end)
+            for industry in self.list_industries()
+        }
+        constituents = {
+            industry: self.get_industry_constituents(industry)
+            for industry in series
+        }
+        totals: dict[date, Decimal] = {}
+        for rows in series.values():
+            for row in rows:
+                if row.amount is not None:
+                    totals[row.trade_date] = totals.get(row.trade_date, Decimal("0")) + row.amount
+        result = []
+        for industry, rows in sorted(series.items()):
+            members = constituents[industry]
+            changes = [item.change_pct for item in members if item.change_pct is not None]
+            new_highs = [item.is_new_high for item in members if item.is_new_high is not None]
+            latest_date = rows[-1].trade_date
+            for row in rows:
+                total = totals.get(row.trade_date)
+                latest = row.trade_date == latest_date
+                result.append(
+                    replace(
+                        row,
+                        amount_share=(
+                            row.amount / total
+                            if row.amount is not None and total
+                            else None
+                        ),
+                        advance_ratio=(
+                            Decimal(sum(value > 0 for value in changes))
+                            / Decimal(len(changes))
+                            if latest and changes
+                            else None
+                        ),
+                        limit_up_count=(
+                            sum(value >= Decimal("9.8") for value in changes)
+                            if latest and changes
+                            else None
+                        ),
+                        leader_strength=max(changes) if latest and changes else None,
+                        new_high_ratio=(
+                            Decimal(sum(value is True for value in new_highs))
+                            / Decimal(len(new_highs))
+                            if latest and new_highs
+                            else None
+                        ),
+                    )
+                )
+        if not result:
+            raise ProviderUnavailableError("industry market universe is empty")
+        return result
+
     def company_concepts(self, symbol: str) -> list[dict]:
         payload = self.company_industry_concepts(symbol)
         concepts = payload.get("concepts") or []
-        if not concepts:
-            raise ProviderUnavailableError(
-                "AKShare has no authoritative company concept membership for this symbol"
-            )
         fetched_at = self._aware_now()
         return [
             {
                 "concept": item["name"],
-                "relevance": "INSUFFICIENT_EVIDENCE",
+                "relevance": item.get("relevance", "INSUFFICIENT_EVIDENCE"),
                 "evidence_summary": item.get("evidence"),
                 "source": payload.get("source", "AKShare"),
+                "source_url": "https://webapi.cninfo.com.cn/",
                 "observed_at": fetched_at,
                 "fetched_at": fetched_at,
             }
@@ -825,10 +958,45 @@ class AKShareProvider(
         ]
 
     def company_industry_chain(self, symbol: str) -> list[dict]:
-        del symbol
-        raise ProviderUnavailableError(
-            "AKShare does not provide authoritative industry-chain positions"
+        profile = self.company_profile(symbol)
+        text = self._profile_evidence_text(profile)
+        fetched_at = self._aware_now()
+        mappings = (
+            (("\u96c6\u6210\u7535\u8def\u8bbe\u8ba1", "\u82af\u7247\u8bbe\u8ba1"), "\u534a\u5bfc\u4f53\u4ea7\u4e1a\u94fe", "\u82af\u7247\u8bbe\u8ba1", "DESIGN"),
+            (("\u6676\u5706\u5236\u9020",), "\u534a\u5bfc\u4f53\u4ea7\u4e1a\u94fe", "\u6676\u5706\u5236\u9020", "MANUFACTURING"),
+            (("\u5c01\u88c5\u6d4b\u8bd5", "\u82af\u7247\u5c01\u88c5"), "\u534a\u5bfc\u4f53\u4ea7\u4e1a\u94fe", "\u5c01\u88c5\u6d4b\u8bd5", "PACKAGING_TEST"),
+            (("\u5149\u4f0f\u7ec4\u4ef6",), "\u5149\u4f0f\u4ea7\u4e1a\u94fe", "\u7ec4\u4ef6", "DOWNSTREAM"),
+            (("\u9502\u7535\u6c60\u6b63\u6781\u6750\u6599", "\u6b63\u6781\u6750\u6599"), "\u9502\u7535\u4ea7\u4e1a\u94fe", "\u6b63\u6781\u6750\u6599", "UPSTREAM"),
         )
+        matched = next(
+            (item for item in mappings if any(keyword in text for keyword in item[0])),
+            None,
+        )
+        if matched is None:
+            chain_name, node_name, stage, relevance = (
+                "UNRESOLVED",
+                "UNRESOLVED",
+                "UNKNOWN",
+                "INSUFFICIENT_EVIDENCE",
+            )
+        else:
+            _, chain_name, node_name, stage = matched
+            relevance = "CORE_BUSINESS"
+        return [
+            {
+                "chain_name": chain_name,
+                "node_name": node_name,
+                "stage": stage,
+                "relevance": relevance,
+                "primary_products": [],
+                "revenue_relevance": "unknown",
+                "source": "AKShare/CNINFO company profile",
+                "source_url": "https://webapi.cninfo.com.cn/",
+                "evidence_summary": text[:1000] or "company profile has no proving business text",
+                "observed_at": fetched_at,
+                "fetched_at": fetched_at,
+            }
+        ]
 
     @staticmethod
     def _records(frame, limit: int = 500) -> list[dict]:
@@ -866,7 +1034,7 @@ class AKShareProvider(
         except Exception as exc:
             raise ProviderUnavailableError(f"行业板块暂不可用：{type(exc).__name__}") from exc
 
-    def company_industry_concepts(self, symbol: str) -> dict:
+    def _legacy_company_industry_concepts(self, symbol: str) -> dict:
         profile = self.company_profile(symbol)
         industry = profile.get("细分行业") or profile.get("所属行业")
         return {
@@ -874,6 +1042,60 @@ class AKShareProvider(
             "concepts": [],
             "source": "AKShare/巨潮公司概况",
         }
+
+    def company_industry_concepts(self, symbol: str) -> dict:
+        profile = self.company_profile(symbol)
+        industry = profile.get("\u7ec6\u5206\u884c\u4e1a") or profile.get("\u6240\u5c5e\u884c\u4e1a")
+        text = self._profile_evidence_text(profile)
+        catalog = (
+            ("\u534a\u5bfc\u4f53", ("\u534a\u5bfc\u4f53", "\u82af\u7247", "\u96c6\u6210\u7535\u8def")),
+            ("\u4eba\u5de5\u667a\u80fd", ("\u4eba\u5de5\u667a\u80fd", "AI\u670d\u52a1\u5668", "AI\u82af\u7247")),
+            ("\u673a\u5668\u4eba", ("\u673a\u5668\u4eba", "\u673a\u5668\u89c6\u89c9")),
+            ("\u5149\u4f0f", ("\u5149\u4f0f", "\u592a\u9633\u80fd\u7535\u6c60")),
+            ("\u9502\u7535\u6c60", ("\u9502\u7535\u6c60", "\u6b63\u6781\u6750\u6599", "\u8d1f\u6781\u6750\u6599")),
+        )
+        concepts = [
+            {"name": name, "evidence": text[:1000], "relevance": "CORE_BUSINESS"}
+            for name, keywords in catalog
+            if any(keyword.lower() in text.lower() for keyword in keywords)
+        ]
+        if industry and all(item["name"] != str(industry).strip() for item in concepts):
+            concepts.append(
+                {
+                    "name": str(industry).strip(),
+                    "evidence": f"CNINFO industry classification: {industry}",
+                    "relevance": "IMPORTANT_BUSINESS",
+                }
+            )
+        if not concepts:
+            concepts.append(
+                {
+                    "name": "UNRESOLVED",
+                    "evidence": text[:1000] or "company profile has no proving business text",
+                    "relevance": "INSUFFICIENT_EVIDENCE",
+                }
+            )
+        return {
+            "industries": [{"name": industry, "level": "provider"}] if industry else [],
+            "concepts": concepts,
+            "source": "AKShare/CNINFO company profile",
+        }
+
+    @staticmethod
+    def _profile_evidence_text(profile: dict) -> str:
+        fields = (
+            "\u4e3b\u8425\u4e1a\u52a1",
+            "\u7ecf\u8425\u8303\u56f4",
+            "\u516c\u53f8\u7b80\u4ecb",
+            "\u516c\u53f8\u4e3b\u8981\u4ea7\u54c1",
+            "\u7ec6\u5206\u884c\u4e1a",
+            "\u6240\u5c5e\u884c\u4e1a",
+        )
+        return " | ".join(
+            f"{field}: {str(profile[field]).strip()}"
+            for field in fields
+            if profile.get(field) is not None and str(profile[field]).strip()
+        )
 
     def company_news(self, symbol: str, start: datetime, end: datetime) -> list[dict]:
         try:

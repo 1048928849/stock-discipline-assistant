@@ -55,6 +55,7 @@ _PRODUCT_TABLES = (
     "market_amount_snapshots",
     "industry_market_snapshots",
     "industry_constituent_snapshots",
+    "market_regime_snapshots",
     "concepts",
     "company_concepts",
     "industry_chains",
@@ -310,7 +311,9 @@ def _seed_mysql_analysis_runs(
                     enable_ai=False,
                 ),
             )
-            assert result["decision_package"]["freeze_allowed"] is True
+            assert result["decision_package"]["freeze_allowed"] is True, result[
+                "decision_package"
+            ]["blocked_reasons"]
             run_ids.append(result["run_id"])
         return account.id, run_ids
 

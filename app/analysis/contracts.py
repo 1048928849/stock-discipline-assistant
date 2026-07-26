@@ -194,6 +194,9 @@ class ConceptChainContext(AnalysisModel):
     relevance: Relevance
     chain: str | None
     chain_node: str | None
+    chain_name: str | None = None
+    node_name: str | None = None
+    stage: str | None = None
     primary_products: tuple[str, ...]
     revenue_relevance: str
     core_level: str | None

@@ -128,6 +128,10 @@ class IndustryConstituent:
     observed_at: datetime
     source: str
     fetched_at: datetime
+    change_pct: Decimal | None = None
+    latest_price: Decimal | None = None
+    high_52w: Decimal | None = None
+    is_new_high: bool | None = None
 
 
 @dataclass(frozen=True)

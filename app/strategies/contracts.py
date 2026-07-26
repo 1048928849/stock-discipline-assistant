@@ -139,8 +139,33 @@ class StrategySignal(BaseModel):
         return self
 
 
+class StrategyDecisionCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    strategy_id: str
+    strategy_version: str
+    applicable: bool
+    signal_type: str
+    signal_strength: Decimal = Field(ge=0, le=1)
+    signal_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    blocked_reasons: tuple[str, ...]
+
+    @classmethod
+    def from_signal(cls, signal: StrategySignal) -> "StrategyDecisionCandidate":
+        return cls(
+            strategy_id=signal.strategy_id,
+            strategy_version=signal.strategy_version,
+            applicable=signal.applicable,
+            signal_type=signal.signal_type,
+            signal_strength=signal.signal_strength,
+            signal_hash=signal.signal_hash,
+            blocked_reasons=signal.blocked_reasons,
+        )
+
+
 __all__ = [
     "FORMAL_DATA_CAPABILITIES",
     "StrategyManifest",
+    "StrategyDecisionCandidate",
     "StrategySignal",
 ]

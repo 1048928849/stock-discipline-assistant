@@ -99,6 +99,18 @@ def industry_constituents_subject(industry: str) -> SubjectRef:
     )
 
 
+def industry_universe_subject(*, constituents: bool = False) -> SubjectRef:
+    return SubjectRef(
+        subject_type="market",
+        subject_id="CN-A",
+        semantic_key=(
+            "industry-universe/constituents/current"
+            if constituents
+            else "industry-universe/daily/unadjusted/CNY/share"
+        ),
+    )
+
+
 def company_concepts_subject(symbol: str) -> SubjectRef:
     return SubjectRef(
         subject_type="stock",
@@ -164,6 +176,7 @@ __all__ = [
     "company_industry_chain_subject",
     "index_daily_subject",
     "industry_constituents_subject",
+    "industry_universe_subject",
     "market_amount_subject",
     "market_breadth_subject",
     "sector_daily_subject",

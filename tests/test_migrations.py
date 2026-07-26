@@ -15,6 +15,7 @@ PRODUCT_TABLES = {
     "market_amount_snapshots",
     "industry_market_snapshots",
     "industry_constituent_snapshots",
+    "market_regime_snapshots",
     "concepts",
     "company_concepts",
     "industry_chains",
@@ -227,3 +228,11 @@ def test_0012_product_tables_upgrade_and_downgrade(tmp_path):
         }
     assert not PRODUCT_TABLES & remaining
     _alembic(database, "upgrade", "head")
+
+
+def test_0012_uses_explicit_immutable_table_definitions():
+    source = (
+        ROOT / "alembic" / "versions" / "20260726_0012_product_v1_data_foundation.py"
+    ).read_text(encoding="utf-8")
+    assert "Base.metadata" not in source
+    assert "op.create_table" in source

@@ -64,9 +64,8 @@ from app.services.research_cache import (
 )
 from app.services.plan_freeze import freeze_trade_plan
 from app.services.product_pipeline import (
-    has_product_cache,
-    router_supports_product_data,
     run_product_pipeline,
+    should_run_product_pipeline,
 )
 from app.services.trade_plan_generator import (
     GENERATOR_PARAMETERS,
@@ -1403,9 +1402,7 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
             orchestrator_id=research_orchestrator.orchestrator_id,
         )
         product_result = None
-        if has_product_cache(db, payload.symbol) or (
-            payload.refresh and router_supports_product_data(provider)
-        ):
+        if should_run_product_pipeline(db, provider, payload.symbol):
             risk_levels = {
                 str(item.get("risk_level"))
                 for item in research.get("risk_events", [])

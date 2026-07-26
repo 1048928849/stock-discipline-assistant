@@ -298,6 +298,10 @@ class IndustryConstituentSnapshot(Base):
     symbol: Mapped[str] = mapped_column(String(12), index=True)
     name: Mapped[str] = mapped_column(String(100))
     weight: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    change_pct: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    latest_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    high_52w: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    is_new_high: Mapped[bool | None] = mapped_column(Boolean)
     snapshot_date: Mapped[date] = mapped_column(Date, index=True)
     observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
     source: Mapped[str] = mapped_column(String(80))
@@ -305,6 +309,21 @@ class IndustryConstituentSnapshot(Base):
     quality_record_id: Mapped[int] = mapped_column(
         ForeignKey("data_quality_records.id"), nullable=False, index=True
     )
+
+
+class MarketRegimeSnapshot(Base):
+    __tablename__ = "market_regime_snapshots"
+    __table_args__ = (
+        UniqueConstraint("market_id", "trade_date", name="uq_market_regime_date"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    market_id: Mapped[str] = mapped_column(String(20), default="CN-A")
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    state: Mapped[str] = mapped_column(String(20), index=True)
+    previous_state: Mapped[str] = mapped_column(String(20))
+    transition: Mapped[str] = mapped_column(String(50))
+    product_snapshot_hash: Mapped[str] = mapped_column(String(64))
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
 
 
 class Concept(Base):
