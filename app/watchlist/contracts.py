@@ -31,6 +31,7 @@ class WatchlistSourceType(str, Enum):
     MANUAL = "MANUAL"
     PRODUCT_ANALYSIS = "PRODUCT_ANALYSIS"
     STRATEGY_SIGNAL = "STRATEGY_SIGNAL"
+    CANDIDATE_DISCOVERY = "CANDIDATE_DISCOVERY"
 
 
 class MonitoringRuleType(str, Enum):

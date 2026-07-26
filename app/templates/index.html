@@ -6,11 +6,12 @@
   <title>股票纪律助手</title>
   <link rel="stylesheet" href="/static/app.css">
   <link rel="stylesheet" href="/static/product-v1.css?v=20260726">
+  <link rel="stylesheet" href="/static/discovery.css?v=20260727b">
 </head>
 <body data-page="{{ page|default('dashboard') }}">
   <aside class="sidebar">
     <div class="brand"><small>STOCK DISCIPLINE</small><b>纪律助手</b></div>
-    <nav>
+    <nav><a href="/opportunities">机会池</a>
       <span class="nav-group">今日</span><a href="/dashboard">今日工作台</a>
       <span class="nav-group">研究中心</span><a href="/market">市场与主线</a><a href="/company-research">公司与财报</a><a href="/technical">技术研究</a><a href="/x-monitor">产业线索 / X</a>
       <span class="nav-group">计划与执行</span><a href="/trade-plans">交易计划</a><a href="/watchlist">观察名单</a><a href="/holdings">持仓管理</a><a href="/trades">交易记录</a>
@@ -86,6 +87,28 @@
       <h3>已有计划</h3><div id="trade-plan-list" class="risk-grid"></div><details class="developer-details"><summary>技术详情 / 调试信息（默认隐藏）</summary><pre id="trade-plan-json"></pre></details>
     </section>
 
+    <section class="panel" data-view="opportunities">
+      <div class="opportunity-heading">
+        <div><p class="eyebrow">DETERMINISTIC DISCOVERY</p><h2>机会池</h2></div>
+        <button id="discovery-run" type="button">运行盘后发现</button>
+      </div>
+      <div id="discovery-run-summary" class="discovery-summary"><div class="missing-data">暂无发现记录。</div></div>
+      <div class="opportunity-layout">
+        <section><h3>行业评估</h3><div id="discovery-industries" class="discovery-industries"></div></section>
+        <section><h3>候选研究</h3><div id="discovery-candidates" class="discovery-candidates"></div></section>
+      </div>
+      <dialog id="candidate-promote-dialog">
+        <form method="dialog" id="candidate-promote-form">
+          <input type="hidden" name="candidate_id">
+          <h3>研究并加入观察</h3>
+          <label><span>研究补充</span><textarea name="thesis" maxlength="4000" required></textarea></label>
+          <label><span>分析资金</span><input name="analysis_capital" type="number" min="1" value="300000" required></label>
+          <label><span>等待条件</span><textarea name="waiting_conditions" maxlength="2000"></textarea></label>
+          <div class="action-row"><button value="cancel">取消</button><button value="promote" class="primary-action">加入观察</button></div>
+        </form>
+      </dialog>
+    </section>
+
     <section class="panel" data-view="watchlist">
       <div class="watchlist-heading"><div><p class="eyebrow">DETERMINISTIC MONITORING</p><h2>观察名单</h2><p>监控只生成状态变化、事件和重新分析；确认与冻结始终由用户完成。</p></div><button id="watchlist-scan" type="button" title="立即扫描"><span aria-hidden="true">↻</span> 扫描</button></div>
       <div id="watchlist-summary" class="cards"></div>
@@ -143,5 +166,6 @@
   <div id="toast" role="status"></div>
   <script src="/static/app.js"></script>
   <script src="/static/product-v1.js?v=20260726"></script>
+  <script src="/static/discovery.js?v=20260727b"></script>
 </body>
 </html>

@@ -223,6 +223,7 @@ def create_watchlist_item(
     payload: WatchlistCreateRequest,
     *,
     now: datetime | None = None,
+    source_reference_override: str | None = None,
 ) -> WatchlistItem:
     created_at = now or utc_now_naive()
     if payload.source_type == WatchlistSourceType.PRODUCT_ANALYSIS:
@@ -237,7 +238,7 @@ def create_watchlist_item(
         )
     else:
         assert payload.symbol is not None
-        source_reference = uuid4().hex
+        source_reference = source_reference_override or uuid4().hex
         values = {
             "account_id": None,
             "symbol": payload.symbol,

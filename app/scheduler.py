@@ -1,5 +1,6 @@
 from datetime import date, datetime, timedelta
 import logging
+from uuid import uuid4
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import select
@@ -10,8 +11,10 @@ from app.models import Account, SystemJob, TradeReview, XPost, XWatchAccount, XW
 from app.services.reviews import review_metrics
 from app.services.technical_snapshots import snapshot_all_holdings
 from app.services.data_sources import UnifiedDataService
-from app.data_hub.trading_calendar import shanghai_now
+from app.data_hub.trading_calendar import get_trading_calendar, shanghai_now
+from app.discovery.service import CandidateDiscoveryService
 from app.watchlist.monitoring import WatchlistMonitoringService
+from app.watchlist.lease import acquire_monitor_lease, release_monitor_lease
 
 
 scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
@@ -140,6 +143,34 @@ def scan_watchlist() -> None:
         logger.exception("scheduled watchlist scan failed")
 
 
+def run_candidate_discovery() -> None:
+    now = shanghai_now()
+    calendar = get_trading_calendar()
+    if not calendar.is_session(now.date()) or now < calendar.session_close_at(now.date()):
+        return
+    try:
+        with SessionLocal() as db:
+            owner_token = f"candidate-discovery:{uuid4().hex}"
+            if not acquire_monitor_lease(
+                db,
+                owner_token=owner_token,
+                lease_name="candidate_discovery",
+                lease_seconds=3600,
+                now=now,
+            ):
+                return
+            try:
+                CandidateDiscoveryService(db, calendar=calendar).run(now=now)
+            finally:
+                release_monitor_lease(
+                    db,
+                    owner_token=owner_token,
+                    lease_name="candidate_discovery",
+                )
+    except Exception:
+        logger.exception("scheduled candidate discovery failed")
+
+
 def start_scheduler() -> None:
     settings = get_settings()
     if scheduler.running or not settings.scheduler_enabled:
@@ -202,6 +233,21 @@ def start_scheduler() -> None:
             )
         except Exception:
             logger.exception("watchlist scheduler registration failed")
+    if settings.candidate_discovery_enabled:
+        try:
+            scheduler.add_job(
+                run_candidate_discovery,
+                "cron",
+                day_of_week="mon-fri",
+                hour=settings.candidate_discovery_hour,
+                minute=settings.candidate_discovery_minute,
+                id="candidate_discovery",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+            )
+        except Exception:
+            logger.exception("candidate discovery scheduler registration failed")
     try:
         scheduler.start()
     except Exception:

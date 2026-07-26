@@ -311,6 +311,59 @@ class IndustryConstituentSnapshot(Base):
     )
 
 
+class IndustryCapitalFlowSnapshot(Base):
+    __tablename__ = "industry_capital_flow_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "industry_key", "trade_date", name="uq_industry_capital_flow_date"
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    industry_key: Mapped[str] = mapped_column(String(40), index=True)
+    industry_name: Mapped[str] = mapped_column(String(200), index=True)
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    net_inflow_1d: Mapped[Decimal] = mapped_column(Numeric(24, 4))
+    net_inflow_5d: Mapped[Decimal] = mapped_column(Numeric(24, 4))
+    net_inflow_10d: Mapped[Decimal] = mapped_column(Numeric(24, 4))
+    amount: Mapped[Decimal] = mapped_column(Numeric(24, 4))
+    amount_unit: Mapped[str] = mapped_column(String(10))
+    source: Mapped[str] = mapped_column(String(100))
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    fetched_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    quality_record_id: Mapped[int] = mapped_column(
+        ForeignKey("data_quality_records.id"), nullable=False, index=True
+    )
+
+
+class MarketEventPoolSnapshot(Base):
+    __tablename__ = "market_event_pool_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "trade_date", "event_type", "symbol", name="uq_market_event_pool_symbol"
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    name: Mapped[str] = mapped_column(String(100))
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    event_type: Mapped[str] = mapped_column(String(20), index=True)
+    first_event_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    last_event_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    sealed_amount: Mapped[Decimal | None] = mapped_column(Numeric(24, 4))
+    sealed_amount_unit: Mapped[str] = mapped_column(String(10))
+    turnover_rate: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    turnover_rate_unit: Mapped[str] = mapped_column(String(20))
+    consecutive_days: Mapped[int] = mapped_column(Integer)
+    industry_name: Mapped[str | None] = mapped_column(String(200), index=True)
+    reason_summary: Mapped[str | None] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(100))
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    fetched_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    quality_record_id: Mapped[int] = mapped_column(
+        ForeignKey("data_quality_records.id"), nullable=False, index=True
+    )
+
+
 class MarketRegimeSnapshot(Base):
     __tablename__ = "market_regime_snapshots"
     __table_args__ = (
@@ -1083,6 +1136,98 @@ class ReanalysisRun(Base):
     started_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
     finished_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
     created_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+
+
+class CandidateDiscoveryRun(Base):
+    __tablename__ = "candidate_discovery_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "market",
+            "trade_date",
+            "algorithm_version",
+            "config_hash",
+            name="uq_candidate_discovery_run_identity",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    market: Mapped[str] = mapped_column(String(10), index=True)
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    algorithm_id: Mapped[str] = mapped_column(String(64))
+    algorithm_version: Mapped[str] = mapped_column(String(20))
+    config_hash: Mapped[str] = mapped_column(String(64))
+    input_snapshot_hash: Mapped[str | None] = mapped_column(String(64))
+    market_state: Mapped[str | None] = mapped_column(String(20))
+    quality_status: Mapped[str] = mapped_column(String(20))
+    blocked_reasons: Mapped[list] = mapped_column(JSON, default=list)
+    quality_bindings: Mapped[list] = mapped_column(JSON, default=list)
+    industries_evaluated: Mapped[int] = mapped_column(Integer, default=0)
+    candidates_generated: Mapped[int] = mapped_column(Integer, default=0)
+    total_constituents: Mapped[int] = mapped_column(Integer, default=0)
+    historical_data_ready: Mapped[int] = mapped_column(Integer, default=0)
+    historical_data_missing: Mapped[int] = mapped_column(Integer, default=0)
+    coverage_ratio: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal("0")
+    )
+    started_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    completed_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    created_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+
+
+class CandidateIndustryAssessment(Base):
+    __tablename__ = "candidate_industry_assessments"
+    __table_args__ = (
+        UniqueConstraint(
+            "discovery_run_id", "industry_key", name="uq_candidate_industry_run"
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    discovery_run_id: Mapped[int] = mapped_column(
+        ForeignKey("candidate_discovery_runs.id", ondelete="CASCADE"), index=True
+    )
+    industry_key: Mapped[str] = mapped_column(String(40), index=True)
+    industry_name: Mapped[str] = mapped_column(String(200), index=True)
+    classification: Mapped[str] = mapped_column(String(20), index=True)
+    score: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    rank: Mapped[int | None] = mapped_column(Integer)
+    metrics: Mapped[dict] = mapped_column(JSON)
+    reason_codes: Mapped[list] = mapped_column(JSON)
+    evidence_references: Mapped[list] = mapped_column(JSON)
+    quality_status: Mapped[str] = mapped_column(String(20))
+
+
+class DiscoveryCandidate(Base):
+    __tablename__ = "discovery_candidates"
+    __table_args__ = (
+        UniqueConstraint(
+            "discovery_run_id", "symbol", name="uq_discovery_candidate_run_symbol"
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    discovery_run_id: Mapped[int] = mapped_column(
+        ForeignKey("candidate_discovery_runs.id", ondelete="CASCADE"), index=True
+    )
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    name: Mapped[str] = mapped_column(String(100))
+    industry_key: Mapped[str] = mapped_column(String(40), index=True)
+    industry_name: Mapped[str] = mapped_column(String(200), index=True)
+    candidate_type: Mapped[str] = mapped_column(String(30), index=True)
+    score: Mapped[Decimal] = mapped_column(Numeric(18, 8))
+    rank: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    current_price: Mapped[Decimal] = mapped_column(PRICE)
+    technical_metrics: Mapped[dict] = mapped_column(JSON)
+    reason_codes: Mapped[list] = mapped_column(JSON)
+    risk_flags: Mapped[list] = mapped_column(JSON)
+    evidence_references: Mapped[list] = mapped_column(JSON)
+    quality_status: Mapped[str] = mapped_column(String(20))
+    snapshot_hash: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME, index=True)
+    promoted_watchlist_item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("watchlist_items.id"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    updated_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
 
 
 class MonitoringEvent(Base):

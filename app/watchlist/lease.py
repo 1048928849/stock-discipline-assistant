@@ -25,17 +25,20 @@ def acquire_monitor_lease(
     *,
     owner_token: str,
     lease_seconds: int,
+    lease_name: str = LEASE_NAME,
     now: datetime | None = None,
 ) -> bool:
     if not owner_token or len(owner_token) > 64:
         raise ValueError("owner_token must contain 1 to 64 characters")
     if lease_seconds < 1:
         raise ValueError("lease_seconds must be positive")
+    if not lease_name or len(lease_name) > 64:
+        raise ValueError("lease_name must contain 1 to 64 characters")
     acquired_at = _utc_naive(now)
     acquired_until = acquired_at + timedelta(seconds=lease_seconds)
     dialect = db.get_bind().dialect.name
     values = {
-        "name": LEASE_NAME,
+        "name": lease_name,
         "owner_token": owner_token,
         "acquired_until": acquired_until,
         "lease_version": 1,
@@ -71,7 +74,7 @@ def acquire_monitor_lease(
         )
         result = db.execute(
             update(WatchlistMonitorLease)
-            .where(WatchlistMonitorLease.name == LEASE_NAME, available)
+            .where(WatchlistMonitorLease.name == lease_name, available)
             .values(
                 owner_token=owner_token,
                 acquired_until=acquired_until,
@@ -85,7 +88,7 @@ def acquire_monitor_lease(
         result = db.execute(
             update(WatchlistMonitorLease)
             .where(
-                WatchlistMonitorLease.name == LEASE_NAME,
+                WatchlistMonitorLease.name == lease_name,
                 (
                     WatchlistMonitorLease.acquired_until.is_(None)
                     | (WatchlistMonitorLease.acquired_until <= acquired_at)
@@ -108,11 +111,16 @@ def acquire_monitor_lease(
     return bool(result.rowcount)
 
 
-def release_monitor_lease(db: Session, *, owner_token: str) -> bool:
+def release_monitor_lease(
+    db: Session,
+    *,
+    owner_token: str,
+    lease_name: str = LEASE_NAME,
+) -> bool:
     result = db.execute(
         update(WatchlistMonitorLease)
         .where(
-            WatchlistMonitorLease.name == LEASE_NAME,
+            WatchlistMonitorLease.name == lease_name,
             WatchlistMonitorLease.owner_token == owner_token,
         )
         .values(owner_token=None, acquired_until=None, updated_at=_utc_naive())

@@ -369,6 +369,9 @@ class DataHubRouter:
         if capability.startswith("announcement."):
             return fetched_at
         if isinstance(value, list):
+            explicit_observed_at = getattr(value, "observed_at", None)
+            if isinstance(explicit_observed_at, (datetime, date)):
+                return explicit_observed_at
             structured_times = [
                 item.observed_at
                 for item in value
@@ -860,6 +863,15 @@ class DataHubRouter:
             try:
                 value = getattr(provider, operation)(*args, **kwargs)
                 fetched_at = self._now()
+                provider_cache_used = bool(getattr(value, "cache_used", False))
+                provider_fetched_at = getattr(value, "fetched_at", None)
+                if hasattr(value, "cache_used") and isinstance(
+                    provider_fetched_at, datetime
+                ):
+                    fetched_at = to_shanghai_aware(
+                        provider_fetched_at,
+                        naive_is_shanghai=provider_fetched_at.tzinfo is None,
+                    )
                 if capability in {
                     "market.quote.realtime",
                     "market.quote.latest_close",
@@ -916,7 +928,7 @@ class DataHubRouter:
                         "duration_ms": duration_ms,
                         "observed_at": observed_at.isoformat() if observed_at else None,
                         "fetched_at": fetched_at.isoformat(),
-                        "cache_used": False,
+                        "cache_used": provider_cache_used,
                         "fallback_used": index > 0,
                         "stale": stale,
                         "normalized_digest": digest,
@@ -994,7 +1006,11 @@ class DataHubRouter:
                 observed_at=scan_completed_at or selected.observed_at,
                 fetched_at=selected.fetched_at or self._now(),
                 fallback_used=bool(errors) or selected.provider_id != observations[0].provider_id,
-                cache_used=False,
+                cache_used=any(
+                    bool(item.get("cache_used"))
+                    for item in audit
+                    if item.get("status") == "success"
+                ),
                 errors=errors,
                 quality_status=quality,
                 provider_observations=audit,
@@ -1309,6 +1325,45 @@ class DataHubRouter:
             subject=subject,
             cache_loader=cache_loader,
             validator=lambda value: isinstance(value, list) and bool(value),
+        )
+
+    def get_industry_capital_flow(self, day: date, cache_loader=None):
+        from app.data_hub.market_subjects import industry_capital_flow_subject
+
+        return self.invoke(
+            "market.industry.capital_flow",
+            "get_industry_capital_flow",
+            day,
+            symbol="CN-A",
+            subject=industry_capital_flow_subject(),
+            cache_loader=cache_loader,
+            validator=lambda value: isinstance(value, list) and bool(value),
+        )
+
+    def get_limit_up_pool(self, day: date, cache_loader=None):
+        from app.data_hub.market_subjects import market_event_pool_subject
+
+        return self.invoke(
+            "market.limit_up_pool",
+            "get_limit_up_pool",
+            day,
+            symbol="CN-A",
+            subject=market_event_pool_subject("limit-up"),
+            cache_loader=cache_loader,
+            validator=lambda value: isinstance(value, list),
+        )
+
+    def get_broken_limit_pool(self, day: date, cache_loader=None):
+        from app.data_hub.market_subjects import market_event_pool_subject
+
+        return self.invoke(
+            "market.broken_limit_pool",
+            "get_broken_limit_pool",
+            day,
+            symbol="CN-A",
+            subject=market_event_pool_subject("broken-limit"),
+            cache_loader=cache_loader,
+            validator=lambda value: isinstance(value, list),
         )
 
     def get_industry_universe(

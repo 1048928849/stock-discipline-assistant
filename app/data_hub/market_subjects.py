@@ -90,6 +90,25 @@ def market_amount_subject() -> SubjectRef:
     )
 
 
+def industry_capital_flow_subject() -> SubjectRef:
+    return SubjectRef(
+        subject_type="market",
+        subject_id="CN-A",
+        semantic_key="industry-capital-flow/daily/CNY",
+    )
+
+
+def market_event_pool_subject(event_type: str) -> SubjectRef:
+    normalized = _required_component(event_type, name="event_type").lower()
+    if normalized not in {"limit-up", "broken-limit"}:
+        raise ValueError("unsupported market event pool")
+    return SubjectRef(
+        subject_type="market",
+        subject_id="CN-A",
+        semantic_key=f"{normalized}-pool/daily",
+    )
+
+
 def industry_constituents_subject(industry: str) -> SubjectRef:
     base = sector_daily_subject(industry, "unadjusted", "CNY", "share")
     return SubjectRef(
@@ -176,9 +195,11 @@ __all__ = [
     "company_industry_chain_subject",
     "index_daily_subject",
     "industry_constituents_subject",
+    "industry_capital_flow_subject",
     "industry_universe_subject",
     "market_amount_subject",
     "market_breadth_subject",
+    "market_event_pool_subject",
     "sector_daily_subject",
     "stock_daily_subject",
     "stock_intraday_subject",
