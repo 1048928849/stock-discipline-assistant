@@ -448,6 +448,15 @@ def test_mysql_0015_candidate_discovery_round_trip(mysql_database: URL):
     _alembic(mysql_database, "upgrade", "head")
     inspector = inspect(engine)
     assert set(_CANDIDATE_DISCOVERY_TABLES) <= set(inspector.get_table_names())
+    run_columns = {
+        item["name"] for item in inspector.get_columns("candidate_discovery_runs")
+    }
+    assert {
+        "total_constituents",
+        "historical_data_ready",
+        "historical_data_missing",
+        "coverage_ratio",
+    } <= run_columns
     run_constraints = {
         item["name"]
         for item in inspector.get_unique_constraints("candidate_discovery_runs")

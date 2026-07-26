@@ -1163,6 +1163,12 @@ class CandidateDiscoveryRun(Base):
     quality_bindings: Mapped[list] = mapped_column(JSON, default=list)
     industries_evaluated: Mapped[int] = mapped_column(Integer, default=0)
     candidates_generated: Mapped[int] = mapped_column(Integer, default=0)
+    total_constituents: Mapped[int] = mapped_column(Integer, default=0)
+    historical_data_ready: Mapped[int] = mapped_column(Integer, default=0)
+    historical_data_missing: Mapped[int] = mapped_column(Integer, default=0)
+    coverage_ratio: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal("0")
+    )
     started_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
     completed_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
     created_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)

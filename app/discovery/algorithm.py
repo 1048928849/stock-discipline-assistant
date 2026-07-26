@@ -201,6 +201,28 @@ def discover_candidates(
     config: DiscoveryConfig,
 ) -> DiscoveryResult:
     snapshot_hash = snapshot.snapshot_hash()
+    total_constituents = sum(
+        item.total_constituents for item in snapshot.industries
+    )
+    historical_data_ready = sum(
+        item.historical_data_ready for item in snapshot.industries
+    )
+    historical_data_missing = sum(
+        item.historical_data_missing for item in snapshot.industries
+    )
+    coverage_ratio = (
+        (
+            Decimal(historical_data_ready) / Decimal(total_constituents)
+        ).quantize(Decimal("0.000001"))
+        if total_constituents
+        else Decimal("0")
+    )
+    coverage_fields = {
+        "total_constituents": total_constituents,
+        "historical_data_ready": historical_data_ready,
+        "historical_data_missing": historical_data_missing,
+        "coverage_ratio": coverage_ratio,
+    }
     if snapshot.market.quality_status not in _EXECUTABLE_QUALITY:
         return DiscoveryResult(
             status="BLOCKED",
@@ -210,7 +232,9 @@ def discover_candidates(
             input_snapshot_hash=snapshot_hash,
             market_state=snapshot.market.state,
             quality_status=snapshot.market.quality_status,
-            blocked_reasons=(f"MARKET_QUALITY_{snapshot.market.quality_status}",),
+            blocked_reasons=snapshot.blocked_reasons
+            or (f"MARKET_QUALITY_{snapshot.market.quality_status}",),
+            **coverage_fields,
             industries=(),
             candidates=(),
         )
@@ -267,6 +291,10 @@ def discover_candidates(
                     "net_inflow_5d": item.net_inflow_5d,
                     "net_inflow_10d": item.net_inflow_10d,
                     "broken_limit_rate": item.broken_limit_rate,
+                    "total_constituents": item.total_constituents,
+                    "historical_data_ready": item.historical_data_ready,
+                    "historical_data_missing": item.historical_data_missing,
+                    "coverage_ratio": item.coverage_ratio,
                 },
                 reason_codes=reasons,
                 evidence_references=item.evidence_references,
@@ -290,6 +318,7 @@ def discover_candidates(
             market_state=snapshot.market.state,
             quality_status=industry_quality,
             blocked_reasons=("INCOMPLETE_INDUSTRY_UNIVERSE",),
+            **coverage_fields,
             industries=tuple(industry_results),
             candidates=(),
         )
@@ -304,6 +333,30 @@ def discover_candidates(
             market_state=snapshot.market.state,
             quality_status=industry_quality,
             blocked_reasons=("NO_EXECUTABLE_INDUSTRY_DATA",),
+            **coverage_fields,
+            industries=tuple(industry_results),
+            candidates=(),
+        )
+
+    selected_industries = [
+        industry
+        for industry, score in scored_industries
+        if score is not None and industry.industry_key in selected_keys
+    ]
+    if any(
+        industry.coverage_ratio < config.candidate_min_history_coverage_ratio
+        for industry in selected_industries
+    ):
+        return DiscoveryResult(
+            status="BLOCKED",
+            algorithm_id=config.algorithm_id,
+            algorithm_version=config.algorithm_version,
+            config_hash=config.config_hash(),
+            input_snapshot_hash=snapshot_hash,
+            market_state=snapshot.market.state,
+            quality_status=_worst_quality(industry_quality, "MISSING"),
+            blocked_reasons=("HISTORICAL_UNIVERSE_COVERAGE_INSUFFICIENT",),
+            **coverage_fields,
             industries=tuple(industry_results),
             candidates=(),
         )
@@ -335,6 +388,7 @@ def discover_candidates(
             market_state=snapshot.market.state,
             quality_status=stock_quality,
             blocked_reasons=("NO_EXECUTABLE_STOCK_DATA",),
+            **coverage_fields,
             industries=tuple(industry_results),
             candidates=(),
         )
@@ -421,6 +475,7 @@ def discover_candidates(
         market_state=snapshot.market.state,
         quality_status=industry_quality,
         blocked_reasons=(),
+        **coverage_fields,
         industries=tuple(industry_results),
         candidates=tuple(candidate_results),
     )

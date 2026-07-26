@@ -114,6 +114,17 @@ def test_0015_candidate_discovery_roundtrip(tmp_path):
             )
         }
     assert CANDIDATE_DISCOVERY_TABLES <= upgraded
+    with sqlite3.connect(database) as connection:
+        run_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(candidate_discovery_runs)")
+        }
+    assert {
+        "total_constituents",
+        "historical_data_ready",
+        "historical_data_missing",
+        "coverage_ratio",
+    } <= run_columns
     _alembic(database, "downgrade", "20260727_0014")
     with sqlite3.connect(database) as connection:
         downgraded = {

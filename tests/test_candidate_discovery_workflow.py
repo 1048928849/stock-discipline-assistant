@@ -69,6 +69,10 @@ def _snapshot(*, market_state="EXPANSION", market_quality="VERIFIED"):
         broken_limit_rate=Decimal("0.1"),
         quality_status="VERIFIED",
         evidence_references=("quality:industry",),
+        total_constituents=1,
+        historical_data_ready=1,
+        historical_data_missing=0,
+        coverage_ratio=Decimal("1"),
         constituents=(stock,),
     )
     return DiscoverySnapshot(
@@ -90,6 +94,10 @@ def test_discovery_run_persists_immutable_results_and_is_idempotent(session):
     assert first.id == second.id
     assert first.status == "COMPLETED"
     assert first.candidates_generated == 1
+    assert first.total_constituents == 1
+    assert first.historical_data_ready == 1
+    assert first.historical_data_missing == 0
+    assert first.coverage_ratio == Decimal("1")
     assert session.scalar(select(func.count(CandidateDiscoveryRun.id))) == 1
     assert session.scalar(select(func.count(CandidateIndustryAssessment.id))) == 1
     assert session.scalar(select(func.count(DiscoveryCandidate.id))) == 1

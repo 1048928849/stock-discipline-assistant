@@ -65,3 +65,16 @@ def test_initial_schema_contains_required_tables(session):
         "discovery_candidates",
     }
     assert required == set(inspect(session.bind).get_table_names())
+
+
+def test_candidate_discovery_run_schema_contains_history_coverage(session):
+    columns = {
+        column["name"]
+        for column in inspect(session.bind).get_columns("candidate_discovery_runs")
+    }
+    assert {
+        "total_constituents",
+        "historical_data_ready",
+        "historical_data_missing",
+        "coverage_ratio",
+    } <= columns

@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     candidate_discovery_max_industries: int = Field(default=3, ge=1, le=20)
     candidate_discovery_max_per_industry: int = Field(default=10, ge=1, le=100)
     candidate_discovery_max_candidates: int = Field(default=30, ge=1, le=500)
+    candidate_min_history_coverage_ratio: Decimal = Field(
+        default=Decimal("0.8"), ge=0, le=1
+    )
 
 
 @lru_cache

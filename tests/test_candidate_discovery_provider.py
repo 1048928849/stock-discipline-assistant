@@ -1,5 +1,6 @@
 from datetime import date, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -9,7 +10,10 @@ from app.data_hub.contracts import ProviderUnavailableError
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
 from app.models import DataQualityRecord
-from app.providers.astock_discovery_provider import AStockDiscoveryProvider
+from app.providers.astock_discovery_provider import (
+    AStockDiscoveryProvider,
+    _AKShareDiscoveryClient,
+)
 
 
 NOW = datetime(2026, 7, 24, 19, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -78,6 +82,75 @@ def test_capital_flow_contract_has_fixed_cny_units():
     assert row.amount_unit == "CNY"
     assert row.observed_at.tzinfo is not None
     assert row.fetched_at == NOW
+
+
+def test_real_akshare_capital_flow_shape_maps_all_periods(monkeypatch):
+    calls = []
+
+    def stock_sector_fund_flow_rank(*, indicator, sector_type):
+        calls.append((indicator, sector_type))
+        values = {
+            "今日": ("今日主力净流入-净额", "100000000"),
+            "5日": ("5日主力净流入-净额", "300000000"),
+            "10日": ("10日主力净流入-净额", "500000000"),
+        }
+        field, value = values[indicator]
+        return [
+            {
+                "行业代码": "BK0001",
+                "名称": "通信设备",
+                "今日成交额": "2000000000",
+                field: value,
+            }
+        ]
+
+    client = _AKShareDiscoveryClient()
+    monkeypatch.setattr(
+        client,
+        "_ak",
+        lambda: SimpleNamespace(
+            stock_sector_fund_flow_rank=stock_sector_fund_flow_rank
+        ),
+    )
+
+    raw = client.industry_capital_flow(DAY)
+    row = _provider(client=SimpleNamespace(industry_capital_flow=lambda day: raw)).get_industry_capital_flow(DAY)[0]
+
+    assert calls == [
+        ("今日", "行业资金流"),
+        ("5日", "行业资金流"),
+        ("10日", "行业资金流"),
+    ]
+    assert row.net_inflow_1d == Decimal("100000000")
+    assert row.net_inflow_5d == Decimal("300000000")
+    assert row.net_inflow_10d == Decimal("500000000")
+
+
+@pytest.mark.parametrize("missing_period", ["今日", "5日", "10日"])
+def test_real_akshare_capital_flow_missing_period_fails(monkeypatch, missing_period):
+    def stock_sector_fund_flow_rank(*, indicator, sector_type):
+        if indicator == missing_period:
+            return []
+        return [
+            {
+                "行业代码": "BK0001",
+                "名称": "通信设备",
+                "今日成交额": "2000000000",
+                f"{indicator}主力净流入-净额": "100000000",
+            }
+        ]
+
+    client = _AKShareDiscoveryClient()
+    monkeypatch.setattr(
+        client,
+        "_ak",
+        lambda: SimpleNamespace(
+            stock_sector_fund_flow_rank=stock_sector_fund_flow_rank
+        ),
+    )
+
+    with pytest.raises(ProviderUnavailableError, match="capital flow period"):
+        client.industry_capital_flow(DAY)
 
 
 def test_limit_pool_contract_has_decimal_percent_turnover():

@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.discovery.algorithm import discover_candidates
+from app.discovery.service import _compound_return_pct
 from app.discovery.contracts import (
     CandidateStockInput,
     DiscoveryConfig,
@@ -62,6 +63,10 @@ def _industry(
         broken_limit_rate=Decimal("0.1"),
         quality_status=quality,
         evidence_references=(f"industry:{name}",),
+        total_constituents=1,
+        historical_data_ready=1,
+        historical_data_missing=0,
+        coverage_ratio=Decimal("1"),
         constituents=(
             CandidateStockInput(
                 symbol=symbol,
@@ -205,12 +210,48 @@ def test_partial_industry_quality_gap_blocks_incomplete_universe():
 
 def test_missing_daily_data_for_all_constituents_blocks_run():
     industry = _industry("通信", "MAINLINE", symbol="300001").model_copy(
-        update={"constituents": ()}
+        update={
+            "constituents": (),
+            "historical_data_ready": 0,
+            "historical_data_missing": 1,
+            "coverage_ratio": Decimal("0"),
+        }
     )
     result = discover_candidates(_snapshot(industry), DiscoveryConfig())
     assert result.status == "BLOCKED"
     assert result.candidates == ()
-    assert result.blocked_reasons == ("NO_EXECUTABLE_STOCK_DATA",)
+    assert result.blocked_reasons == (
+        "HISTORICAL_UNIVERSE_COVERAGE_INSUFFICIENT",
+    )
+
+
+def test_focus_industry_below_history_coverage_threshold_blocks_candidates():
+    industry = _industry("通信", "MAINLINE", symbol="300001").model_copy(
+        update={
+            "total_constituents": 10,
+            "historical_data_ready": 7,
+            "historical_data_missing": 3,
+            "coverage_ratio": Decimal("0.7"),
+        }
+    )
+    result = discover_candidates(
+        _snapshot(industry),
+        DiscoveryConfig(candidate_min_history_coverage_ratio=Decimal("0.8")),
+    )
+    assert result.status == "BLOCKED"
+    assert result.candidates == ()
+    assert result.blocked_reasons == (
+        "HISTORICAL_UNIVERSE_COVERAGE_INSUFFICIENT",
+    )
+    assert result.total_constituents == 10
+    assert result.historical_data_ready == 7
+    assert result.historical_data_missing == 3
+    assert result.coverage_ratio == Decimal("0.7")
+    assert result.industries[0].metrics["coverage_ratio"] == Decimal("0.7")
+
+
+def test_compound_return_handles_offsetting_large_moves():
+    assert _compound_return_pct([Decimal("100"), Decimal("-50")]) == Decimal("0")
 
 
 def test_untrusted_stock_data_blocks_instead_of_completing_empty():

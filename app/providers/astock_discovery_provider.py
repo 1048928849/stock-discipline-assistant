@@ -26,6 +26,11 @@ from app.data_hub.trading_calendar import (
 
 
 ADAPTER_VERSION = "1.0.0"
+_CAPITAL_FLOW_FIELDS = {
+    "今日": "net_inflow_1d",
+    "5日": "net_inflow_5d",
+    "10日": "net_inflow_10d",
+}
 
 
 def _records(frame: Any) -> list[dict[str, Any]]:
@@ -106,14 +111,19 @@ class _AKShareDiscoveryClient:
 
     def industry_capital_flow(self, day: date):
         frames = {}
-        for period in ("今日", "5日", "10日"):
+        for period in _CAPITAL_FLOW_FIELDS:
             frame = self._ak().stock_sector_fund_flow_rank(
                 indicator=period,
                 sector_type="行业资金流",
             )
             frames[period] = self._frame_records(frame)
         by_name: dict[str, dict[str, Any]] = {}
+        periods_by_name: dict[str, set[str]] = {}
         for period, rows in frames.items():
+            if not rows:
+                raise ProviderUnavailableError(
+                    f"industry capital flow period returned no rows: {period}"
+                )
             for row in rows:
                 name = str(_field(row, "名称", "行业名称", "industry_name")).strip()
                 target = by_name.setdefault(
@@ -122,14 +132,21 @@ class _AKShareDiscoveryClient:
                         "industry_key": str(row.get("行业代码") or row.get("代码") or name),
                         "industry_name": name,
                         "trade_date": day.isoformat(),
-                        "amount": row.get("今日成交额") or row.get("成交额"),
+                        "amount": _field(row, "今日成交额", "成交额"),
                     },
                 )
-                target[f"net_inflow_{'1d' if period == '今日' else period.lower()}"] = (
-                    row.get(f"{period}主力净流入-净额")
-                    or row.get("主力净流入-净额")
-                    or row.get("主力净流入净额")
+                target[_CAPITAL_FLOW_FIELDS[period]] = _field(
+                    row,
+                    f"{period}主力净流入-净额",
+                    "主力净流入-净额",
+                    "主力净流入净额",
                 )
+                periods_by_name.setdefault(name, set()).add(period)
+        expected_periods = set(_CAPITAL_FLOW_FIELDS)
+        if any(periods != expected_periods for periods in periods_by_name.values()):
+            raise ProviderUnavailableError(
+                "industry capital flow period coverage is incomplete"
+            )
         return list(by_name.values())
 
     def limit_up_pool(self, day: date):

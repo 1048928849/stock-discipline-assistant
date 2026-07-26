@@ -29,6 +29,9 @@ class DiscoveryConfig(DiscoveryModel):
     max_candidates_per_industry: int = Field(default=10, ge=1, le=100)
     max_candidates: int = Field(default=30, ge=1, le=500)
     minimum_history_rows: int = Field(default=50, ge=20, le=500)
+    candidate_min_history_coverage_ratio: Decimal = Field(
+        default=Decimal("0.8"), ge=0, le=1
+    )
     minimum_average_amount: Decimal = Field(default=Decimal("50000000"), ge=0)
     minimum_turnover_rate: Decimal = Field(default=Decimal("0.5"), ge=0)
     maximum_turnover_rate: Decimal = Field(default=Decimal("15"), gt=0)
@@ -123,12 +126,32 @@ class IndustryDiscoveryInput(DiscoveryModel):
     broken_limit_rate: Decimal | None
     quality_status: QualityStatus
     evidence_references: tuple[str, ...]
+    total_constituents: int = Field(ge=0)
+    historical_data_ready: int = Field(ge=0)
+    historical_data_missing: int = Field(ge=0)
+    coverage_ratio: Decimal = Field(ge=0, le=1)
     constituents: tuple[CandidateStockInput, ...]
 
     @field_validator("evidence_references", mode="before")
     @classmethod
     def stable_evidence(cls, value):
         return tuple(sorted(set(value)))
+
+    @model_validator(mode="after")
+    def validate_coverage(self):
+        if self.historical_data_ready + self.historical_data_missing != self.total_constituents:
+            raise ValueError("industry history coverage counts must match total constituents")
+        expected = (
+            (
+                Decimal(self.historical_data_ready)
+                / Decimal(self.total_constituents)
+            ).quantize(Decimal("0.000001"))
+            if self.total_constituents
+            else Decimal("0")
+        )
+        if self.coverage_ratio != expected:
+            raise ValueError("industry history coverage ratio must match coverage counts")
+        return self
 
 
 class MarketDiscoveryInput(DiscoveryModel):
@@ -148,6 +171,7 @@ class DiscoverySnapshot(DiscoveryModel):
     market: MarketDiscoveryInput
     industries: tuple[IndustryDiscoveryInput, ...]
     observed_at: datetime
+    blocked_reasons: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def validate_observed_at(self):
@@ -201,6 +225,10 @@ class DiscoveryResult(DiscoveryModel):
     market_state: MarketState
     quality_status: QualityStatus
     blocked_reasons: tuple[str, ...]
+    total_constituents: int
+    historical_data_ready: int
+    historical_data_missing: int
+    coverage_ratio: Decimal
     industries: tuple[CandidateIndustryResult, ...]
     candidates: tuple[CandidateResult, ...]
 
