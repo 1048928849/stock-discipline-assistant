@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from datetime import datetime
+
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
+from app.data_hub.trading_calendar import TradingCalendar
 from app.providers.akshare_provider import AKShareProvider
 from app.providers.external_http_provider import (
     ConfiguredNewsApiProvider,
@@ -31,6 +35,15 @@ def build_provider_registry() -> ProviderRegistry:
 
 
 def build_data_hub(
-    db: Session, registry: ProviderRegistry | None = None
+    db: Session,
+    registry: ProviderRegistry | None = None,
+    *,
+    calendar: TradingCalendar | None = None,
+    now_fn: Callable[[], datetime] | None = None,
 ) -> DataHubRouter:
-    return DataHubRouter(db, registry=registry or build_provider_registry())
+    return DataHubRouter(
+        db,
+        registry=registry or build_provider_registry(),
+        calendar=calendar,
+        now_fn=now_fn,
+    )

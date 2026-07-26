@@ -1,4 +1,5 @@
 from functools import lru_cache
+from decimal import Decimal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -44,6 +45,18 @@ class Settings(BaseSettings):
     x_cookie: str = Field(default="", repr=False)
     scheduler_enabled: bool = True
     x_sync_minutes: int = 15
+    watchlist_monitor_enabled: bool = False
+    watchlist_monitor_interval_seconds: int = Field(default=300, ge=1, le=86400)
+    watchlist_monitor_batch_size: int = Field(default=100, ge=1, le=500)
+    watchlist_monitor_lease_seconds: int = Field(default=240, ge=1, le=86400)
+    watchlist_plan_max_age_seconds: int = Field(
+        default=86400,
+        ge=60,
+        le=31_536_000,
+    )
+    watchlist_near_entry_distance_pct: Decimal = Field(
+        default=Decimal("2"), ge=0, le=100
+    )
 
 
 @lru_cache

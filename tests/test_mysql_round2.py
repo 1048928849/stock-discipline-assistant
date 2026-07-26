@@ -357,9 +357,9 @@ def test_mysql8_version_empty_upgrade_and_idempotency(mysql_database: URL):
     assert session_tz
     _alembic(mysql_database, "upgrade", "head")
     current = _alembic(mysql_database, "current")
-    assert "20260726_0012" in current.stdout
+    assert "20260727_0014" in current.stdout
     heads = _alembic(mysql_database, "heads")
-    assert "20260726_0012" in heads.stdout
+    assert "20260727_0014" in heads.stdout
     _alembic(mysql_database, "upgrade", "head")
 
 
@@ -386,6 +386,87 @@ def test_mysql_0012_product_tables_legacy_upgrade_round_trip(mysql_database: URL
     _alembic(mysql_database, "downgrade", "20260725_0011")
     assert not set(_PRODUCT_TABLES) & set(inspect(engine).get_table_names())
     _alembic(mysql_database, "upgrade", "head")
+    engine.dispose()
+
+
+def test_mysql_0013_watchlist_tables_previous_head_round_trip(mysql_database: URL):
+    watchlist_tables = (
+        "monitoring_events",
+        "reanalysis_runs",
+        "reanalysis_requests",
+        "watchlist_transitions",
+        "watchlist_revisions",
+        "watchlist_monitor_leases",
+        "watchlist_items",
+    )
+    _alembic(mysql_database, "upgrade", "20260726_0012")
+    engine = create_engine(mysql_database, pool_pre_ping=True)
+    with engine.begin() as connection:
+        connection.exec_driver_sql("SET FOREIGN_KEY_CHECKS=0")
+        for table in watchlist_tables:
+            connection.exec_driver_sql(f"DROP TABLE IF EXISTS `{table}`")
+        connection.exec_driver_sql("SET FOREIGN_KEY_CHECKS=1")
+    _alembic(mysql_database, "upgrade", "head")
+    assert set(watchlist_tables) <= set(inspect(engine).get_table_names())
+    _alembic(mysql_database, "downgrade", "20260726_0012")
+    assert not set(watchlist_tables) & set(inspect(engine).get_table_names())
+    _alembic(mysql_database, "upgrade", "head")
+    engine.dispose()
+
+
+def test_mysql_0014_watchlist_semantics_round_trip(mysql_database: URL):
+    _alembic(mysql_database, "upgrade", "head")
+    _alembic(mysql_database, "downgrade", "20260727_0013")
+    engine = create_engine(mysql_database, pool_pre_ping=True)
+    inspector = inspect(engine)
+    assert "industry_analysis_snapshots" not in inspector.get_table_names()
+    columns = {item["name"] for item in inspector.get_columns("watchlist_items")}
+    assert "invalidation_rule_specs" not in columns
+    assert "industry_name" not in columns
+    _alembic(mysql_database, "upgrade", "head")
+    inspector = inspect(engine)
+    assert "industry_analysis_snapshots" in inspector.get_table_names()
+    columns = {item["name"] for item in inspector.get_columns("watchlist_items")}
+    assert {"invalidation_rule_specs", "industry_name"} <= columns
+    engine.dispose()
+
+
+def test_mysql_watchlist_monitor_lease_is_atomic(mysql_head_url: URL):
+    from app.watchlist.lease import acquire_monitor_lease, release_monitor_lease
+
+    engine = create_engine(mysql_head_url, pool_pre_ping=True)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    now = datetime(2026, 7, 27, 2, 0, tzinfo=timezone.utc)
+    barrier = Barrier(3)
+    outcomes = []
+    result_lock = Lock()
+
+    def worker(token: str) -> None:
+        with factory() as db:
+            barrier.wait()
+            acquired = acquire_monitor_lease(
+                db, owner_token=token, lease_seconds=60, now=now
+            )
+            with result_lock:
+                outcomes.append((token, acquired))
+
+    threads = [
+        Thread(target=worker, args=(token,))
+        for token in ("mysql-worker-a", "mysql-worker-b")
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+    assert sorted(acquired for _, acquired in outcomes) == [False, True]
+    winner = next(token for token, acquired in outcomes if acquired)
+    with factory() as first, factory() as second:
+        assert release_monitor_lease(first, owner_token=winner)
+        assert acquire_monitor_lease(
+            second, owner_token="mysql-worker-b", lease_seconds=60, now=now
+        )
     engine.dispose()
 
 

@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta
+import logging
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import select
@@ -9,9 +10,12 @@ from app.models import Account, SystemJob, TradeReview, XPost, XWatchAccount, XW
 from app.services.reviews import review_metrics
 from app.services.technical_snapshots import snapshot_all_holdings
 from app.services.data_sources import UnifiedDataService
+from app.data_hub.trading_calendar import shanghai_now
+from app.watchlist.monitoring import WatchlistMonitoringService
 
 
 scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
+logger = logging.getLogger(__name__)
 
 
 def _acquire(db, name: str) -> SystemJob | None:
@@ -128,6 +132,14 @@ def generate_technical_snapshots() -> None:
             _fail_job(db, job, exc)
 
 
+def scan_watchlist() -> None:
+    try:
+        with SessionLocal() as db:
+            WatchlistMonitoringService(db).scan(now=shanghai_now())
+    except Exception:
+        logger.exception("scheduled watchlist scan failed")
+
+
 def start_scheduler() -> None:
     settings = get_settings()
     if scheduler.running or not settings.scheduler_enabled:
@@ -177,7 +189,23 @@ def start_scheduler() -> None:
             max_instances=1,
             coalesce=True,
         )
-    scheduler.start()
+    if settings.watchlist_monitor_enabled:
+        try:
+            scheduler.add_job(
+                scan_watchlist,
+                "interval",
+                seconds=settings.watchlist_monitor_interval_seconds,
+                id="watchlist_monitor",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+            )
+        except Exception:
+            logger.exception("watchlist scheduler registration failed")
+    try:
+        scheduler.start()
+    except Exception:
+        logger.exception("scheduler startup failed; web application will continue")
 
 
 def stop_scheduler() -> None:

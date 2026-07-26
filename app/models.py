@@ -324,6 +324,25 @@ class MarketRegimeSnapshot(Base):
     transition: Mapped[str] = mapped_column(String(50))
     product_snapshot_hash: Mapped[str] = mapped_column(String(64))
     observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    quality_status: Mapped[str | None] = mapped_column(String(20))
+    quality_bindings: Mapped[list] = mapped_column(JSON, default=list)
+
+
+class IndustryAnalysisSnapshot(Base):
+    __tablename__ = "industry_analysis_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "industry_name", "trade_date", name="uq_industry_analysis_name_date"
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    industry_name: Mapped[str] = mapped_column(String(200), index=True)
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    classification: Mapped[str] = mapped_column(String(20), index=True)
+    product_snapshot_hash: Mapped[str] = mapped_column(String(64))
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    quality_status: Mapped[str] = mapped_column(String(20))
+    quality_bindings: Mapped[list] = mapped_column(JSON, default=list)
 
 
 class Concept(Base):
@@ -939,6 +958,166 @@ class PlanAnalysisRun(TimestampMixin, Base):
     user_confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
     confirmed_plan_id: Mapped[int | None] = mapped_column(ForeignKey("trade_plans.id"), index=True)
     error: Mapped[str | None] = mapped_column(Text)
+
+
+class WatchlistItem(TimestampMixin, Base):
+    __tablename__ = "watchlist_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_type", "source_reference", name="uq_watchlist_source_reference"
+        ),
+        Index("ix_watchlist_account_symbol", "account_id", "symbol"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"), index=True)
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    name: Mapped[str | None] = mapped_column(String(100))
+    market: Mapped[str] = mapped_column(String(10), default="CN")
+    status: Mapped[str] = mapped_column(String(30), index=True)
+    monitoring_health: Mapped[str] = mapped_column(String(30), index=True)
+    source_type: Mapped[str] = mapped_column(String(30))
+    source_reference: Mapped[str] = mapped_column(String(100))
+    thesis: Mapped[str] = mapped_column(Text)
+    strategy_id: Mapped[str | None] = mapped_column(String(64))
+    strategy_version: Mapped[str | None] = mapped_column(String(40))
+    strategy_implementation_hash: Mapped[str | None] = mapped_column(String(64))
+    strategy_parameter_hash: Mapped[str | None] = mapped_column(String(64))
+    strategy_signal_hash: Mapped[str | None] = mapped_column(String(64))
+    strategy_binding_hash: Mapped[str | None] = mapped_column(String(64))
+    analysis_capital: Mapped[Decimal] = mapped_column(MONEY)
+    entry_low: Mapped[Decimal | None] = mapped_column(PRICE)
+    entry_high: Mapped[Decimal | None] = mapped_column(PRICE)
+    hard_stop: Mapped[Decimal | None] = mapped_column(PRICE)
+    waiting_conditions: Mapped[list] = mapped_column(JSON, default=list)
+    invalidation_conditions: Mapped[list] = mapped_column(JSON, default=list)
+    invalidation_rule_specs: Mapped[list] = mapped_column(JSON, default=list)
+    latest_snapshot_hash: Mapped[str | None] = mapped_column(String(64))
+    latest_package_hash: Mapped[str | None] = mapped_column(String(64))
+    latest_analysis_id: Mapped[int | None] = mapped_column(
+        ForeignKey("plan_analysis_runs.id"), index=True
+    )
+    monitoring_enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    current_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    current_price_observed_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    market_state: Mapped[str | None] = mapped_column(String(30))
+    industry_name: Mapped[str | None] = mapped_column(String(200), index=True)
+    industry_state: Mapped[str | None] = mapped_column(String(30))
+    data_quality: Mapped[str | None] = mapped_column(String(20))
+    last_analyzed_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    last_scanned_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    next_scan_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME, index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class WatchlistRevision(Base):
+    __tablename__ = "watchlist_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "watchlist_item_id",
+            "revision_number",
+            name="uq_watchlist_revision_item_number",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    watchlist_item_id: Mapped[int] = mapped_column(
+        ForeignKey("watchlist_items.id", ondelete="CASCADE"), index=True
+    )
+    revision_number: Mapped[int] = mapped_column(Integer)
+    previous_revision_number: Mapped[int | None] = mapped_column(Integer)
+    change_reason: Mapped[str] = mapped_column(String(100))
+    changed_by: Mapped[str] = mapped_column(String(50))
+    snapshot: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+
+
+class WatchlistTransition(Base):
+    __tablename__ = "watchlist_transitions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    watchlist_item_id: Mapped[int] = mapped_column(
+        ForeignKey("watchlist_items.id", ondelete="CASCADE"), index=True
+    )
+    revision_number: Mapped[int] = mapped_column(Integer)
+    from_status: Mapped[str] = mapped_column(String(30))
+    to_status: Mapped[str] = mapped_column(String(30), index=True)
+    reason_codes: Mapped[list] = mapped_column(JSON)
+    evidence_references: Mapped[list] = mapped_column(JSON)
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME, index=True)
+    created_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+
+
+class ReanalysisRequest(Base):
+    __tablename__ = "reanalysis_requests"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_reanalysis_request_dedupe"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    watchlist_item_id: Mapped[int] = mapped_column(
+        ForeignKey("watchlist_items.id", ondelete="CASCADE"), index=True
+    )
+    revision_number: Mapped[int] = mapped_column(Integer)
+    reason_codes: Mapped[list] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(20), index=True, default="PENDING")
+    dedupe_key: Mapped[str] = mapped_column(String(64))
+    requested_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME, index=True)
+    created_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+
+
+class ReanalysisRun(Base):
+    __tablename__ = "reanalysis_runs"
+    __table_args__ = (
+        UniqueConstraint("request_id", name="uq_reanalysis_run_request"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    request_id: Mapped[int] = mapped_column(
+        ForeignKey("reanalysis_requests.id", ondelete="CASCADE"), index=True
+    )
+    watchlist_item_id: Mapped[int] = mapped_column(
+        ForeignKey("watchlist_items.id", ondelete="CASCADE"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    analysis_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("plan_analysis_runs.id"), index=True
+    )
+    error_code: Mapped[str | None] = mapped_column(String(100))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    finished_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    created_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+
+
+class MonitoringEvent(Base):
+    __tablename__ = "monitoring_events"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_monitoring_event_dedupe"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    watchlist_item_id: Mapped[int] = mapped_column(
+        ForeignKey("watchlist_items.id", ondelete="CASCADE"), index=True
+    )
+    revision_number: Mapped[int] = mapped_column(Integer)
+    event_type: Mapped[str] = mapped_column(String(50), index=True)
+    severity: Mapped[str] = mapped_column(String(20), index=True)
+    title: Mapped[str] = mapped_column(String(300))
+    reason_codes: Mapped[list] = mapped_column(JSON)
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME, index=True)
+    created_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    dedupe_key: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict] = mapped_column(JSON)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    reanalysis_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    reanalysis_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("reanalysis_runs.id"), index=True
+    )
+
+
+class WatchlistMonitorLease(Base):
+    __tablename__ = "watchlist_monitor_leases"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(80), unique=True)
+    owner_token: Mapped[str | None] = mapped_column(String(64), index=True)
+    acquired_until: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME, index=True)
+    lease_version: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
 
 
 class PlanExecutionEvent(Base):

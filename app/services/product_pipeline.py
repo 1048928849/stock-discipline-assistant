@@ -66,6 +66,7 @@ from app.domain.quality_subject import SubjectRef
 from app.models import (
     CompanyChainPosition,
     DataQualityRecord,
+    IndustryAnalysisSnapshot,
     IndustryChain,
     IndustryChainNode,
     MarketDailyBar,
@@ -758,6 +759,64 @@ def _previous_market_state(db: Session, snapshot: ProductAnalysisSnapshot) -> st
     )
 
 
+_MARKET_STATE_CAPABILITIES = frozenset(
+    {"market.breadth.daily", "market.amount.daily", "market.index_daily"}
+)
+_INDUSTRY_STATE_CAPABILITIES = frozenset(
+    {
+        "market.industry.daily",
+        "market.industry.constituents",
+        "market.index_daily",
+    }
+)
+
+
+def _analysis_quality_bindings(
+    snapshot: ProductAnalysisSnapshot,
+    capabilities: frozenset[str],
+) -> list[dict[str, Any]]:
+    bindings = []
+    for item in snapshot.capabilities:
+        if item.capability not in capabilities:
+            continue
+        if item.quality_record_id is None or item.observed_at is None:
+            continue
+        bindings.append(
+            {
+                "capability": item.capability,
+                "subject": item.subject.model_dump(mode="json"),
+                "quality_record_id": item.quality_record_id,
+                "observed_at": item.observed_at.isoformat(),
+            }
+        )
+    return sorted(
+        bindings,
+        key=lambda row: (
+            row["capability"],
+            row["subject"]["subject_type"],
+            row["subject"]["subject_id"],
+            row["subject"].get("semantic_key") or "",
+        ),
+    )
+
+
+def _analysis_quality(
+    snapshot: ProductAnalysisSnapshot,
+    capabilities: frozenset[str],
+) -> DataQualityStatus:
+    by_capability = {
+        item.capability: item.quality_status
+        for item in snapshot.capabilities
+        if item.capability in capabilities
+    }
+    return worst_quality(
+        [
+            by_capability.get(capability, DataQualityStatus.MISSING)
+            for capability in sorted(capabilities)
+        ]
+    )
+
+
 def _persist_market_regime(
     db: Session,
     snapshot: ProductAnalysisSnapshot,
@@ -782,6 +841,44 @@ def _persist_market_regime(
     stored.transition = regime.transition
     stored.product_snapshot_hash = snapshot.snapshot_hash
     stored.observed_at = _market_time_for_storage(observed_at)
+    stored.quality_status = _analysis_quality(
+        snapshot, _MARKET_STATE_CAPABILITIES
+    ).value
+    stored.quality_bindings = _analysis_quality_bindings(
+        snapshot, _MARKET_STATE_CAPABILITIES
+    )
+
+
+def _persist_industry_context(
+    db: Session,
+    snapshot: ProductAnalysisSnapshot,
+    context: IndustryContext,
+) -> None:
+    source = _capability(snapshot, "market.industry.daily")
+    if not source or not source.rows:
+        return
+    trade_date = max(date.fromisoformat(str(row["trade_date"])) for row in source.rows)
+    observed_at = source.observed_at or snapshot.analysis_started_at
+    quality = _analysis_quality(snapshot, _INDUSTRY_STATE_CAPABILITIES).value
+    bindings = _analysis_quality_bindings(snapshot, _INDUSTRY_STATE_CAPABILITIES)
+    for assessment in context.industries:
+        stored = db.scalar(
+            select(IndustryAnalysisSnapshot).where(
+                IndustryAnalysisSnapshot.industry_name == assessment.name,
+                IndustryAnalysisSnapshot.trade_date == trade_date,
+            )
+        )
+        if stored is None:
+            stored = IndustryAnalysisSnapshot(
+                industry_name=assessment.name,
+                trade_date=trade_date,
+            )
+            db.add(stored)
+        stored.classification = assessment.classification
+        stored.product_snapshot_hash = snapshot.snapshot_hash
+        stored.observed_at = _market_time_for_storage(observed_at)
+        stored.quality_status = quality
+        stored.quality_bindings = bindings
 
 
 def _market_time_for_storage(value: datetime) -> datetime:
@@ -895,6 +992,7 @@ def run_product_pipeline(
         previous_market_state=previous_market_state,
     )
     _persist_market_regime(db, snapshot, market)
+    _persist_industry_context(db, snapshot, industry_context)
     required_statuses = [
         item.quality_status for item in snapshot.capabilities if item.required
     ]

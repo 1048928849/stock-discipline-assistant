@@ -17,6 +17,7 @@ def test_initial_schema_contains_required_tables(session):
         "market_amount_snapshots",
         "industry_market_snapshots",
         "industry_constituent_snapshots",
+        "industry_analysis_snapshots",
         "market_regime_snapshots",
         "concepts",
         "company_concepts",
@@ -49,6 +50,13 @@ def test_initial_schema_contains_required_tables(session):
         "data_quality_subject_heads",
         "company_research_refreshes",
         "plan_execution_events",
+        "watchlist_items",
+        "watchlist_revisions",
+        "watchlist_transitions",
+        "monitoring_events",
+        "reanalysis_requests",
+        "reanalysis_runs",
+        "watchlist_monitor_leases",
         "plan_execution_fills",
     }
     assert required == set(inspect(session.bind).get_table_names())

@@ -23,7 +23,7 @@ jobs:
       - run: python -m ruff check .
       - run: node --check app/static/product-v1.js
       - run: git diff --check
-      - run: python -m alembic heads | grep -Fx "20260726_0012 (head)"
+      - run: python -m alembic heads | grep -Fx "20260727_0014 (head)"
       - run: python -c "from app.main import app; assert app.openapi()['paths']; print(app.title)"
 
   sqlite:
