@@ -63,6 +63,13 @@ _PRODUCT_TABLES = (
     "company_chain_positions",
     "mapping_evidence",
 )
+_CANDIDATE_DISCOVERY_TABLES = (
+    "industry_capital_flow_snapshots",
+    "market_event_pool_snapshots",
+    "candidate_discovery_runs",
+    "candidate_industry_assessments",
+    "discovery_candidates",
+)
 
 
 def _safe_error(exc: BaseException) -> str:
@@ -357,9 +364,9 @@ def test_mysql8_version_empty_upgrade_and_idempotency(mysql_database: URL):
     assert session_tz
     _alembic(mysql_database, "upgrade", "head")
     current = _alembic(mysql_database, "current")
-    assert "20260727_0014" in current.stdout
+    assert "20260727_0015" in current.stdout
     heads = _alembic(mysql_database, "heads")
-    assert "20260727_0014" in heads.stdout
+    assert "20260727_0015" in heads.stdout
     _alembic(mysql_database, "upgrade", "head")
 
 
@@ -428,6 +435,29 @@ def test_mysql_0014_watchlist_semantics_round_trip(mysql_database: URL):
     assert "industry_analysis_snapshots" in inspector.get_table_names()
     columns = {item["name"] for item in inspector.get_columns("watchlist_items")}
     assert {"invalidation_rule_specs", "industry_name"} <= columns
+    engine.dispose()
+
+
+def test_mysql_0015_candidate_discovery_round_trip(mysql_database: URL):
+    _alembic(mysql_database, "upgrade", "head")
+    _alembic(mysql_database, "downgrade", "20260727_0014")
+    engine = create_engine(mysql_database, pool_pre_ping=True)
+    assert not set(_CANDIDATE_DISCOVERY_TABLES) & set(
+        inspect(engine).get_table_names()
+    )
+    _alembic(mysql_database, "upgrade", "head")
+    inspector = inspect(engine)
+    assert set(_CANDIDATE_DISCOVERY_TABLES) <= set(inspector.get_table_names())
+    run_constraints = {
+        item["name"]
+        for item in inspector.get_unique_constraints("candidate_discovery_runs")
+    }
+    candidate_constraints = {
+        item["name"]
+        for item in inspector.get_unique_constraints("discovery_candidates")
+    }
+    assert "uq_candidate_discovery_run_identity" in run_constraints
+    assert "uq_discovery_candidate_run_symbol" in candidate_constraints
     engine.dispose()
 
 

@@ -10,6 +10,7 @@ from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
 from app.data_hub.trading_calendar import TradingCalendar
 from app.providers.akshare_provider import AKShareProvider
+from app.providers.astock_discovery_provider import AStockDiscoveryProvider
 from app.providers.external_http_provider import (
     ConfiguredNewsApiProvider,
     ProfessionalMarketApiProvider,
@@ -21,6 +22,7 @@ from app.providers.x_social_provider import XSocialClueProvider
 def build_provider_registry() -> ProviderRegistry:
     settings = get_settings()
     registry = ProviderRegistry()
+    registry.register(AStockDiscoveryProvider(settings))
     registry.register(ProfessionalMarketApiProvider(settings))
     registry.register(TushareProvider(settings))
     registry.register(

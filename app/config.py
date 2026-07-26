@@ -57,6 +57,18 @@ class Settings(BaseSettings):
     watchlist_near_entry_distance_pct: Decimal = Field(
         default=Decimal("2"), ge=0, le=100
     )
+    astock_data_enabled: bool = False
+    astock_data_timeout_seconds: float = Field(default=10, gt=0, le=120)
+    astock_data_max_retries: int = Field(default=2, ge=1, le=5)
+    astock_data_min_interval_seconds: float = Field(default=1, ge=0, le=60)
+    astock_data_cache_ttl_seconds: int = Field(default=900, ge=0, le=86400)
+    candidate_max_age_seconds: int = Field(default=86400, ge=60, le=604800)
+    candidate_discovery_enabled: bool = False
+    candidate_discovery_hour: int = Field(default=19, ge=0, le=23)
+    candidate_discovery_minute: int = Field(default=30, ge=0, le=59)
+    candidate_discovery_max_industries: int = Field(default=3, ge=1, le=20)
+    candidate_discovery_max_per_industry: int = Field(default=10, ge=1, le=100)
+    candidate_discovery_max_candidates: int = Field(default=30, ge=1, le=500)
 
 
 @lru_cache

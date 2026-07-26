@@ -135,6 +135,58 @@ class IndustryConstituent:
 
 
 @dataclass(frozen=True)
+class IndustryCapitalFlow:
+    industry_key: str
+    industry_name: str
+    trade_date: date
+    net_inflow_1d: Decimal
+    net_inflow_5d: Decimal
+    net_inflow_10d: Decimal
+    amount: Decimal
+    amount_unit: Literal["CNY"]
+    source: str
+    observed_at: datetime
+    fetched_at: datetime
+
+
+@dataclass(frozen=True)
+class MarketPoolEvent:
+    symbol: str
+    name: str
+    trade_date: date
+    event_type: Literal["LIMIT_UP", "BROKEN_LIMIT"]
+    first_event_at: datetime | None
+    last_event_at: datetime | None
+    sealed_amount: Decimal | None
+    sealed_amount_unit: Literal["CNY"]
+    turnover_rate: Decimal | None
+    turnover_rate_unit: Literal["percent"]
+    consecutive_days: int
+    industry_name: str | None
+    reason_summary: str | None
+    source: str
+    observed_at: datetime
+    fetched_at: datetime
+
+
+class ObservedRows(list):
+    """List payload that preserves the business observation time when empty."""
+
+    def __init__(
+        self,
+        rows=(),
+        *,
+        observed_at: datetime,
+        fetched_at: datetime | None = None,
+        cache_used: bool = False,
+    ):
+        super().__init__(rows)
+        self.observed_at = observed_at
+        self.fetched_at = fetched_at
+        self.cache_used = cache_used
+
+
+@dataclass(frozen=True)
 class ProviderMetadata:
     provider_id: str
     supported_capabilities: tuple[str, ...]

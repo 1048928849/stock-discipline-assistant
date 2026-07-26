@@ -32,6 +32,13 @@ WATCHLIST_TABLES = {
     "reanalysis_runs",
     "watchlist_monitor_leases",
 }
+CANDIDATE_DISCOVERY_TABLES = {
+    "industry_capital_flow_snapshots",
+    "market_event_pool_snapshots",
+    "candidate_discovery_runs",
+    "candidate_industry_assessments",
+    "discovery_candidates",
+}
 
 
 def _database_url(path: Path) -> str:
@@ -81,6 +88,42 @@ def _quality_subject(path: Path, record_id: int) -> tuple[str | None, str | None
         ).fetchone()
     assert row is not None
     return row
+
+
+def test_0015_candidate_discovery_roundtrip(tmp_path):
+    database = tmp_path / "candidate-discovery-roundtrip.db"
+    _alembic(database, "upgrade", "20260727_0014")
+    with sqlite3.connect(database) as connection:
+        before = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    # Revision 0001 may create current metadata on a fresh database. Downgrade
+    # establishes the historical 0014 shape before testing the explicit DDL.
+    if CANDIDATE_DISCOVERY_TABLES <= before:
+        _alembic(database, "upgrade", "20260727_0015")
+        _alembic(database, "downgrade", "20260727_0014")
+    _alembic(database, "upgrade", "20260727_0015")
+    with sqlite3.connect(database) as connection:
+        upgraded = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert CANDIDATE_DISCOVERY_TABLES <= upgraded
+    _alembic(database, "downgrade", "20260727_0014")
+    with sqlite3.connect(database) as connection:
+        downgraded = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert not (CANDIDATE_DISCOVERY_TABLES & downgraded)
+    _alembic(database, "upgrade", "head")
 
 
 def test_0010_backfills_stock_subject(tmp_path):
