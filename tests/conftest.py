@@ -18,6 +18,15 @@ from app.database import Base, get_db
 from app.main import app
 
 
+def pytest_collection_modifyitems(config, items):
+    if os.environ.get("RUN_FREESTOCKDB_INTEGRATION") == "1":
+        return
+    marker = pytest.mark.skip(reason="real local free-stockdb service is opt-in")
+    for item in items:
+        if "freestockdb_integration" in item.keywords:
+            item.add_marker(marker)
+
+
 @pytest.fixture(autouse=True)
 def deterministic_legacy_market_session(request, monkeypatch):
     """Keep pre-D.1 tests independent from the wall clock.

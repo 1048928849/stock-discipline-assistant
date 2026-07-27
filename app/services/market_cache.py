@@ -204,9 +204,9 @@ def mapping_series_bars(
             DailyBar(
                 symbol=cache_symbol,
                 trade_date=trade_date,
-                open=close,
-                high=close,
-                low=close,
+                open=Decimal(str(row.get("open", close))),
+                high=Decimal(str(row.get("high", close))),
+                low=Decimal(str(row.get("low", close))),
                 close=close,
                 volume=Decimal(str(row.get("volume") or 0)),
                 adjustment=adjustment,

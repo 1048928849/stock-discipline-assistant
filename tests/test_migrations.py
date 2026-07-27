@@ -39,6 +39,41 @@ CANDIDATE_DISCOVERY_TABLES = {
     "candidate_industry_assessments",
     "discovery_candidates",
 }
+HISTORY_BOOTSTRAP_TABLES = {
+    "historical_data_bootstrap_runs",
+    "historical_data_bootstrap_items",
+}
+
+
+def test_0016_history_bootstrap_roundtrip(tmp_path):
+    database = tmp_path / "history-bootstrap-roundtrip.db"
+    _alembic(database, "upgrade", "20260727_0015")
+    _alembic(database, "upgrade", "20260728_0016")
+    with sqlite3.connect(database) as connection:
+        upgraded = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        item_foreign_keys = list(
+            connection.execute(
+                "PRAGMA foreign_key_list(historical_data_bootstrap_items)"
+            )
+        )
+    assert HISTORY_BOOTSTRAP_TABLES <= upgraded
+    assert any(row[2] == "historical_data_bootstrap_runs" for row in item_foreign_keys)
+    assert any(row[2] == "data_quality_records" for row in item_foreign_keys)
+    _alembic(database, "downgrade", "20260727_0015")
+    with sqlite3.connect(database) as connection:
+        downgraded = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert not (HISTORY_BOOTSTRAP_TABLES & downgraded)
+    _alembic(database, "upgrade", "head")
 
 
 def _database_url(path: Path) -> str:

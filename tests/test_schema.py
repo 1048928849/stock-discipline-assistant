@@ -63,6 +63,8 @@ def test_initial_schema_contains_required_tables(session):
         "candidate_discovery_runs",
         "candidate_industry_assessments",
         "discovery_candidates",
+        "historical_data_bootstrap_runs",
+        "historical_data_bootstrap_items",
     }
     assert required == set(inspect(session.bind).get_table_names())
 

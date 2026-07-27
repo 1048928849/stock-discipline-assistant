@@ -1230,6 +1230,75 @@ class DiscoveryCandidate(Base):
     updated_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
 
 
+class HistoricalDataBootstrapRun(Base):
+    __tablename__ = "historical_data_bootstrap_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "purpose",
+            "market",
+            "trade_date",
+            "plan_hash",
+            name="uq_history_bootstrap_run_identity",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    purpose: Mapped[str] = mapped_column(String(40), index=True)
+    market: Mapped[str] = mapped_column(String(10), index=True)
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    provider_id: Mapped[str] = mapped_column(String(80))
+    adapter_version: Mapped[str] = mapped_column(String(20))
+    config_hash: Mapped[str] = mapped_column(String(64))
+    plan_hash: Mapped[str] = mapped_column(String(64))
+    required_symbols: Mapped[list] = mapped_column(JSON, default=list)
+    ready_symbols: Mapped[int] = mapped_column(Integer, default=0)
+    failed_symbols: Mapped[int] = mapped_column(Integer, default=0)
+    benchmark_ready: Mapped[bool] = mapped_column(Boolean, default=False)
+    total_rows_written: Mapped[int] = mapped_column(Integer, default=0)
+    coverage_ratio: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal("0")
+    )
+    started_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    completed_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    blocked_reasons: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+
+
+class HistoricalDataBootstrapItem(Base):
+    __tablename__ = "historical_data_bootstrap_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "symbol",
+            "capability",
+            name="uq_history_bootstrap_item_scope",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("historical_data_bootstrap_runs.id", ondelete="CASCADE"),
+        index=True,
+    )
+    symbol: Mapped[str] = mapped_column(String(16), index=True)
+    capability: Mapped[str] = mapped_column(String(80), index=True)
+    adjustment: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    requested_start: Mapped[date] = mapped_column(Date)
+    requested_end: Mapped[date] = mapped_column(Date)
+    rows_received: Mapped[int] = mapped_column(Integer, default=0)
+    rows_written: Mapped[int] = mapped_column(Integer, default=0)
+    first_trade_date: Mapped[date | None] = mapped_column(Date)
+    last_trade_date: Mapped[date | None] = mapped_column(Date)
+    quality_record_id: Mapped[int | None] = mapped_column(
+        ForeignKey("data_quality_records.id"), index=True
+    )
+    normalized_digest: Mapped[str | None] = mapped_column(String(64))
+    error_code: Mapped[str | None] = mapped_column(String(100))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    completed_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+
+
 class MonitoringEvent(Base):
     __tablename__ = "monitoring_events"
     __table_args__ = (

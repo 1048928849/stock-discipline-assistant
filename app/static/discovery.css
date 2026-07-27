@@ -1,4 +1,5 @@
 .opportunity-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+.history-bootstrap-progress{margin:10px 0;padding:10px;border-left:4px solid var(--gold);background:#f5f7f6;overflow-wrap:anywhere}
 .opportunity-heading h2{margin:3px 0}.discovery-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:18px 0}
 .discovery-summary article,.discovery-industry,.discovery-candidate{min-width:0;border:1px solid var(--line);border-radius:6px;background:#fff;padding:14px;overflow-wrap:anywhere}
 .opportunity-layout{display:grid;grid-template-columns:minmax(250px,.65fr) minmax(0,1.65fr);gap:22px}
