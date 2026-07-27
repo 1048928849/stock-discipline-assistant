@@ -51,3 +51,17 @@ def build_data_hub(
         calendar=calendar,
         now_fn=now_fn,
     )
+
+
+def build_history_data_hub(
+    db: Session,
+    *,
+    calendar: TradingCalendar | None = None,
+    now_fn: Callable[[], datetime] | None = None,
+) -> DataHubRouter:
+    settings = get_settings()
+    registry = ProviderRegistry()
+    registry.register(
+        FreeStockDBProvider(settings, calendar=calendar, now_fn=now_fn)
+    )
+    return DataHubRouter(db, registry=registry, calendar=calendar, now_fn=now_fn)

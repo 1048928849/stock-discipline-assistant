@@ -207,6 +207,88 @@ def persist_stock_history_bundle(
     return len(daily) + len(turnover)
 
 
+def persist_stock_daily_window(
+    db: Session,
+    router: DataHubRouter,
+    *,
+    result: ProviderResult,
+    expected_trade_dates: set[date],
+    requested_start: date,
+    requested_end: date,
+    minimum_rows: int,
+) -> int:
+    if result.subject is None:
+        raise ProviderUnavailableError("stock daily persistence requires a subject")
+    rows = _validate_daily(
+        result,
+        result.subject,
+        minimum_rows=minimum_rows,
+        requested_start=requested_start,
+        requested_end=requested_end,
+    )
+    if {row.trade_date for row in rows} != expected_trade_dates:
+        raise ProviderUnavailableError("daily and turnover trade dates do not match")
+    _validate_lineage(router, result, len(rows))
+    with db.begin_nested():
+        _store_daily(
+            db,
+            result,
+            rows,
+            requested_start=requested_start,
+            requested_end=requested_end,
+        )
+        db.flush()
+        router.mark_persisted(result)
+    return len(rows)
+
+
+def persist_turnover_history_window(
+    db: Session,
+    router: DataHubRouter,
+    *,
+    result: ProviderResult,
+    expected_trade_dates: set[date],
+    requested_start: date,
+    requested_end: date,
+    minimum_rows: int,
+) -> int:
+    rows = _validate_turnover(
+        result,
+        minimum_rows=minimum_rows,
+        requested_start=requested_start,
+        requested_end=requested_end,
+    )
+    if {row.trade_date for row in rows} != expected_trade_dates:
+        raise ProviderUnavailableError("daily and turnover trade dates do not match")
+    _validate_lineage(router, result, len(rows))
+    with db.begin_nested():
+        db.execute(
+            delete(MarketTurnoverSnapshot).where(
+                MarketTurnoverSnapshot.symbol == result.subject.subject_id,
+                MarketTurnoverSnapshot.trade_date >= requested_start,
+                MarketTurnoverSnapshot.trade_date <= requested_end,
+            )
+        )
+        db.add_all(
+            [
+                MarketTurnoverSnapshot(
+                    symbol=row.symbol,
+                    trade_date=row.trade_date,
+                    turnover_rate=row.turnover_rate,
+                    amount=row.amount,
+                    observed_at=to_market_storage_naive(row.observed_at),
+                    source=row.source,
+                    fetched_at=to_market_storage_naive(row.fetched_at),
+                    quality_record_id=result.quality_record_id,
+                )
+                for row in rows
+            ]
+        )
+        db.flush()
+        router.mark_persisted(result)
+    return len(rows)
+
+
 def persist_index_history_window(
     db: Session,
     router: DataHubRouter,
@@ -238,4 +320,9 @@ def persist_index_history_window(
     return len(rows)
 
 
-__all__ = ["persist_index_history_window", "persist_stock_history_bundle"]
+__all__ = [
+    "persist_index_history_window",
+    "persist_stock_daily_window",
+    "persist_stock_history_bundle",
+    "persist_turnover_history_window",
+]

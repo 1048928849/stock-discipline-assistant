@@ -70,6 +70,10 @@ _CANDIDATE_DISCOVERY_TABLES = (
     "candidate_industry_assessments",
     "discovery_candidates",
 )
+_HISTORY_BOOTSTRAP_TABLES = (
+    "historical_data_bootstrap_runs",
+    "historical_data_bootstrap_items",
+)
 
 
 def _safe_error(exc: BaseException) -> str:
@@ -364,9 +368,9 @@ def test_mysql8_version_empty_upgrade_and_idempotency(mysql_database: URL):
     assert session_tz
     _alembic(mysql_database, "upgrade", "head")
     current = _alembic(mysql_database, "current")
-    assert "20260727_0015" in current.stdout
+    assert "20260728_0016" in current.stdout
     heads = _alembic(mysql_database, "heads")
-    assert "20260727_0015" in heads.stdout
+    assert "20260728_0016" in heads.stdout
     _alembic(mysql_database, "upgrade", "head")
 
 
@@ -467,6 +471,33 @@ def test_mysql_0015_candidate_discovery_round_trip(mysql_database: URL):
     }
     assert "uq_candidate_discovery_run_identity" in run_constraints
     assert "uq_discovery_candidate_run_symbol" in candidate_constraints
+    engine.dispose()
+
+
+def test_mysql_0016_history_bootstrap_round_trip(mysql_database: URL):
+    _alembic(mysql_database, "upgrade", "head")
+    _alembic(mysql_database, "downgrade", "20260727_0015")
+    engine = create_engine(mysql_database, pool_pre_ping=True)
+    assert not set(_HISTORY_BOOTSTRAP_TABLES) & set(
+        inspect(engine).get_table_names()
+    )
+    _alembic(mysql_database, "upgrade", "head")
+    inspector = inspect(engine)
+    assert set(_HISTORY_BOOTSTRAP_TABLES) <= set(inspector.get_table_names())
+    run_constraints = {
+        item["name"]
+        for item in inspector.get_unique_constraints(
+            "historical_data_bootstrap_runs"
+        )
+    }
+    item_constraints = {
+        item["name"]
+        for item in inspector.get_unique_constraints(
+            "historical_data_bootstrap_items"
+        )
+    }
+    assert "uq_history_bootstrap_run_identity" in run_constraints
+    assert "uq_history_bootstrap_item_scope" in item_constraints
     engine.dispose()
 
 

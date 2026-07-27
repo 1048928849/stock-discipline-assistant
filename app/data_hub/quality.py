@@ -465,7 +465,11 @@ def canonical_value(value: Any, policy: CapabilityQualityPolicy) -> Any:
                 str(row["announcement_id"]),
             ),
         )
-    if policy.capability.startswith("market.daily") and isinstance(value, list):
+    if (
+        policy.capability.startswith("market.daily")
+        and policy.capability != "market.daily.qfq"
+        and isinstance(value, list)
+    ):
         value = [
             asdict(item) if is_dataclass(item) else dict(item)
             for item in value[-5:]

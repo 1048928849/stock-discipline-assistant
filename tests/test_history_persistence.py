@@ -160,6 +160,54 @@ def test_qfq_rewrite_updates_window_and_preserves_older_cache(session):
     ]
 
 
+def test_qfq_rewrite_accepts_legitimate_historical_price_change(session):
+    first_router = _router(session)
+    first_daily = first_router.get_history(
+        "600519", date(2026, 7, 23), date(2026, 7, 24)
+    )
+    first_turnover = first_router.get_turnover_daily(
+        "600519", date(2026, 7, 23), date(2026, 7, 24)
+    )
+    persist_stock_history_bundle(
+        session,
+        first_router,
+        daily_result=first_daily,
+        turnover_result=first_turnover,
+        requested_start=date(2026, 7, 23),
+        requested_end=date(2026, 7, 24),
+        minimum_rows=2,
+    )
+    session.commit()
+
+    changed = _payload()
+    changed["data"]["rows"][0].update(close="10.4", high="10.7")
+    second_router = _router(session, changed)
+    second_daily = second_router.get_history(
+        "600519", date(2026, 7, 23), date(2026, 7, 24)
+    )
+    second_turnover = second_router.get_turnover_daily(
+        "600519", date(2026, 7, 23), date(2026, 7, 24)
+    )
+    persist_stock_history_bundle(
+        session,
+        second_router,
+        daily_result=second_daily,
+        turnover_result=second_turnover,
+        requested_start=date(2026, 7, 23),
+        requested_end=date(2026, 7, 24),
+        minimum_rows=2,
+    )
+
+    rows = session.scalars(
+        select(MarketDailyBar).where(MarketDailyBar.symbol == "600519")
+        .order_by(MarketDailyBar.trade_date)
+    ).all()
+    assert len(rows) == 2
+    assert rows[0].close == Decimal("10.4000")
+    assert {row.quality_record_id for row in rows} == {second_daily.quality_record_id}
+    assert second_daily.normalized_digest != first_daily.normalized_digest
+
+
 def test_mark_persisted_failure_rolls_back_both_series_and_preserves_old_cache(
     session, monkeypatch
 ):
