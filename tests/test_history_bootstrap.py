@@ -289,7 +289,10 @@ def test_planning_block_uses_formal_plan_hash_and_is_idempotent(session):
         minimum_rows=1,
         config={
             "planning_error": code,
-            "adapter_version": service.settings.freestockdb_adapter_version,
+            "adapter_version": (
+                f"freestockdb:{service.settings.freestockdb_adapter_version};"
+                f"baostock:{service.settings.baostock_adapter_version}"
+            ),
         },
     )
 

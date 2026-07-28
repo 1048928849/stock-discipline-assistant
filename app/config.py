@@ -85,6 +85,13 @@ class Settings(BaseSettings):
     freestockdb_refresh_rewrite_sessions: int = Field(default=120, ge=1, le=1000)
     freestockdb_csi300_symbol: str = ""
     freestockdb_adapter_version: str = "1.0.0"
+    baostock_enabled: bool = False
+    baostock_worker_timeout_seconds: int = Field(default=10, ge=1, le=60)
+    baostock_max_response_bytes: int = Field(
+        default=2_000_000, ge=1024, le=10_000_000
+    )
+    baostock_max_rows: int = Field(default=500, ge=80, le=1000)
+    baostock_adapter_version: str = "1.0.0"
     history_bootstrap_max_symbols: int = Field(default=500, ge=1, le=7000)
     history_bootstrap_max_rows: int = Field(default=100_000, ge=1, le=5_000_000)
     history_bootstrap_max_duration_seconds: int = Field(default=900, ge=1, le=86400)

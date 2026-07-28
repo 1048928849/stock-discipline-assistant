@@ -111,6 +111,12 @@ class HistoricalDataBootstrapService:
             ),
         )
 
+    def _history_adapter_identity(self) -> str:
+        return (
+            f"freestockdb:{self.settings.freestockdb_adapter_version};"
+            f"baostock:{self.settings.baostock_adapter_version}"
+        )
+
     def _planning_inputs(
         self, *, trade_date: date, now: datetime
     ) -> tuple[tuple[IndustryDiscoveryInput, ...], dict[str, tuple[str, ...]]]:
@@ -246,7 +252,7 @@ class HistoricalDataBootstrapService:
             minimum_rows=config.minimum_history_rows,
             lookback_sessions=self.settings.freestockdb_history_lookback_sessions,
             rewrite_sessions=self.settings.freestockdb_refresh_rewrite_sessions,
-            adapter_version=self.settings.freestockdb_adapter_version,
+            adapter_version=self._history_adapter_identity(),
         ).build(
             trade_date=trade_date,
             industries=industries,
@@ -608,7 +614,7 @@ class HistoricalDataBootstrapService:
             minimum_rows=1,
             config={
                 "planning_error": code,
-                "adapter_version": self.settings.freestockdb_adapter_version,
+                "adapter_version": self._history_adapter_identity(),
             },
         )
         run = self._get_or_create_run(plan, now=now)
