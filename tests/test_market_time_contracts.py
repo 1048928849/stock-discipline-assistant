@@ -1036,7 +1036,13 @@ class CompletedSessionProvider(DataProvider):
 def _sync_stock_at(session, now):
     provider = CompletedSessionProvider(now)
     router = _router(session, now, provider)
-    return _sync_stock(session, "300502", router, refresh=True)
+    return _sync_stock(
+        session,
+        "300502",
+        router,
+        refresh=True,
+        evaluated_at=now,
+    )
 
 
 def test_one_click_morning_analysis_never_uses_partial_current_daily_bar(session):
@@ -1045,8 +1051,13 @@ def test_one_click_morning_analysis_never_uses_partial_current_daily_bar(session
     assert session.query(MarketDailyBar).count() == 0
 
 
-def test_one_click_after_close_can_use_completed_current_daily_bar(session):
+def test_one_click_after_close_can_use_completed_current_daily_bar(
+    session, monkeypatch
+):
     after_close = datetime(2026, 7, 24, 15, 1, tzinfo=SHANGHAI_TZ)
+    monkeypatch.setattr(
+        "app.data_hub.effective_quality.shanghai_now", lambda: after_close
+    )
     step, context = _sync_stock_at(session, after_close)
     latest = (
         session.query(MarketDailyBar)

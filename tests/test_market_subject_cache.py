@@ -59,6 +59,25 @@ from app.services.market_cache import (
 from app.services.technical_snapshots import load_qfq_frame, snapshot_all_holdings
 
 
+TEST_NOW = datetime(2026, 7, 24, 18, 0, tzinfo=timezone(timedelta(hours=8)))
+
+
+@pytest.fixture(autouse=True)
+def _fixed_market_test_clock(monkeypatch):
+    monkeypatch.setattr("app.data_hub.router.shanghai_now", lambda: TEST_NOW)
+    monkeypatch.setattr(
+        "app.data_hub.effective_quality.shanghai_now", lambda: TEST_NOW
+    )
+    monkeypatch.setattr(
+        "app.data_hub.trading_calendar.shanghai_now", lambda: TEST_NOW
+    )
+    monkeypatch.setattr(
+        "app.services.one_click_pipeline.shanghai_now", lambda: TEST_NOW
+    )
+    monkeypatch.setattr(sys.modules[__name__], "shanghai_now", lambda: TEST_NOW)
+    monkeypatch.setattr(sys.modules[__name__], "shanghai_today", lambda: TEST_NOW.date())
+
+
 class MarketStub(DataProvider):
     def __init__(
         self,
@@ -1359,7 +1378,7 @@ def test_cached_quote_step_recomputes_natural_staleness(session):
     router = _router(session, MarketStub("cached"))
     result = router.get_quote("300502")
     quote = _persist_quote(session, router, result)
-    stale_at = datetime.now() - timedelta(minutes=31)
+    stale_at = TEST_NOW.replace(tzinfo=None) - timedelta(minutes=31)
     quote.observed_at = stale_at
     _quality_record(session, result).observed_at = stale_at
     session.commit()
@@ -1393,7 +1412,7 @@ def test_quote_api_reports_effective_quality_and_dynamic_staleness(
     router = _router(session, MarketStub("cached"))
     result = router.get_quote("300502")
     quote = _persist_quote(session, router, result)
-    stale_at = datetime.now() - timedelta(minutes=31)
+    stale_at = TEST_NOW.replace(tzinfo=None) - timedelta(minutes=31)
     quote.observed_at = stale_at
     _quality_record(session, result).observed_at = stale_at
     session.commit()
