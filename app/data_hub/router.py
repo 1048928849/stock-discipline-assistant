@@ -1127,15 +1127,21 @@ class DataHubRouter:
             return {}
         allowed = {
             "adapter_version",
+            "protocol_version",
             "source_service",
             "requested_start",
             "requested_end",
             "requested_fields",
+            "actual_fields",
             "requested_adjustment",
             "row_count",
             "response_schema_version",
             "schema_fingerprint",
             "raw_response_digest",
+            "raw_daily_request_digest",
+            "raw_daily_response_digest",
+            "factor_request_digest",
+            "factor_response_digest",
             "source_url",
         }
         return {key: raw[key] for key in sorted(raw) if key in allowed}

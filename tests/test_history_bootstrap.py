@@ -106,51 +106,43 @@ class FixtureHistoryClient:
         self.rows = rows
         self.calls = []
 
-    def daily_history(self, **kwargs):
-        symbol = kwargs["symbol"]
-        self.calls.append((kwargs["kind"], symbol, kwargs["adjustment"]))
+    @staticmethod
+    def _response(payload, operation, digest):
+        return FreeStockDBResponse(
+            payload=payload,
+            raw_response_digest=digest * 64,
+            request_digest=("d" if operation == "daily" else "f") * 64,
+            source_url="http://127.0.0.1:7899/",
+            operation=operation,
+        )
+
+    def daily_history(self, symbol, start, end):
+        self.calls.append(("daily", symbol, start, end))
         if symbol == self.fail_once_symbol and not self.failed:
             self.failed = True
             raise ProviderUnavailableError("fixture symbol unavailable")
         days = _sessions(self.rows)
-        payload = {
-            "schema_version": "1.0",
-            "data": {
-                "symbol": symbol,
-                "adjustment": kwargs["adjustment"],
-                "price_unit": "CNY",
-                "volume_unit": "share",
-                "amount_unit": "CNY",
-                "turnover_rate_unit": "percent",
-                "rows": [
-                    {
-                        "trade_date": day.isoformat(),
-                        "open": str(10 + index / 100),
-                        "high": str(10.5 + index / 100),
-                        "low": str(9.5 + index / 100),
-                        "close": str(10.2 + index / 100),
-                        "volume": "1000000",
-                        "amount": "200000000",
-                        "turnover_rate": "3",
-                    }
-                    for index, day in enumerate(days)
-                ],
-            },
-        }
-        return FreeStockDBResponse(
-            payload=payload,
-            raw_response_digest=("a" if kwargs["kind"] == "index" else "b") * 64,
-            schema_version="1.0",
-            source_url="http://127.0.0.1:7899/api/v1/history/daily",
-        )
+        payload = [
+            {
+                "date": int(day.strftime("%Y%m%d")),
+                "code": symbol,
+                "name": "fixture",
+                "open": str(10 + index / 100),
+                "high": str(10.5 + index / 100),
+                "low": str(9.5 + index / 100),
+                "close": str(10.2 + index / 100),
+                "pre_close": str(10.1 + index / 100),
+                "volume": "1000000",
+                "amount": "200000000",
+                "turnover": "3",
+            }
+            for index, day in enumerate(days)
+        ]
+        return self._response(payload, "daily", "b")
 
-    def health(self):
-        return {
-            "schema_version": "1.0",
-            "service": "free-stockdb",
-            "version": "fixture",
-            "status": "ok",
-        }
+    def adjustment_factors(self, symbol):
+        self.calls.append(("factors", symbol))
+        return self._response([], "factors", "c")
 
 
 def _plan(symbols=("600001",), *, minimum_rows=20):
@@ -197,7 +189,7 @@ def _service(session, client, plan, **setting_updates):
     )
 
 
-def test_bootstrap_success_is_idempotent_and_persists_progress(session):
+def test_bootstrap_stocks_are_idempotent_but_missing_benchmark_blocks(session):
     plan = _plan()
     client = FixtureHistoryClient(rows=20)
     service = _service(session, client, plan)
@@ -207,8 +199,8 @@ def test_bootstrap_success_is_idempotent_and_persists_progress(session):
     second = service.run(trade_date=DAY)
 
     assert first.id == second.id
-    assert second.status == "SUCCEEDED"
-    assert second.benchmark_ready is True
+    assert second.status == "BLOCKED"
+    assert second.benchmark_ready is False
     assert second.ready_symbols == 1
     assert second.failed_symbols == 0
     assert second.coverage_ratio == Decimal("1")
@@ -219,8 +211,10 @@ def test_bootstrap_success_is_idempotent_and_persists_progress(session):
         .order_by(HistoricalDataBootstrapItem.symbol, HistoricalDataBootstrapItem.capability)
     ).all()
     assert len(items) == 3
-    assert {item.status for item in items} == {"SUCCEEDED"}
-    assert all(item.quality_record_id for item in items)
+    assert {item.status for item in items} == {"FAILED", "SKIPPED_FRESH"}
+    benchmark = next(item for item in items if item.capability == "market.index_daily")
+    assert benchmark.error_message == "market.index_daily is missing"
+    assert second.blocked_reasons == ["BENCHMARK_HISTORY_MISSING"]
 
 
 def test_bootstrap_continues_after_symbol_failure_and_resumes_item(session):
@@ -235,12 +229,13 @@ def test_bootstrap_continues_after_symbol_failure_and_resumes_item(session):
 
     second = service.run(trade_date=DAY)
     assert second.id == first.id
-    assert second.status == "SUCCEEDED"
+    assert second.status == "BLOCKED"
     assert second.ready_symbols == 2
     assert second.failed_symbols == 0
     assert session.scalar(select(HistoricalDataBootstrapRun).where(
         HistoricalDataBootstrapRun.id == first.id
-    )).status == "SUCCEEDED"
+    )).status == "BLOCKED"
+    assert second.blocked_reasons == ["BENCHMARK_HISTORY_MISSING"]
 
 
 def test_bootstrap_budget_blocks_without_silently_truncating_universe(session):
@@ -325,9 +320,10 @@ def test_duration_budget_blocks_and_same_run_can_resume(session, monkeypatch):
     second = service.run(trade_date=DAY)
 
     assert second.id == first.id
-    assert second.status == "SUCCEEDED"
+    assert second.status == "BLOCKED"
     assert second.ready_symbols == 2
     assert second.failed_symbols == 0
+    assert second.blocked_reasons == ["BENCHMARK_HISTORY_MISSING"]
 
 
 def test_force_refresh_bypasses_successful_bootstrap_cache(session):
@@ -340,7 +336,7 @@ def test_force_refresh_bypasses_successful_bootstrap_cache(session):
     assert len(client.calls) > first_calls
 
 
-def test_fixture_bootstrap_closes_candidate_discovery_history_gap(session):
+def test_fixture_bootstrap_blocks_discovery_without_benchmark_protocol(session):
     from test_candidate_discovery_cold_start import (
         _seed_analysis_context,
         _service as discovery_service,
@@ -355,8 +351,9 @@ def test_fixture_bootstrap_closes_candidate_discovery_history_gap(session):
     ).run(trade_date=DAY)
     discovery = discovery_service(session).run(now=NOW)
 
-    assert bootstrap.status == "SUCCEEDED"
+    assert bootstrap.status == "BLOCKED"
     assert bootstrap.coverage_ratio == Decimal("1")
-    assert discovery.status == "COMPLETED"
-    assert discovery.blocked_reasons == []
-    assert discovery.candidates_generated == 1
+    assert bootstrap.blocked_reasons == ["BENCHMARK_HISTORY_MISSING"]
+    assert discovery.status == "BLOCKED"
+    assert "BENCHMARK_HISTORY_MISSING" in discovery.blocked_reasons
+    assert discovery.candidates_generated == 0
