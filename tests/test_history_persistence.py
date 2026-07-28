@@ -7,50 +7,82 @@ import pytest
 from sqlalchemy import select
 
 from app.config import Settings
-from app.data_hub.market_subjects import index_daily_subject
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
 from app.data_hub.trading_calendar import SHANGHAI_TZ
 from app.models import DataQualityRecord, MarketDailyBar, MarketTurnoverSnapshot
 from app.providers.freestockdb import FreeStockDBProvider
-from app.services.history_persistence import (
-    persist_index_history_window,
-    persist_stock_history_bundle,
-)
-
-from test_freestockdb_provider import _payload
+from app.services.history_persistence import persist_stock_history_bundle
 
 
 NOW = datetime(2026, 7, 24, 18, 0, tzinfo=SHANGHAI_TZ)
 
 
-class FixtureClient:
-    def __init__(self, payload):
-        self.payload = payload
+def _native_rows(symbol="600519"):
+    return [
+        {
+            "date": 20260724,
+            "code": symbol,
+            "name": "fixture",
+            "open": "10.5",
+            "high": "10.9",
+            "low": "10.3",
+            "close": "10.8",
+            "pre_close": "10.4",
+            "volume": "1200",
+            "amount": "12800",
+            "turnover": "1.4",
+        },
+        {
+            "date": 20260723,
+            "code": symbol,
+            "name": "fixture",
+            "open": "10.0",
+            "high": "10.7",
+            "low": "9.8",
+            "close": "10.2",
+            "pre_close": "9.6",
+            "volume": "1000",
+            "amount": "10200",
+            "turnover": "1.2",
+        },
+    ]
 
-    def daily_history(self, **_kwargs):
+
+class FixtureClient:
+    def __init__(self, rows):
+        self.rows = rows
+
+    @staticmethod
+    def _response(payload, operation, digest):
         from app.providers.freestockdb import FreeStockDBResponse
 
         return FreeStockDBResponse(
-            payload=self.payload,
-            raw_response_digest="a" * 64,
-            schema_version="1.0",
-            source_url="http://127.0.0.1:7899/api/v1/history/daily",
+            payload=payload,
+            raw_response_digest=digest * 64,
+            request_digest=("d" if operation == "daily" else "f") * 64,
+            source_url="http://127.0.0.1:7899/",
+            operation=operation,
         )
 
-    def health(self):
-        return {"status": "ok", "schema_version": "1.0"}
+    def daily_history(self, symbol, start, end):
+        assert symbol == self.rows[0]["code"]
+        assert start <= end
+        return self._response(self.rows, "daily", "a")
+
+    def adjustment_factors(self, symbol):
+        assert symbol == self.rows[0]["code"]
+        return self._response([], "factors", "b")
 
 
-def _router(session, payload=None):
+def _router(session, rows=None):
     settings = Settings(
         freestockdb_enabled=True,
         freestockdb_history_lookback_sessions=2,
-        freestockdb_csi300_symbol="fixture-csi300",
     )
     provider = FreeStockDBProvider(
         settings,
-        client=FixtureClient(payload or _payload()),
+        client=FixtureClient(rows or _native_rows()),
         now_fn=lambda: NOW,
     )
     registry = ProviderRegistry()
@@ -66,7 +98,7 @@ def test_stock_history_bundle_persists_exact_aligned_lineage(session):
     )
     assert daily.quality_status.value == "SINGLE_SOURCE"
     assert daily.provider_observations[0]["adapter_version"] == "1.0.0"
-    assert daily.provider_observations[0]["raw_response_digest"] == "a" * 64
+    assert daily.provider_observations[0]["raw_daily_response_digest"] == "a" * 64
     assert "?" not in daily.provider_observations[0]["source_url"]
 
     written = persist_stock_history_bundle(
@@ -112,9 +144,9 @@ def test_stock_history_bundle_rejects_misaligned_dates_before_delete(session):
     session.commit()
     old_ids = {row.quality_record_id for row in session.query(MarketDailyBar)}
 
-    payload = _payload()
-    payload["data"]["rows"][0]["turnover_rate"] = None
-    router = _router(session, payload)
+    rows = _native_rows()
+    rows[0]["turnover"] = None
+    router = _router(session, rows)
     daily = router.get_history("600519", date(2026, 7, 23), date(2026, 7, 24))
     missing = router.get_turnover_daily(
         "600519", date(2026, 7, 23), date(2026, 7, 24)
@@ -179,8 +211,8 @@ def test_qfq_rewrite_accepts_legitimate_historical_price_change(session):
     )
     session.commit()
 
-    changed = _payload()
-    changed["data"]["rows"][0].update(close="10.4", high="10.7")
+    changed = _native_rows()
+    changed[1].update(close="10.4", high="10.7")
     second_router = _router(session, changed)
     second_daily = second_router.get_history(
         "600519", date(2026, 7, 23), date(2026, 7, 24)
@@ -249,34 +281,13 @@ def test_mark_persisted_failure_rolls_back_both_series_and_preserves_old_cache(
     assert session.get(DataQualityRecord, turnover.quality_record_id).persisted is False
 
 
-def test_index_history_window_uses_existing_market_bar_cache(session):
-    payload = _payload(symbol="fixture-csi300", adjustment="unadjusted")
-    template = payload["data"]["rows"][0]
-    payload["data"]["rows"] = [
-        {**template, "trade_date": day.isoformat()}
-        for day in (
-            date(2026, 6, 29), date(2026, 6, 30), date(2026, 7, 1),
-            date(2026, 7, 2), date(2026, 7, 3), date(2026, 7, 6),
-            date(2026, 7, 7), date(2026, 7, 8), date(2026, 7, 9),
-            date(2026, 7, 10), date(2026, 7, 13), date(2026, 7, 14),
-            date(2026, 7, 15), date(2026, 7, 16), date(2026, 7, 17),
-            date(2026, 7, 20), date(2026, 7, 21), date(2026, 7, 22),
-            date(2026, 7, 23), date(2026, 7, 24),
-        )
-    ]
-    router = _router(session, payload)
+def test_index_history_is_honestly_unavailable(session):
+    router = _router(session)
     result = router.get_index_history(
-        "CSI000300", date(2026, 6, 29), date(2026, 7, 24)
+        "CSI000300", date(2026, 7, 23), date(2026, 7, 24)
     )
-    count = persist_index_history_window(
-        session,
-        router,
-        result=result,
-        subject=index_daily_subject("CSI000300", "unadjusted", "CNY", "share"),
-        requested_start=date(2026, 6, 29),
-        requested_end=date(2026, 7, 24),
-        minimum_rows=20,
-    )
-    assert count == 20
-    assert {row.symbol for row in session.query(MarketDailyBar)} == {"CSI000300"}
-    assert session.get(DataQualityRecord, result.quality_record_id).persisted is True
+    assert result.value is None
+    assert result.quality_status.value == "MISSING"
+    assert result.provider_observations == []
+    assert session.query(MarketDailyBar).count() == 0
+    assert session.get(DataQualityRecord, result.quality_record_id).persisted is False
