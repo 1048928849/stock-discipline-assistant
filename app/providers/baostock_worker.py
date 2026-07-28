@@ -29,6 +29,9 @@ MAX_INPUT_BYTES = 4096
 MAX_ROWS = 1000
 MAX_CALENDAR_DAYS = 2000
 MAX_DIAGNOSTIC_CHARS = 2000
+MAX_FIELD_CHARS = 256
+MAX_OUTPUT_BYTES = 2_000_000
+MAX_ERROR_OUTPUT_BYTES = 4096
 
 
 class WorkerRequestError(ValueError):
@@ -47,6 +50,25 @@ class WorkerDataUnavailableError(RuntimeError):
     pass
 
 
+class _DiagnosticBuffer(io.TextIOBase):
+    def __init__(self, max_chars: int) -> None:
+        self.max_chars = max_chars
+        self.parts: list[str] = []
+        self.length = 0
+
+    def write(self, value: str) -> int:
+        rendered = str(value)
+        remaining = self.max_chars - self.length
+        if remaining > 0:
+            part = rendered[:remaining]
+            self.parts.append(part)
+            self.length += len(part)
+        return len(rendered)
+
+    def getvalue(self) -> str:
+        return "".join(self.parts)
+
+
 def _canonical_json(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -55,6 +77,15 @@ def _canonical_json(value: Any) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
+
+
+def _field_value(value: Any) -> str:
+    rendered = str(value)
+    if not rendered.strip():
+        raise WorkerQueryError("BaoStock row field must be non-empty")
+    if len(rendered) > MAX_FIELD_CHARS:
+        raise WorkerQueryError("BaoStock row field length exceeds the fixed limit")
+    return rendered
 
 
 def _read_request() -> tuple[dict[str, str], date, date]:
@@ -89,13 +120,14 @@ def _read_request() -> tuple[dict[str, str], date, date]:
 
 
 def _query(start: date, end: date) -> dict[str, Any]:
-    import baostock as bs
-
     login_result = None
-    sdk_output = io.StringIO()
+    bs = None
+    sdk_output = _DiagnosticBuffer(MAX_DIAGNOSTIC_CHARS)
     result: dict[str, Any] | None = None
     try:
         with contextlib.redirect_stdout(sdk_output):
+            import baostock as bs
+
             login_result = bs.login()
         if str(getattr(login_result, "error_code", "")) != "0":
             raise WorkerAuthenticationError("BaoStock login failed")
@@ -110,7 +142,9 @@ def _query(start: date, end: date) -> dict[str, Any]:
             )
         if str(getattr(query, "error_code", "")) != "0":
             raise WorkerQueryError("BaoStock index query failed")
-        actual_fields = tuple(str(item) for item in getattr(query, "fields", ()))
+        actual_fields = tuple(
+            _field_value(item) for item in getattr(query, "fields", ())
+        )
         if actual_fields != FIELDS:
             raise WorkerQueryError("BaoStock query fields do not match the fixed protocol")
         rows: list[dict[str, str]] = []
@@ -119,18 +153,20 @@ def _query(start: date, end: date) -> dict[str, Any]:
                 has_next = query.next()
             if not has_next:
                 break
-            raw_row = query.get_row_data()
+            with contextlib.redirect_stdout(sdk_output):
+                raw_row = query.get_row_data()
             if not isinstance(raw_row, list) or len(raw_row) != len(FIELDS):
                 raise WorkerQueryError("BaoStock row shape is invalid")
-            rows.append(dict(zip(FIELDS, (str(value) for value in raw_row), strict=True)))
+            row = dict(
+                zip(FIELDS, (_field_value(value) for value in raw_row), strict=True)
+            )
+            rows.append(row)
             if len(rows) > MAX_ROWS:
                 raise WorkerQueryError("BaoStock row count exceeds the fixed worker limit")
         if not rows:
             raise WorkerDataUnavailableError("BaoStock index data is unavailable")
         query_digest = hashlib.sha256(_canonical_json(rows)).hexdigest()
-        package_version = str(getattr(bs, "__version__", "")).strip()
-        if not package_version:
-            raise WorkerQueryError("BaoStock package version is unavailable")
+        package_version = _field_value(getattr(bs, "__version__", ""))
         result = {
             "worker_protocol_version": WORKER_PROTOCOL_VERSION,
             "baostock_package_version": package_version,
@@ -142,7 +178,7 @@ def _query(start: date, end: date) -> dict[str, Any]:
             "query_digest": query_digest,
         }
     finally:
-        if login_result is not None:
+        if bs is not None and login_result is not None:
             try:
                 with contextlib.redirect_stdout(sdk_output):
                     bs.logout()
@@ -173,20 +209,39 @@ def _error_type(exc: Exception) -> str:
     return "QUERY"
 
 
+def _error_json(exc: Exception) -> bytes:
+    response = {
+        "worker_protocol_version": WORKER_PROTOCOL_VERSION,
+        "ok": False,
+        "error_type": _error_type(exc),
+        "message": f"{type(exc).__name__}: {str(exc)}"[:500],
+    }
+    encoded = _canonical_json(response)
+    if len(encoded) <= MAX_ERROR_OUTPUT_BYTES:
+        return encoded
+    return _canonical_json(
+        {
+            "worker_protocol_version": WORKER_PROTOCOL_VERSION,
+            "ok": False,
+            "error_type": "QUERY",
+            "message": "WorkerQueryError: bounded worker failure",
+        }
+    )
+
+
 def main() -> int:
     try:
         _request, start, end = _read_request()
         response = _query(start, end)
+        encoded = _canonical_json(response)
+        if len(encoded) > MAX_OUTPUT_BYTES:
+            raise WorkerQueryError(
+                "BaoStock worker response exceeds the fixed output limit"
+            )
     except Exception as exc:
-        response = {
-            "worker_protocol_version": WORKER_PROTOCOL_VERSION,
-            "ok": False,
-            "error_type": _error_type(exc),
-            "message": f"{type(exc).__name__}: {str(exc)}"[:500],
-        }
-        sys.stdout.buffer.write(_canonical_json(response))
+        sys.stdout.buffer.write(_error_json(exc))
         return 2
-    sys.stdout.buffer.write(_canonical_json(response))
+    sys.stdout.buffer.write(encoded)
     return 0
 
 

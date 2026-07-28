@@ -4,6 +4,8 @@ from decimal import Decimal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.providers.baostock_worker import MAX_OUTPUT_BYTES as BAOSTOCK_MAX_OUTPUT_BYTES
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -88,7 +90,7 @@ class Settings(BaseSettings):
     baostock_enabled: bool = False
     baostock_worker_timeout_seconds: int = Field(default=10, ge=1, le=60)
     baostock_max_response_bytes: int = Field(
-        default=2_000_000, ge=1024, le=10_000_000
+        default=BAOSTOCK_MAX_OUTPUT_BYTES, ge=1024, le=BAOSTOCK_MAX_OUTPUT_BYTES
     )
     baostock_max_rows: int = Field(default=500, ge=80, le=1000)
     baostock_adapter_version: str = "1.0.0"

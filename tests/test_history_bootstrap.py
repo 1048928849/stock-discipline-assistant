@@ -217,6 +217,54 @@ def test_bootstrap_stocks_are_idempotent_but_missing_benchmark_blocks(session):
     assert second.blocked_reasons == ["BENCHMARK_HISTORY_MISSING"]
 
 
+def test_bootstrap_run_identity_binds_both_adapter_versions(session):
+    base = _plan()
+
+    def identity_plan(freestockdb_version: str, baostock_version: str):
+        identity = (
+            f"freestockdb:{freestockdb_version};baostock:{baostock_version}"
+        )
+        return HistoryRequirementPlan.create(
+            trade_date=base.trade_date,
+            benchmark_symbols=base.benchmark_symbols,
+            selected_industries=base.selected_industries,
+            required_stock_symbols=base.required_stock_symbols,
+            required_capabilities=base.required_capabilities,
+            start_date=base.start_date,
+            end_date=base.end_date,
+            minimum_rows=base.minimum_rows,
+            config={"fixture": True, "adapter_version": identity},
+        )
+
+    versions = (("1.0.0", "1.0.0"), ("1.0.1", "1.0.0"), ("1.0.0", "1.0.1"))
+    runs = []
+    plans = []
+    for freestockdb_version, baostock_version in versions:
+        plan = identity_plan(freestockdb_version, baostock_version)
+        service = _service(
+            session,
+            FixtureHistoryClient(rows=20),
+            plan,
+            freestockdb_adapter_version=freestockdb_version,
+            baostock_adapter_version=baostock_version,
+        )
+        plans.append(plan)
+        runs.append(service._get_or_create_run(plan, now=NOW))
+
+    repeated = _service(
+        session,
+        FixtureHistoryClient(rows=20),
+        plans[0],
+    )._get_or_create_run(plans[0], now=NOW)
+
+    assert repeated.id == runs[0].id
+    assert repeated.plan_hash == runs[0].plan_hash
+    assert len({plan.plan_hash for plan in plans}) == 3
+    assert len({run.id for run in runs}) == 3
+    assert runs[0].provider_id == "freestockdb+baostock-benchmark"
+    assert runs[0].adapter_version == "freestockdb:1.0.0;baostock:1.0.0"
+
+
 def test_bootstrap_continues_after_symbol_failure_and_resumes_item(session):
     plan = _plan(("600001", "600002"))
     client = FixtureHistoryClient(fail_once_symbol="600001", rows=20)

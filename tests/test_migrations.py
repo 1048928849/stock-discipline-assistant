@@ -76,6 +76,22 @@ def test_0016_history_bootstrap_roundtrip(tmp_path):
     _alembic(database, "upgrade", "head")
 
 
+def test_0017_expands_bootstrap_adapter_identity(tmp_path):
+    database = tmp_path / "history-bootstrap-identity.db"
+    _alembic(database, "upgrade", "20260728_0016")
+    _alembic(database, "upgrade", "head")
+    with sqlite3.connect(database) as connection:
+        columns = {
+            row[1]: row[2]
+            for row in connection.execute(
+                "PRAGMA table_info(historical_data_bootstrap_runs)"
+            )
+        }
+    assert columns["adapter_version"] == "VARCHAR(64)"
+    _alembic(database, "downgrade", "20260728_0016")
+    _alembic(database, "upgrade", "head")
+
+
 def _database_url(path: Path) -> str:
     return f"sqlite:///{path.as_posix()}"
 

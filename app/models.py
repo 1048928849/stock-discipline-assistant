@@ -1247,7 +1247,7 @@ class HistoricalDataBootstrapRun(Base):
     trade_date: Mapped[date] = mapped_column(Date, index=True)
     status: Mapped[str] = mapped_column(String(20), index=True)
     provider_id: Mapped[str] = mapped_column(String(80))
-    adapter_version: Mapped[str] = mapped_column(String(20))
+    adapter_version: Mapped[str] = mapped_column(String(64))
     config_hash: Mapped[str] = mapped_column(String(64))
     plan_hash: Mapped[str] = mapped_column(String(64))
     required_symbols: Mapped[list] = mapped_column(JSON, default=list)

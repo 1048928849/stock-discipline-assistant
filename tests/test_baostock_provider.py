@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import hashlib
 import io
 import json
@@ -301,6 +302,13 @@ def test_runner_rejects_oversized_stdout(monkeypatch):
         BaoStockWorkerRunner(_settings(baostock_max_response_bytes=1024)).run({})
 
 
+def test_settings_reject_response_limit_above_worker_boundary():
+    with pytest.raises(ValueError, match="less than or equal"):
+        _settings(
+            baostock_max_response_bytes=baostock_worker.MAX_OUTPUT_BYTES + 1
+        )
+
+
 def test_runner_maps_nonzero_worker_error_and_truncates_stderr(monkeypatch):
     error = {
         "worker_protocol_version": "1.0.0",
@@ -398,6 +406,154 @@ def test_worker_normal_query_uses_fixed_baostock_call_and_logout(monkeypatch):
         "adjustflag": "3",
     }
     assert calls[-1] == ("logout",)
+
+
+def _worker_sdk(rows, *, noisy: bool = False):
+    class Query:
+        error_code = "0"
+        fields = list(baostock_worker.FIELDS)
+
+        def __init__(self):
+            self.index = -1
+
+        def next(self):
+            if noisy:
+                print("next diagnostic")
+            self.index += 1
+            return self.index < len(rows)
+
+        def get_row_data(self):
+            if noisy:
+                print("row diagnostic")
+            row = rows[self.index]
+            return [row[field] for field in self.fields]
+
+    def login():
+        if noisy:
+            print("login diagnostic")
+        return SimpleNamespace(error_code="0")
+
+    def query(*_args, **_kwargs):
+        if noisy:
+            print("query diagnostic")
+        return Query()
+
+    def logout():
+        if noisy:
+            print("logout diagnostic")
+
+    return SimpleNamespace(
+        __version__="00.9.30",
+        login=login,
+        logout=logout,
+        query_history_k_data_plus=query,
+    )
+
+
+def _invoke_worker_main(monkeypatch, sdk) -> tuple[int, bytes, bytes]:
+    request = {
+        "operation": "index_daily",
+        "symbol": "CSI000300",
+        "start": START.isoformat(),
+        "end": END.isoformat(),
+    }
+    stdin = io.TextIOWrapper(io.BytesIO(_canonical_json(request)), encoding="utf-8")
+    stdout_buffer = io.BytesIO()
+    stderr_buffer = io.BytesIO()
+    stdout = io.TextIOWrapper(stdout_buffer, encoding="utf-8")
+    stderr = io.TextIOWrapper(stderr_buffer, encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "baostock", sdk)
+    monkeypatch.setattr(sys, "stdin", stdin)
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+    return_code = baostock_worker.main()
+    stdout.flush()
+    stderr.flush()
+    return return_code, stdout_buffer.getvalue(), stderr_buffer.getvalue()
+
+
+def test_worker_rejects_overlong_single_field(monkeypatch):
+    rows = _raw_rows()[:1]
+    rows[0]["close"] = "1" * (baostock_worker.MAX_FIELD_CHARS + 1)
+    monkeypatch.setitem(sys.modules, "baostock", _worker_sdk(rows))
+
+    with pytest.raises(baostock_worker.WorkerQueryError, match="field length"):
+        baostock_worker._query(START, END)
+
+
+def test_worker_rejects_total_json_above_fixed_limit(monkeypatch):
+    field_value = "1" * baostock_worker.MAX_FIELD_CHARS
+    rows = [
+        {field: field_value for field in baostock_worker.FIELDS}
+        for _ in range(baostock_worker.MAX_ROWS)
+    ]
+
+    return_code, stdout, _stderr = _invoke_worker_main(
+        monkeypatch, _worker_sdk(rows)
+    )
+
+    assert return_code == 2
+    assert len(stdout) <= baostock_worker.MAX_ERROR_OUTPUT_BYTES
+    assert len(stdout) < baostock_worker.MAX_OUTPUT_BYTES
+    response = json.loads(stdout)
+    assert response["ok"] is False
+    assert "output limit" in response["message"]
+
+
+def test_worker_import_and_sdk_stdout_do_not_pollute_protocol(
+    monkeypatch, capsys
+):
+    sdk = _worker_sdk(_raw_rows()[:1], noisy=True)
+    monkeypatch.delitem(sys.modules, "baostock", raising=False)
+    real_import = builtins.__import__
+
+    def noisy_import(name, *args, **kwargs):
+        if name == "baostock":
+            print("import diagnostic")
+            return sdk
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", noisy_import)
+    result = baostock_worker._query(START, END)
+    captured = capsys.readouterr()
+
+    assert result["row_count"] == 1
+    assert captured.out == ""
+    assert "import diagnostic" in captured.err
+    assert "login diagnostic" in captured.err
+    assert "logout diagnostic" in captured.err
+
+
+def test_worker_error_json_is_always_within_small_fixed_limit(monkeypatch):
+    sdk = _worker_sdk(_raw_rows()[:1])
+    sdk.login = lambda: (_ for _ in ()).throw(RuntimeError("x" * 20_000))
+
+    return_code, stdout, _stderr = _invoke_worker_main(monkeypatch, sdk)
+
+    assert return_code == 2
+    assert len(stdout) <= baostock_worker.MAX_ERROR_OUTPUT_BYTES
+    assert set(json.loads(stdout)) == {
+        "worker_protocol_version",
+        "ok",
+        "error_type",
+        "message",
+    }
+
+
+def test_worker_normal_136_row_response_is_single_bounded_json(monkeypatch):
+    template = _raw_rows()[0]
+    rows = [
+        {**template, "date": f"2026-01-{(index % 28) + 1:02d}", "volume": str(index + 1)}
+        for index in range(136)
+    ]
+
+    return_code, stdout, _stderr = _invoke_worker_main(
+        monkeypatch, _worker_sdk(rows)
+    )
+
+    assert return_code == 0
+    assert len(stdout) <= baostock_worker.MAX_OUTPUT_BYTES
+    assert json.loads(stdout)["row_count"] == 136
 
 
 def test_health_maps_timeout_and_post_success_failure_to_degraded():
@@ -578,6 +734,8 @@ def test_history_bootstrap_uses_baostock_benchmark_capability(session):
     second = service.run(trade_date=END, now=NOW)
 
     assert first.status == "SUCCEEDED"
+    assert first.provider_id == "freestockdb+baostock-benchmark"
+    assert first.adapter_version == "freestockdb:1.0.0;baostock:1.0.0"
     assert first.benchmark_ready is True
     assert first.coverage_ratio == 1
     assert first.blocked_reasons == []

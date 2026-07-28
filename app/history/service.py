@@ -51,6 +51,7 @@ from app.services.product_data import resolve_product_cache
 
 _PURPOSE = "CANDIDATE_DISCOVERY"
 _TRUSTED = {"VERIFIED", "SINGLE_SOURCE"}
+_HISTORY_PROVIDER_IDENTITY = "freestockdb+baostock-benchmark"
 
 
 class HistoryPlanningBlocked(RuntimeError):
@@ -279,8 +280,8 @@ class HistoricalDataBootstrapService:
             market="CN-A",
             trade_date=plan.trade_date,
             status="PENDING",
-            provider_id="freestockdb",
-            adapter_version=self.settings.freestockdb_adapter_version,
+            provider_id=_HISTORY_PROVIDER_IDENTITY,
+            adapter_version=self._history_adapter_identity(),
             config_hash=plan.config_hash,
             plan_hash=plan.plan_hash,
             required_symbols=list(plan.benchmark_symbols + plan.required_stock_symbols),

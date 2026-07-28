@@ -22,8 +22,8 @@ def test_history_bootstrap_read_endpoints_serialize_runs_and_items(client, sessi
         market="CN-A",
         trade_date=date(2026, 7, 24),
         status="BLOCKED",
-        provider_id="freestockdb",
-        adapter_version="1.0.0",
+        provider_id="freestockdb+baostock-benchmark",
+        adapter_version="freestockdb:1.0.0;baostock:1.0.0",
         config_hash="a" * 64,
         plan_hash="b" * 64,
         required_symbols=["CSI000300"],
@@ -56,8 +56,14 @@ def test_history_bootstrap_read_endpoints_serialize_runs_and_items(client, sessi
     )
     session.commit()
 
-    assert client.get("/api/history/bootstrap/runs").status_code == 200
-    assert client.get(f"/api/history/bootstrap/runs/{run.id}").status_code == 200
+    listed = client.get("/api/history/bootstrap/runs")
+    detail = client.get(f"/api/history/bootstrap/runs/{run.id}")
+    assert listed.status_code == 200
+    assert detail.status_code == 200
+    assert listed.json()[0]["provider_id"] == "freestockdb+baostock-benchmark"
+    assert detail.json()["adapter_version"] == (
+        "freestockdb:1.0.0;baostock:1.0.0"
+    )
     items = client.get(f"/api/history/bootstrap/runs/{run.id}/items")
     assert items.status_code == 200
     assert items.json()[0]["capability"] == "market.index_daily"
