@@ -26,6 +26,7 @@ dependencies = [
   "httpx>=0.27,<1",
   "pypdf>=6,<7",
   "exchange-calendars>=4.5,<5",
+  "baostock==0.9.3",
 ]
 
 [project.optional-dependencies]
@@ -45,6 +46,7 @@ addopts = "-q"
 markers = [
   "mysql_integration: requires MYSQL_TEST_DATABASE_URL and an isolated MySQL 8 database",
   "freestockdb_integration: requires a real local free-stockdb HTTP service",
+  "baostock_integration: requires the real BaoStock remote service",
 ]
 
 [tool.ruff]

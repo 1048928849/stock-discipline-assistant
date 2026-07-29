@@ -11,6 +11,7 @@ from app.data_hub.router import DataHubRouter
 from app.data_hub.trading_calendar import TradingCalendar
 from app.providers.akshare_provider import AKShareProvider
 from app.providers.astock_discovery_provider import AStockDiscoveryProvider
+from app.providers.baostock_provider import BaoStockBenchmarkProvider
 from app.providers.external_http_provider import (
     ConfiguredNewsApiProvider,
     ProfessionalMarketApiProvider,
@@ -23,6 +24,7 @@ from app.providers.x_social_provider import XSocialClueProvider
 def build_provider_registry() -> ProviderRegistry:
     settings = get_settings()
     registry = ProviderRegistry()
+    registry.register(BaoStockBenchmarkProvider(settings))
     registry.register(FreeStockDBProvider(settings))
     registry.register(AStockDiscoveryProvider(settings))
     registry.register(ProfessionalMarketApiProvider(settings))
@@ -61,6 +63,9 @@ def build_history_data_hub(
 ) -> DataHubRouter:
     settings = get_settings()
     registry = ProviderRegistry()
+    registry.register(
+        BaoStockBenchmarkProvider(settings, calendar=calendar, now_fn=now_fn)
+    )
     registry.register(
         FreeStockDBProvider(settings, calendar=calendar, now_fn=now_fn)
     )

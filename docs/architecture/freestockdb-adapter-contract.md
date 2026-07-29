@@ -31,14 +31,16 @@ The Provider advertises only:
 - `market.turnover.daily`
 
 Native field semantics are declared as volume=`share`, amount=`CNY`, and turnover=`percent`.
-The local protocol returned populated values for these fields, but trusted cross-source ratios
-could not be completed because the existing AKShare source was unreachable. This limitation
-must remain visible in release reporting.
+Five common 600519 sessions were compared with BaoStock before the benchmark adapter was
+enabled. Volume ratios were `0.9999862` to `1.0000091`, amount ratios were `0.9999994` to
+`1.0000010`, and turnover ratios were `0.9952083` to `1.0160219`. The sources therefore use the
+same units; turnover retains a documented precision and rounding difference and is not claimed
+to match value-for-value.
 
 No documented, verified HTTP command for CSI300 history was found in the local release package.
 Therefore the Provider does not advertise `market.index_daily`, and direct index requests fail
-with `CSI300_HTTP_CAPABILITY_UNAVAILABLE`. History Bootstrap must remain `BLOCKED` with
-`BENCHMARK_HISTORY_MISSING`; it must not fabricate index data or silently fall back to AKShare.
+with `CSI300_HTTP_CAPABILITY_UNAVAILABLE`. The independent BaoStock benchmark Provider owns that
+capability. FreeStockDB must not fabricate index data or hide a benchmark fallback.
 
 ## Security, Health, and Lineage
 

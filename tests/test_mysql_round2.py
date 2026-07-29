@@ -368,9 +368,9 @@ def test_mysql8_version_empty_upgrade_and_idempotency(mysql_database: URL):
     assert session_tz
     _alembic(mysql_database, "upgrade", "head")
     current = _alembic(mysql_database, "current")
-    assert "20260728_0016" in current.stdout
+    assert "20260728_0017" in current.stdout
     heads = _alembic(mysql_database, "heads")
-    assert "20260728_0016" in heads.stdout
+    assert "20260728_0017" in heads.stdout
     _alembic(mysql_database, "upgrade", "head")
 
 
@@ -498,6 +498,20 @@ def test_mysql_0016_history_bootstrap_round_trip(mysql_database: URL):
     }
     assert "uq_history_bootstrap_run_identity" in run_constraints
     assert "uq_history_bootstrap_item_scope" in item_constraints
+
+
+def test_mysql_0017_bootstrap_adapter_identity_round_trip(mysql_database: URL):
+    _alembic(mysql_database, "upgrade", "20260728_0016")
+    _alembic(mysql_database, "upgrade", "head")
+    engine = create_engine(mysql_database, pool_pre_ping=True)
+    columns = {
+        item["name"]: item for item in inspect(engine).get_columns(
+            "historical_data_bootstrap_runs"
+        )
+    }
+    assert columns["adapter_version"]["type"].length == 64
+    _alembic(mysql_database, "downgrade", "20260728_0016")
+    _alembic(mysql_database, "upgrade", "head")
     engine.dispose()
 
 

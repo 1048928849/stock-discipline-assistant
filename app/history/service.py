@@ -51,6 +51,7 @@ from app.services.product_data import resolve_product_cache
 
 _PURPOSE = "CANDIDATE_DISCOVERY"
 _TRUSTED = {"VERIFIED", "SINGLE_SOURCE"}
+_HISTORY_PROVIDER_IDENTITY = "freestockdb+baostock-benchmark"
 
 
 class HistoryPlanningBlocked(RuntimeError):
@@ -109,6 +110,12 @@ class HistoricalDataBootstrapService:
             candidate_min_history_coverage_ratio=(
                 self.settings.candidate_min_history_coverage_ratio
             ),
+        )
+
+    def _history_adapter_identity(self) -> str:
+        return (
+            f"freestockdb:{self.settings.freestockdb_adapter_version};"
+            f"baostock:{self.settings.baostock_adapter_version}"
         )
 
     def _planning_inputs(
@@ -246,7 +253,7 @@ class HistoricalDataBootstrapService:
             minimum_rows=config.minimum_history_rows,
             lookback_sessions=self.settings.freestockdb_history_lookback_sessions,
             rewrite_sessions=self.settings.freestockdb_refresh_rewrite_sessions,
-            adapter_version=self.settings.freestockdb_adapter_version,
+            adapter_version=self._history_adapter_identity(),
         ).build(
             trade_date=trade_date,
             industries=industries,
@@ -273,8 +280,8 @@ class HistoricalDataBootstrapService:
             market="CN-A",
             trade_date=plan.trade_date,
             status="PENDING",
-            provider_id="freestockdb",
-            adapter_version=self.settings.freestockdb_adapter_version,
+            provider_id=_HISTORY_PROVIDER_IDENTITY,
+            adapter_version=self._history_adapter_identity(),
             config_hash=plan.config_hash,
             plan_hash=plan.plan_hash,
             required_symbols=list(plan.benchmark_symbols + plan.required_stock_symbols),
@@ -608,7 +615,7 @@ class HistoricalDataBootstrapService:
             minimum_rows=1,
             config={
                 "planning_error": code,
-                "adapter_version": self.settings.freestockdb_adapter_version,
+                "adapter_version": self._history_adapter_identity(),
             },
         )
         run = self._get_or_create_run(plan, now=now)

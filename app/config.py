@@ -4,6 +4,8 @@ from decimal import Decimal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.providers.baostock_worker import MAX_OUTPUT_BYTES as BAOSTOCK_MAX_OUTPUT_BYTES
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -85,6 +87,13 @@ class Settings(BaseSettings):
     freestockdb_refresh_rewrite_sessions: int = Field(default=120, ge=1, le=1000)
     freestockdb_csi300_symbol: str = ""
     freestockdb_adapter_version: str = "1.0.0"
+    baostock_enabled: bool = False
+    baostock_worker_timeout_seconds: int = Field(default=10, ge=1, le=60)
+    baostock_max_response_bytes: int = Field(
+        default=BAOSTOCK_MAX_OUTPUT_BYTES, ge=1024, le=BAOSTOCK_MAX_OUTPUT_BYTES
+    )
+    baostock_max_rows: int = Field(default=500, ge=80, le=1000)
+    baostock_adapter_version: str = "1.0.0"
     history_bootstrap_max_symbols: int = Field(default=500, ge=1, le=7000)
     history_bootstrap_max_rows: int = Field(default=100_000, ge=1, le=5_000_000)
     history_bootstrap_max_duration_seconds: int = Field(default=900, ge=1, le=86400)
