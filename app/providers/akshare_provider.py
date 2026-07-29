@@ -28,6 +28,11 @@ from app.data_hub.trading_calendar import (
     shanghai_today,
     to_shanghai_aware,
 )
+from app.domain.market_symbols import CSI300_INTERNAL_SYMBOL
+
+
+_AKSHARE_CSI300_EASTMONEY_SYMBOL = "sh000300"
+_AKSHARE_CSI300_FALLBACK_SYMBOL = "000300"
 
 
 class AKShareProvider(
@@ -657,26 +662,36 @@ class AKShareProvider(
         }
 
     def get_index_history(self, symbol: str, start: date, end: date) -> dict:
+        eastmoney_symbol = (
+            _AKSHARE_CSI300_EASTMONEY_SYMBOL
+            if symbol == CSI300_INTERNAL_SYMBOL
+            else symbol
+        )
+        fallback_symbol = (
+            _AKSHARE_CSI300_FALLBACK_SYMBOL
+            if symbol == CSI300_INTERNAL_SYMBOL
+            else symbol[-6:]
+        )
         errors = []
         providers = (
             (
                 "东方财富指数",
                 lambda: self._ak().stock_zh_index_daily_em(
-                    symbol=symbol,
+                    symbol=eastmoney_symbol,
                     start_date=start.strftime("%Y%m%d"),
                     end_date=end.strftime("%Y%m%d"),
                 ),
-                f"AKShare/东方财富指数 {symbol}",
+                f"AKShare/东方财富指数 {eastmoney_symbol}",
             ),
             (
                 "东方财富指数备用",
                 lambda: self._ak().index_zh_a_hist(
-                    symbol=symbol[-6:],
+                    symbol=fallback_symbol,
                     period="daily",
                     start_date=start.strftime("%Y%m%d"),
                     end_date=end.strftime("%Y%m%d"),
                 ),
-                f"AKShare/index_zh_a_hist {symbol[-6:]}",
+                f"AKShare/index_zh_a_hist {fallback_symbol}",
             ),
         )
         for name, callback, source in providers:

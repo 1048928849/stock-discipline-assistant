@@ -4,6 +4,7 @@ import hashlib
 import unicodedata
 
 from app.domain.quality_subject import SubjectRef
+from app.domain.market_symbols import CSI300_INTERNAL_SYMBOL
 
 
 def _required_component(value: str, *, name: str) -> str:
@@ -154,7 +155,7 @@ def index_daily_subject(
 ) -> SubjectRef:
     normalized_id = _required_component(index_id, name="index_id").upper()
     if normalized_id in {"000300", "000300.SH", "000300.SS"}:
-        normalized_id = "CSI000300"
+        normalized_id = CSI300_INTERNAL_SYMBOL
     semantic_key = (
         f"{_adjustment(adjustment)}/{_price_unit(price_unit)}/"
         f"{_volume_unit(volume_unit)}"

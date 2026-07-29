@@ -52,6 +52,7 @@ from app.models import (
 from app.schemas_workflow import OneClickPlanRequest, TradePlanPreviewRequest
 from app.services.one_click_pipeline import (
     _ensure_profile,
+    _market_assessment,
     confirm_one_click_plan,
     run_one_click_analysis,
 )
@@ -350,6 +351,110 @@ class BindingScenarioProvider(DataProvider):
     def get_sector_history(self, industry, start, end):
         self._check()
         return self._series(end)
+
+
+class FixedBenchmarkProvider(DataProvider):
+    def __init__(self, *, evaluated_at, include_future_row=False):
+        self.metadata = ProviderMetadata(
+            provider_id="fixed-benchmark",
+            supported_capabilities=("market.index_daily",),
+            priority=1,
+        )
+        self.evaluated_at = evaluated_at
+        self.include_future_row = include_future_row
+        self.calls = []
+
+    def health_check(self, probe: bool = False):
+        return {"status": "healthy"}
+
+    def get_index_history(self, symbol, start, end):
+        self.calls.append((symbol, start, end))
+        calendar = XSHGTradingCalendar()
+        latest = end + timedelta(days=1) if self.include_future_row else end
+        trade_dates = []
+        candidate = latest
+        while len(trade_dates) < 80:
+            try:
+                calendar.session_close_at(candidate)
+            except ValueError:
+                candidate -= timedelta(days=1)
+                continue
+            trade_dates.append(candidate)
+            candidate -= timedelta(days=1)
+        trade_dates.reverse()
+        return {
+            "rows": [
+                {"date": day, "close": Decimal("100"), "volume": Decimal("1")}
+                for day in trade_dates
+            ],
+            "source": "fixed-benchmark",
+            "fetched_at": self.evaluated_at,
+        }
+
+
+def _fixed_benchmark_router(session, provider, evaluated_at):
+    registry = ProviderRegistry()
+    registry.register(provider)
+    return DataHubRouter(session, registry, now_fn=lambda: evaluated_at)
+
+
+def test_market_assessment_uses_completed_session_and_canonical_csi300(session):
+    evaluated_at = datetime(2026, 7, 29, 9, 41, 15, tzinfo=SHANGHAI_TZ)
+    provider = FixedBenchmarkProvider(evaluated_at=evaluated_at)
+    router = _fixed_benchmark_router(session, provider, evaluated_at)
+
+    _, step = _market_assessment(session, router, evaluated_at=evaluated_at)
+
+    assert provider.calls == [
+        ("CSI000300", date(2025, 11, 30), date(2026, 7, 28))
+    ]
+    assert step["effective_quality"] == "SINGLE_SOURCE"
+    assert step["executable"] is True
+    record = session.get(DataQualityRecord, step["quality_record_id"])
+    assert record.subject_id == "CSI000300"
+    assert record.observed_at == datetime(2026, 7, 28, 15, 0)
+    assert record.persisted is True
+    assert session.query(MarketDailyBar).filter_by(symbol="CSI000300").count() == 80
+
+
+def test_market_assessment_rejects_rows_after_completed_session(session):
+    evaluated_at = datetime(2026, 7, 29, 9, 41, 15, tzinfo=SHANGHAI_TZ)
+    provider = FixedBenchmarkProvider(
+        evaluated_at=evaluated_at,
+        include_future_row=True,
+    )
+    router = _fixed_benchmark_router(session, provider, evaluated_at)
+
+    _, step = _market_assessment(session, router, evaluated_at=evaluated_at)
+
+    assert step["effective_quality"] == "MISSING"
+    assert step["executable"] is False
+    assert session.query(MarketDailyBar).filter_by(symbol="CSI000300").count() == 0
+    record = session.query(DataQualityRecord).filter_by(
+        capability="market.index_daily"
+    ).one()
+    assert record.persisted is False
+
+
+def test_market_assessment_reuses_fixed_evaluated_at_for_cache_quality(
+    session, monkeypatch
+):
+    evaluated_at = datetime(2026, 7, 29, 9, 41, 15, tzinfo=SHANGHAI_TZ)
+    provider = FixedBenchmarkProvider(evaluated_at=evaluated_at)
+    router = _fixed_benchmark_router(session, provider, evaluated_at)
+    _, first = _market_assessment(session, router, evaluated_at=evaluated_at)
+    monkeypatch.setattr(
+        "app.data_hub.effective_quality.shanghai_now",
+        lambda: datetime(2030, 1, 1, 10, 0, tzinfo=SHANGHAI_TZ),
+    )
+
+    _, second = _market_assessment(session, router, evaluated_at=evaluated_at)
+
+    assert provider.calls == [
+        ("CSI000300", date(2025, 11, 30), date(2026, 7, 28))
+    ]
+    assert first["effective_quality"] == second["effective_quality"]
+    assert first["quality_record_id"] == second["quality_record_id"]
 
 
 class PatternRefreshProvider(BindingScenarioProvider):
@@ -2464,7 +2569,8 @@ def _refresh_analysis_with_quote_scenario(
         )
     router = _router_for_binding(session, *providers)
     monkeypatch.setattr(
-        "app.services.one_click_pipeline.build_data_hub", lambda db: router
+        "app.services.one_click_pipeline.build_data_hub",
+        lambda db, **kwargs: router,
     )
     response = client.post(
         "/api/v1/trade-plan-generator/analyze",

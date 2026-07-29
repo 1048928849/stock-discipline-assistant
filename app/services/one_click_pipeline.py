@@ -19,11 +19,13 @@ from app.data_hub.market_subjects import (
 from app.data_hub.research_subjects import announcement_catalog_window
 from app.data_hub.router import DataHubRouter
 from app.data_hub.trading_calendar import (
+    resolve_analysis_trade_date,
     shanghai_now,
     to_market_storage_naive,
     to_shanghai_aware,
     utc_storage_naive_to_aware,
 )
+from app.domain.market_symbols import CSI300_INTERNAL_SYMBOL
 from app.domain.package_builder import build_decision_package
 from app.errors import AppError
 from app.models import (
@@ -135,7 +137,8 @@ def _sync_stock(
     *,
     evaluated_at: datetime | None = None,
 ) -> tuple[dict, dict]:
-    business_day = to_shanghai_aware(evaluated_at or shanghai_now()).date()
+    current = to_shanghai_aware(evaluated_at or shanghai_now())
+    business_day = resolve_analysis_trade_date(provider.calendar, current)
     subject = stock_daily_subject(symbol, "qfq", "CNY", "share")
     cached = resolve_cached_series(
         db,
@@ -146,10 +149,11 @@ def _sync_stock(
         price_unit="CNY",
         volume_unit="share",
         min_rows=250,
+        evaluated_at=current,
     )
     if cached.executable and not refresh:
         latest = cached.bars[-1]
-        quote_step = _cached_quote_step(db, symbol)
+        quote_step = _cached_quote_step(db, symbol, evaluated_at=current)
         return (
             _step(
                 "market_data",
@@ -210,6 +214,7 @@ def _sync_stock(
             bars,
             subject=subject,
             min_rows=250,
+            maximum_trade_date=business_day,
         )
         stored_history = resolve_cached_series(
             db,
@@ -220,6 +225,7 @@ def _sync_stock(
             price_unit="CNY",
             volume_unit="share",
             min_rows=250,
+            evaluated_at=current,
         )
         if not stored_history.executable:
             raise ProviderUnavailableError(
@@ -236,6 +242,7 @@ def _sync_stock(
                     db,
                     symbol=symbol,
                     capability="market.quote.realtime",
+                    evaluated_at=current,
                 )
                 if not candidate_quote.executable:
                     raise ProviderUnavailableError(
@@ -263,6 +270,7 @@ def _sync_stock(
             db,
             symbol=symbol,
             capability="market.quote.realtime",
+            evaluated_at=current,
         )
         execution_quote = (
             stored_quote.value if stored_quote.executable else None
@@ -376,10 +384,11 @@ def _sync_stock(
             price_unit="CNY",
             volume_unit="share",
             min_rows=250,
+            evaluated_at=current,
         )
         if cached.executable:
             latest = cached.bars[-1]
-            quote_step = _cached_quote_step(db, symbol)
+            quote_step = _cached_quote_step(db, symbol, evaluated_at=current)
             return (
                 _step(
                     "market_data",
@@ -423,7 +432,7 @@ def _sync_stock(
             {
                 "data_date": None,
                 "source": "数据不足",
-                "quote_step": _cached_quote_step(db, symbol),
+                "quote_step": _cached_quote_step(db, symbol, evaluated_at=current),
             },
         )
 
@@ -463,8 +472,11 @@ def _market_assessment(
     *,
     evaluated_at: datetime | None = None,
 ) -> tuple[dict, dict]:
-    business_day = to_shanghai_aware(evaluated_at or shanghai_now()).date()
-    subject = index_daily_subject("csi000300", "unadjusted", "CNY", "share")
+    current_time = to_shanghai_aware(evaluated_at or shanghai_now())
+    business_day = resolve_analysis_trade_date(provider.calendar, current_time)
+    subject = index_daily_subject(
+        CSI300_INTERNAL_SYMBOL, "unadjusted", "CNY", "share"
+    )
     cached = resolve_cached_series(
         db,
         cache_symbol=subject.subject_id,
@@ -474,6 +486,7 @@ def _market_assessment(
         price_unit="CNY",
         volume_unit="share",
         min_rows=60,
+        evaluated_at=current_time,
     )
     if cached.executable:
         rows = [
@@ -502,7 +515,7 @@ def _market_assessment(
         )
     try:
         history_result = provider.get_index_history(
-            "csi000300",
+            CSI300_INTERNAL_SYMBOL,
             business_day - timedelta(days=240),
             business_day,
         )
@@ -521,6 +534,7 @@ def _market_assessment(
             bars,
             subject=subject,
             min_rows=60,
+            maximum_trade_date=business_day,
         )
         current = resolve_cached_series(
             db,
@@ -531,6 +545,7 @@ def _market_assessment(
             price_unit="CNY",
             volume_unit="share",
             min_rows=60,
+            evaluated_at=current_time,
         )
         if not current.executable:
             raise ProviderUnavailableError(
@@ -583,6 +598,7 @@ def _market_assessment(
             price_unit="CNY",
             volume_unit="share",
             min_rows=60,
+            evaluated_at=current_time,
         )
         if cached.executable:
             rows = [
@@ -812,7 +828,8 @@ def _sector_assessment(
     *,
     evaluated_at: datetime | None = None,
 ) -> tuple[dict, dict]:
-    business_day = to_shanghai_aware(evaluated_at or shanghai_now()).date()
+    current_time = to_shanghai_aware(evaluated_at or shanghai_now())
+    business_day = resolve_analysis_trade_date(provider.calendar, current_time)
     result: dict[str, object]
     if profile is None or not profile.industry:
         result = {"state": "无法判断", "relative_20d": None, "is_mainline": None}
@@ -834,6 +851,7 @@ def _sector_assessment(
         price_unit="CNY",
         volume_unit="share",
         min_rows=60,
+        evaluated_at=current_time,
     )
     if cached.executable and not refresh:
         rows = [
@@ -880,6 +898,7 @@ def _sector_assessment(
             bars,
             subject=subject,
             min_rows=60,
+            maximum_trade_date=business_day,
         )
         current = resolve_cached_series(
             db,
@@ -890,6 +909,7 @@ def _sector_assessment(
             price_unit="CNY",
             volume_unit="share",
             min_rows=60,
+            evaluated_at=current_time,
         )
         if not current.executable:
             raise ProviderUnavailableError(
@@ -938,6 +958,7 @@ def _sector_assessment(
             price_unit="CNY",
             volume_unit="share",
             min_rows=60,
+            evaluated_at=current_time,
         )
         if cached.executable:
             rows = [
@@ -1089,11 +1110,17 @@ def _latest_quality_record(
     )
 
 
-def _cached_quote_step(db: Session, symbol: str) -> dict:
+def _cached_quote_step(
+    db: Session,
+    symbol: str,
+    *,
+    evaluated_at: datetime | None = None,
+) -> dict:
     selection = resolve_cached_quote(
         db,
         symbol=symbol,
         capability="market.quote.realtime",
+        evaluated_at=evaluated_at,
     )
     execution_quote = selection.value if selection.executable else None
     display_quote = execution_quote
@@ -1102,6 +1129,7 @@ def _cached_quote_step(db: Session, symbol: str) -> dict:
             db,
             symbol=symbol,
             capability="market.quote.latest_close",
+            evaluated_at=evaluated_at,
         )
         display_quote = display_selection.value
     quote = execution_quote
@@ -1187,7 +1215,7 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
     db.add(run)
     db.commit()
     db.refresh(run)
-    provider = build_data_hub(db)
+    provider = build_data_hub(db, now_fn=lambda: analysis_started_at)
     research_orchestrator = ExistingAIResearchOrchestrator(
         lambda request: run_ai_analysis(db, request)
     )
@@ -1211,7 +1239,12 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
             evaluated_at=analysis_started_at,
         )
         steps.append(stock_step)
-        steps.append(stock_meta.get("quote_step") or _cached_quote_step(db, payload.symbol))
+        steps.append(
+            stock_meta.get("quote_step")
+            or _cached_quote_step(
+                db, payload.symbol, evaluated_at=analysis_started_at
+            )
+        )
         research_refresh = refresh_company_research_if_needed(
             db,
             payload.symbol,

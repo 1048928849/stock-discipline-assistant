@@ -21,6 +21,7 @@ from app.data_hub.trading_calendar import (
     SHANGHAI_TZ,
     TradingPhase,
     XSHGTradingCalendar,
+    resolve_analysis_trade_date,
     shanghai_now,
     to_shanghai_aware,
 )
@@ -130,6 +131,33 @@ def test_market_phase_exchange_holiday():
 def test_session_close_is_1500_shanghai_time():
     close = XSHGTradingCalendar().session_close_at(date(2026, 7, 24))
     assert close == datetime(2026, 7, 24, 15, 0, tzinfo=SHANGHAI_TZ)
+
+
+@pytest.mark.parametrize(
+    ("evaluated_at", "expected"),
+    (
+        (
+            datetime(2026, 7, 29, 9, 41, 15, tzinfo=SHANGHAI_TZ),
+            date(2026, 7, 28),
+        ),
+        (
+            datetime(2026, 7, 28, 10, 0, tzinfo=SHANGHAI_TZ),
+            date(2026, 7, 27),
+        ),
+        (
+            datetime(2026, 7, 28, 16, 0, tzinfo=SHANGHAI_TZ),
+            date(2026, 7, 28),
+        ),
+        (
+            datetime(2026, 8, 1, 10, 0, tzinfo=SHANGHAI_TZ),
+            date(2026, 7, 31),
+        ),
+    ),
+)
+def test_analysis_trade_date_uses_latest_completed_session(evaluated_at, expected):
+    assert (
+        resolve_analysis_trade_date(XSHGTradingCalendar(), evaluated_at) == expected
+    )
 
 
 def test_router_never_falls_back_quote_observed_at_to_fetched_at():

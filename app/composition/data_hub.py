@@ -21,18 +21,30 @@ from app.providers.tushare_provider import TushareProvider
 from app.providers.x_social_provider import XSocialClueProvider
 
 
-def build_provider_registry() -> ProviderRegistry:
+def build_provider_registry(
+    *,
+    calendar: TradingCalendar | None = None,
+    now_fn: Callable[[], datetime] | None = None,
+) -> ProviderRegistry:
     settings = get_settings()
     registry = ProviderRegistry()
-    registry.register(BaoStockBenchmarkProvider(settings))
-    registry.register(FreeStockDBProvider(settings))
-    registry.register(AStockDiscoveryProvider(settings))
-    registry.register(ProfessionalMarketApiProvider(settings))
-    registry.register(TushareProvider(settings))
+    registry.register(
+        BaoStockBenchmarkProvider(settings, calendar=calendar, now_fn=now_fn)
+    )
+    registry.register(FreeStockDBProvider(settings, calendar=calendar, now_fn=now_fn))
+    registry.register(
+        AStockDiscoveryProvider(settings, calendar=calendar, now_fn=now_fn)
+    )
+    registry.register(
+        ProfessionalMarketApiProvider(settings, calendar=calendar, now_fn=now_fn)
+    )
+    registry.register(TushareProvider(settings, calendar=calendar, now_fn=now_fn))
     registry.register(
         AKShareProvider(
             retries=settings.provider_max_retries,
             timeout=settings.provider_timeout_seconds,
+            calendar=calendar,
+            now_fn=now_fn,
         )
     )
     registry.register(XSocialClueProvider(settings))
@@ -49,7 +61,8 @@ def build_data_hub(
 ) -> DataHubRouter:
     return DataHubRouter(
         db,
-        registry=registry or build_provider_registry(),
+        registry=registry
+        or build_provider_registry(calendar=calendar, now_fn=now_fn),
         calendar=calendar,
         now_fn=now_fn,
     )

@@ -165,6 +165,63 @@ def test_akshare_adapter_maps_fixed_frames(monkeypatch):
     )
 
 
+def _akshare_index_frame():
+    start = date(2026, 7, 1)
+    return pd.DataFrame(
+        [
+            {
+                "date": (start + timedelta(days=offset)).isoformat(),
+                "close": 100 + offset,
+                "volume": 1_000 + offset,
+            }
+            for offset in range(20)
+        ]
+    )
+
+
+def test_akshare_maps_canonical_csi300_at_eastmoney_boundary(monkeypatch):
+    calls = []
+
+    class FakeAK:
+        @staticmethod
+        def stock_zh_index_daily_em(**kwargs):
+            calls.append(kwargs)
+            return _akshare_index_frame()
+
+    monkeypatch.setattr(AKShareProvider, "_ak", staticmethod(lambda: FakeAK))
+
+    result = AKShareProvider(retries=1).get_index_history(
+        "CSI000300", date(2026, 7, 1), date(2026, 7, 28)
+    )
+
+    assert calls[0]["symbol"] == "sh000300"
+    assert len(result["rows"]) == 20
+
+
+def test_akshare_maps_canonical_csi300_at_fallback_boundary(monkeypatch):
+    fallback_calls = []
+
+    class FakeAK:
+        @staticmethod
+        def stock_zh_index_daily_em(**kwargs):
+            del kwargs
+            raise ConnectionError("primary unavailable")
+
+        @staticmethod
+        def index_zh_a_hist(**kwargs):
+            fallback_calls.append(kwargs)
+            return _akshare_index_frame()
+
+    monkeypatch.setattr(AKShareProvider, "_ak", staticmethod(lambda: FakeAK))
+
+    result = AKShareProvider(retries=1).get_index_history(
+        "CSI000300", date(2026, 7, 1), date(2026, 7, 28)
+    )
+
+    assert fallback_calls[0]["symbol"] == "000300"
+    assert len(result["rows"]) == 20
+
+
 def test_akshare_structure_change_is_explicit(monkeypatch):
     class BrokenAK:
         @staticmethod

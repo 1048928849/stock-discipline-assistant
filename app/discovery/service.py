@@ -42,6 +42,7 @@ from app.discovery.data import (
 )
 from app.errors import AppError
 from app.domain.quality import DataQualityStatus, worst_quality
+from app.domain.market_symbols import CSI300_INTERNAL_SYMBOL
 from app.models import (
     CandidateDiscoveryRun,
     CandidateIndustryAssessment,
@@ -381,7 +382,7 @@ class CandidateDiscoveryService:
         benchmark_rows = self.db.scalars(
             select(MarketDailyBar)
             .where(
-                MarketDailyBar.symbol == "CSI000300",
+                MarketDailyBar.symbol == CSI300_INTERNAL_SYMBOL,
                 MarketDailyBar.adjustment == "unadjusted",
                 MarketDailyBar.price_unit == "CNY",
                 MarketDailyBar.volume_unit == "share",
@@ -406,7 +407,9 @@ class CandidateDiscoveryService:
         benchmark_quality = resolve_effective_quality(
             self.db,
             capability="market.index_daily",
-            subject=index_daily_subject("CSI000300", "unadjusted", "CNY", "share"),
+            subject=index_daily_subject(
+                CSI300_INTERNAL_SYMBOL, "unadjusted", "CNY", "share"
+            ),
             persisted_quality_record_id=next(iter(benchmark_quality_ids)),
             observed_at=market_storage_naive_to_aware(
                 max(row.observed_at for row in benchmark_rows)

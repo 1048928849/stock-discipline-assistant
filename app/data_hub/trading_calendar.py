@@ -136,6 +136,14 @@ class TradingCalendar(Protocol):
     ) -> int: ...
 
 
+def resolve_analysis_trade_date(
+    calendar: TradingCalendar,
+    evaluated_at: datetime,
+) -> date:
+    """Resolve the last fully completed market session for a formal analysis."""
+    return calendar.latest_completed_session(to_shanghai_aware(evaluated_at))
+
+
 class XSHGTradingCalendar:
     def __init__(self) -> None:
         self._calendar = xcals.get_calendar("XSHG")
