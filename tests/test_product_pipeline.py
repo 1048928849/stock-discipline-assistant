@@ -7,6 +7,7 @@ from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import select
 
 from app.data_hub.contracts import MarketAmountDaily
 from app.data_hub.registry import ProviderRegistry
@@ -530,6 +531,105 @@ def test_product_pipeline_builds_one_exact_lineage_snapshot(session):
         legacy_evidence=(),
     )
     assert result.snapshot.snapshot_hash == repeated.snapshot.snapshot_hash
+
+
+def test_market_regime_snapshot_binds_executable_breadth_amount_and_index(session):
+    router = _seed_product_data(session)
+    observed_at = datetime(2026, 7, 24, 15, 0, tzinfo=SHANGHAI_TZ)
+    record = DataQualityRecord(
+        symbol="CSI000300",
+        capability="market.index_daily",
+        subject_type="index",
+        subject_id="CSI000300",
+        semantic_key="unadjusted/CNY/share",
+        quality_status="SINGLE_SOURCE",
+        observed_at=to_market_storage_naive(observed_at),
+        fetched_at=to_market_storage_naive(NOW),
+        cached_at=to_market_storage_naive(NOW),
+        provider_id="fixture",
+        provider_observations=[],
+        normalized_digest="b" * 64,
+        conflict_fields=[],
+        adjustment="unadjusted",
+        price_unit="CNY",
+        volume_unit="share",
+        row_count=2,
+        trusted=True,
+        persisted=True,
+    )
+    session.add(record)
+    session.flush()
+    for trade_date, close in (
+        (date(2026, 7, 23), Decimal("100")),
+        (date(2026, 7, 24), Decimal("101")),
+    ):
+        session.add(
+            MarketDailyBar(
+                symbol="CSI000300",
+                trade_date=trade_date,
+                open=close,
+                high=close,
+                low=close,
+                close=close,
+                volume=Decimal("1000"),
+                adjustment="unadjusted",
+                price_unit="CNY",
+                volume_unit="share",
+                observed_at=to_market_storage_naive(observed_at),
+                quality_status="SINGLE_SOURCE",
+                quality_record_id=record.id,
+                source="fixture",
+                fetched_at=to_market_storage_naive(NOW),
+            )
+        )
+    session.commit()
+    index_evidence = Evidence(
+        evidence_id="pipeline:market_judgement",
+        symbol="300502",
+        capability="market.index_daily",
+        required=True,
+        category="market_judgement",
+        source_name="fixture",
+        observed_at=observed_at.isoformat(),
+        fetched_at=NOW.isoformat(),
+        quality_status=DataQualityStatus.SINGLE_SOURCE,
+        market_quality_binding=MarketQualityBinding(
+            data_capability="market.index_daily",
+            subject_type="index",
+            subject_id="CSI000300",
+            semantic_key="unadjusted/CNY/share",
+            quality_record_id=record.id,
+            observed_at=observed_at,
+        ),
+        payload={"summary": "index"},
+        external_text_is_untrusted=False,
+    )
+    result = run_product_pipeline(
+        session,
+        router,
+        symbol="300502",
+        industry="electronics",
+        analysis_started_at=NOW,
+        force_refresh=False,
+        preview=_preview(),
+        legacy_evidence=(index_evidence,),
+    )
+    stored = session.scalar(select(MarketRegimeSnapshot))
+    assert stored is not None
+    assert stored.trade_date == NOW.date()
+    bindings = {item["capability"]: item for item in stored.quality_bindings}
+    assert set(bindings) == {
+        "market.breadth.daily",
+        "market.amount.daily",
+        "market.index_daily",
+    }
+    for binding in bindings.values():
+        quality = session.get(DataQualityRecord, binding["quality_record_id"])
+        assert quality is not None and quality.persisted and quality.trusted
+    snapshot_capabilities = {
+        item.capability: item for item in result.snapshot.capabilities
+    }
+    assert all(snapshot_capabilities[name].executable for name in bindings)
 
 
 @pytest.mark.parametrize("previous_state", ["PANIC", "CONTRACTION"])

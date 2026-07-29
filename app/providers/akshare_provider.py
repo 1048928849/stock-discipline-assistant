@@ -13,7 +13,6 @@ from app.data_hub.contracts import (
     IndustryConceptProvider,
     IntradayBar,
     MarketAmountDaily,
-    MarketBreadthDaily,
     MarketDataProvider,
     NewsProvider,
     ProviderMetadata,
@@ -66,7 +65,6 @@ class AKShareProvider(
                 "market.daily.qfq",
                 "market.intraday.60m",
                 "market.turnover.daily",
-                "market.breadth.daily",
                 "market.amount.daily",
                 "market.industry.daily",
                 "market.industry.constituents",
@@ -530,42 +528,6 @@ class AKShareProvider(
             )
         frame = self._retry("eastmoney-a-share-spot", self._ak().stock_zh_a_spot_em)
         return frame, fetched_at
-
-    def get_market_breadth(self, day: date) -> list[MarketBreadthDaily]:
-        frame, fetched_at = self._completed_spot_frame(day)
-        change_column = self._column(frame, "\u6da8\u8dcc\u5e45", "change_pct")
-        values = [
-            value
-            for raw in frame[change_column].tolist()
-            if (value := self._optional_decimal(raw)) is not None
-        ]
-        if not values:
-            raise ProviderUnavailableError("market breadth has no valid change values")
-        ordered = sorted(values)
-        middle = len(ordered) // 2
-        median = (
-            ordered[middle]
-            if len(ordered) % 2
-            else (ordered[middle - 1] + ordered[middle]) / Decimal("2")
-        )
-        return [
-            MarketBreadthDaily(
-                trade_date=day,
-                advancing=sum(value > 0 for value in values),
-                declining=sum(value < 0 for value in values),
-                unchanged=sum(value == 0 for value in values),
-                limit_up=sum(value >= Decimal("9.8") for value in values),
-                limit_down=sum(value <= Decimal("-9.8") for value in values),
-                new_highs=None,
-                new_lows=None,
-                median_change_pct=median,
-                above_ma20_ratio=None,
-                above_ma50_ratio=None,
-                observed_at=self.calendar.session_close_at(day),
-                source="akshare_eastmoney_a_spot",
-                fetched_at=fetched_at,
-            )
-        ]
 
     def get_market_amount(self, day: date) -> list[MarketAmountDaily]:
         frame, fetched_at = self._completed_spot_frame(day)

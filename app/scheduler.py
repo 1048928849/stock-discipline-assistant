@@ -11,6 +11,7 @@ from app.models import Account, SystemJob, TradeReview, XPost, XWatchAccount, XW
 from app.services.reviews import review_metrics
 from app.services.technical_snapshots import snapshot_all_holdings
 from app.services.data_sources import UnifiedDataService
+from app.services.market_breadth_capture import capture_latest_market_breadth
 from app.data_hub.trading_calendar import get_trading_calendar, shanghai_now
 from app.discovery.service import CandidateDiscoveryService
 from app.watchlist.monitoring import WatchlistMonitoringService
@@ -171,6 +172,41 @@ def run_candidate_discovery() -> None:
         logger.exception("scheduled candidate discovery failed")
 
 
+def run_market_breadth_capture() -> None:
+    settings = get_settings()
+    if not settings.market_breadth_enabled:
+        return
+    now = shanghai_now()
+    calendar = get_trading_calendar()
+    if not calendar.is_session(now.date()) or now < calendar.session_close_at(now.date()):
+        return
+    try:
+        with SessionLocal() as db:
+            owner_token = f"market-breadth:{uuid4().hex}"
+            if not acquire_monitor_lease(
+                db,
+                owner_token=owner_token,
+                lease_name="market_breadth_capture",
+                lease_seconds=settings.market_breadth_capture_lease_seconds,
+                now=now,
+            ):
+                return
+            try:
+                capture_latest_market_breadth(
+                    db,
+                    calendar=calendar,
+                    evaluated_at=now,
+                )
+            finally:
+                release_monitor_lease(
+                    db,
+                    owner_token=owner_token,
+                    lease_name="market_breadth_capture",
+                )
+    except Exception:
+        logger.exception("scheduled market breadth capture failed")
+
+
 def start_scheduler() -> None:
     settings = get_settings()
     if scheduler.running or not settings.scheduler_enabled:
@@ -248,6 +284,21 @@ def start_scheduler() -> None:
             )
         except Exception:
             logger.exception("candidate discovery scheduler registration failed")
+    if settings.market_breadth_enabled:
+        try:
+            scheduler.add_job(
+                run_market_breadth_capture,
+                "cron",
+                day_of_week="mon-fri",
+                hour=settings.market_breadth_capture_hour,
+                minute=settings.market_breadth_capture_minute,
+                id="market_breadth_capture",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+            )
+        except Exception:
+            logger.exception("market breadth scheduler registration failed")
     try:
         scheduler.start()
     except Exception:

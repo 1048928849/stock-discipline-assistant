@@ -755,6 +755,10 @@ def test_one_click_profile_mark_persisted_failure_preserves_cache(
 
 
 def patch_benchmarks(monkeypatch, market="up", sector="up"):
+    from app.config import get_settings
+
+    settings = get_settings().model_copy(update={"market_breadth_enabled": True})
+    monkeypatch.setattr("app.composition.data_hub.get_settings", lambda: settings)
     monkeypatch.setattr(
         "app.providers.akshare_provider.AKShareProvider.get_index_history",
         lambda self, symbol, start, end: benchmark_rows(market),
@@ -931,7 +935,6 @@ def patch_benchmarks(monkeypatch, market="up", sector="up"):
     targets = {
         "get_intraday_60m": intraday,
         "get_turnover_daily": turnover,
-        "get_market_breadth": breadth,
         "get_market_amount_history": amounts,
         "get_industry_universe": industry_universe,
         "get_industry_constituents_universe": constituent_universe,
@@ -943,6 +946,10 @@ def patch_benchmarks(monkeypatch, market="up", sector="up"):
             f"app.providers.akshare_provider.AKShareProvider.{name}",
             implementation,
         )
+    monkeypatch.setattr(
+        "app.providers.market_breadth.MarketBreadthEODProvider.get_market_breadth",
+        breadth,
+    )
     monkeypatch.setattr(
         "app.services.one_click_pipeline.refresh_company_research_if_needed",
         lambda db, symbol, **kwargs: {

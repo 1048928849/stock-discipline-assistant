@@ -17,6 +17,7 @@ from app.providers.external_http_provider import (
     ProfessionalMarketApiProvider,
 )
 from app.providers.freestockdb import FreeStockDBProvider
+from app.providers.market_breadth import MarketBreadthEODProvider
 from app.providers.tushare_provider import TushareProvider
 from app.providers.x_social_provider import XSocialClueProvider
 
@@ -28,6 +29,9 @@ def build_provider_registry(
 ) -> ProviderRegistry:
     settings = get_settings()
     registry = ProviderRegistry()
+    registry.register(
+        MarketBreadthEODProvider(settings, calendar=calendar, now_fn=now_fn)
+    )
     registry.register(
         BaoStockBenchmarkProvider(settings, calendar=calendar, now_fn=now_fn)
     )
