@@ -34,6 +34,13 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(
                 pytest.mark.skip(reason="real BaoStock service is opt-in")
             )
+        if (
+            "market_breadth_integration" in item.keywords
+            and os.environ.get("RUN_MARKET_BREADTH_INTEGRATION") != "1"
+        ):
+            item.add_marker(
+                pytest.mark.skip(reason="real market breadth sources are opt-in")
+            )
 
 
 @pytest.fixture(autouse=True)

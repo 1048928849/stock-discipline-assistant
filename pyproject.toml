@@ -47,6 +47,7 @@ markers = [
   "mysql_integration: requires MYSQL_TEST_DATABASE_URL and an isolated MySQL 8 database",
   "freestockdb_integration: requires a real local free-stockdb HTTP service",
   "baostock_integration: requires the real BaoStock remote service",
+  "market_breadth_integration: requires local FreeStockDB and real AKShare network",
 ]
 
 [tool.ruff]

@@ -3,6 +3,7 @@ from decimal import Decimal
 
 import pytest
 
+from app.config import Settings
 from app.data_hub.contracts import (
     IndustryConstituent,
     IndustryDaily,
@@ -37,6 +38,7 @@ from app.models import (
     MarketTurnoverSnapshot,
 )
 from app.providers.akshare_provider import AKShareProvider
+from app.providers.market_breadth import MarketBreadthEODProvider
 from app.analysis.contracts import IndustryAnalysisInput, IndustryObservation, IndustrySeries
 from app.analysis.industry import analyze_industry_mainlines
 from app.services.product_data import persist_product_result, resolve_product_cache
@@ -446,18 +448,25 @@ def test_akshare_intraday_provider_uses_real_endpoint_and_drops_incomplete_bar()
     assert rows[0].completed is True
 
 
-def test_akshare_declares_all_product_capabilities():
+def test_breadth_capability_is_owned_by_the_bounded_eod_provider():
     supported = set(AKShareProvider(now_fn=lambda: NOW).metadata.supported_capabilities)
     assert {
         "market.intraday.60m",
         "market.turnover.daily",
-        "market.breadth.daily",
         "market.amount.daily",
         "market.industry.daily",
         "market.industry.constituents",
         "company.concepts",
         "company.industry_chain",
     } <= supported
+    assert "market.breadth.daily" not in supported
+    breadth = MarketBreadthEODProvider(
+        Settings(market_breadth_enabled=False),
+        client=object(),
+        runner=object(),
+        now_fn=lambda: NOW,
+    )
+    assert breadth.metadata.supported_capabilities == ("market.breadth.daily",)
 
 
 def test_akshare_three_industry_universe_produces_mainline_secondary_and_fading():
