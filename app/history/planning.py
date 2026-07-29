@@ -6,6 +6,7 @@ from app.data_hub.trading_calendar import TradingCalendar
 from app.discovery.contracts import IndustryDiscoveryInput
 from app.discovery.scoring import IndustryDiscoveryScorer
 from app.history.contracts import HistoryRequirementPlan
+from app.domain.market_symbols import CSI300_INTERNAL_SYMBOL
 
 
 class HistoryRequirementPlanner:
@@ -68,7 +69,7 @@ class HistoryRequirementPlanner:
         )
         return HistoryRequirementPlan.create(
             trade_date=trade_date,
-            benchmark_symbols=("CSI000300",),
+            benchmark_symbols=(CSI300_INTERNAL_SYMBOL,),
             selected_industries=selected,
             required_stock_symbols=symbols,
             required_capabilities=(

@@ -12,6 +12,7 @@ from app.domain.models import (
     SourceQualityBinding,
     StrategyBinding,
 )
+from app.domain.market_symbols import CSI300_INTERNAL_SYMBOL
 
 __all__ = [
     "DecisionPackage",
@@ -26,4 +27,5 @@ __all__ = [
     "StrategyDecision",
     "SourceQualityBinding",
     "StrategyBinding",
+    "CSI300_INTERNAL_SYMBOL",
 ]

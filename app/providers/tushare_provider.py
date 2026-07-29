@@ -22,6 +22,7 @@ from app.data_hub.trading_calendar import (
     shanghai_today,
     to_shanghai_aware,
 )
+from app.domain.market_symbols import CSI300_INTERNAL_SYMBOL
 
 
 class TushareProvider(
@@ -174,7 +175,7 @@ class TushareProvider(
         return rows
 
     def get_index_history(self, symbol: str, start: date, end: date) -> dict:
-        code = "000300.SH" if symbol.endswith("000300") else symbol
+        code = "000300.SH" if symbol == CSI300_INTERNAL_SYMBOL else symbol
         frame = self._pro().index_daily(
             ts_code=code, start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d")
         )

@@ -8,10 +8,12 @@ import sys
 from datetime import date, datetime, timezone
 from typing import Any
 
+from app.domain.market_symbols import CSI300_INTERNAL_SYMBOL
+
 
 WORKER_PROTOCOL_VERSION = "1.0.0"
 OPERATION = "index_daily"
-INTERNAL_SYMBOL = "CSI000300"
+INTERNAL_SYMBOL = CSI300_INTERNAL_SYMBOL
 EXTERNAL_SYMBOL = "sh.000300"
 FIELDS = (
     "date",

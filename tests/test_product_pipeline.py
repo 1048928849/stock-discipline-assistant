@@ -343,7 +343,7 @@ def _preview():
     }
 
 
-def _seed_product_data(session):
+def _seed_product_data(session, *, include_breadth=True):
     provider = FullProductProvider()
 
     def amount_history(start, end):
@@ -359,6 +359,12 @@ def _seed_product_data(session):
         ]
 
     provider.get_market_amount_history = amount_history
+    if not include_breadth:
+        def missing_breadth(day):
+            del day
+            raise RuntimeError("market breadth unavailable")
+
+        provider.get_market_breadth = missing_breadth
     registry = ProviderRegistry()
     registry.register(provider)
     router = DataHubRouter(session, registry, now_fn=lambda: NOW)
@@ -369,17 +375,110 @@ def _seed_product_data(session):
             NOW,
         ),
         router.get_turnover_daily("300502", NOW.date(), NOW.date()),
-        router.get_market_breadth(NOW.date()),
         router.get_market_amount_history(NOW.date(), NOW.date()),
         router.get_industry_universe(NOW.date(), NOW.date()),
         router.get_industry_constituents_universe(),
         router.company_concepts("300502"),
         router.company_industry_chain("300502"),
     ]
+    if include_breadth:
+        calls.append(router.get_market_breadth(NOW.date()))
     for result in calls:
         persist_product_result(session, router, result)
     session.commit()
     return router
+
+
+def test_missing_breadth_blocks_market_snapshot_without_downgrading_other_data(
+    session,
+):
+    router = _seed_product_data(session, include_breadth=False)
+    observed_at = datetime(2026, 7, 24, 15, 0, tzinfo=SHANGHAI_TZ)
+    record = DataQualityRecord(
+        symbol="CSI000300",
+        capability="market.index_daily",
+        subject_type="index",
+        subject_id="CSI000300",
+        semantic_key="unadjusted/CNY/share",
+        quality_status="SINGLE_SOURCE",
+        observed_at=to_market_storage_naive(observed_at),
+        fetched_at=to_market_storage_naive(NOW),
+        provider_id="fixture",
+        provider_observations=[],
+        normalized_digest="b" * 64,
+        conflict_fields=[],
+        adjustment="unadjusted",
+        price_unit="CNY",
+        volume_unit="share",
+        row_count=2,
+        trusted=True,
+        persisted=True,
+    )
+    session.add(record)
+    session.flush()
+    for trade_date, close in (
+        (date(2026, 7, 23), Decimal("100")),
+        (date(2026, 7, 24), Decimal("101")),
+    ):
+        session.add(
+            MarketDailyBar(
+                symbol="CSI000300",
+                trade_date=trade_date,
+                open=close,
+                high=close,
+                low=close,
+                close=close,
+                volume=Decimal("1000"),
+                adjustment="unadjusted",
+                price_unit="CNY",
+                volume_unit="share",
+                observed_at=to_market_storage_naive(observed_at),
+                quality_status="SINGLE_SOURCE",
+                quality_record_id=record.id,
+                source="fixture",
+                fetched_at=to_market_storage_naive(NOW),
+            )
+        )
+    session.commit()
+    index_evidence = Evidence(
+        evidence_id="pipeline:market_judgement",
+        symbol="300502",
+        capability="market.index_daily",
+        required=True,
+        category="market_judgement",
+        source_name="fixture",
+        observed_at=observed_at.isoformat(),
+        fetched_at=NOW.isoformat(),
+        quality_status=DataQualityStatus.SINGLE_SOURCE,
+        market_quality_binding=MarketQualityBinding(
+            data_capability="market.index_daily",
+            subject_type="index",
+            subject_id="CSI000300",
+            semantic_key="unadjusted/CNY/share",
+            quality_record_id=record.id,
+            observed_at=observed_at,
+        ),
+        payload={"summary": "index"},
+        external_text_is_untrusted=False,
+    )
+
+    result = run_product_pipeline(
+        session,
+        router,
+        symbol="300502",
+        industry="electronics",
+        analysis_started_at=NOW,
+        force_refresh=False,
+        preview=_preview(),
+        legacy_evidence=(index_evidence,),
+    )
+
+    by_capability = {item.capability: item for item in result.snapshot.capabilities}
+    assert by_capability["market.index_daily"].executable is True
+    assert by_capability["market.amount.daily"].executable is True
+    assert by_capability["market.breadth.daily"].quality_status == DataQualityStatus.MISSING
+    assert by_capability["market.breadth.daily"].rows == ()
+    assert session.query(MarketRegimeSnapshot).count() == 0
 
 
 def test_product_pipeline_builds_one_exact_lineage_snapshot(session):

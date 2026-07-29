@@ -287,9 +287,16 @@ def replace_market_series(
     *,
     subject: SubjectRef,
     min_rows: int,
+    maximum_trade_date: date | None = None,
 ) -> list[MarketDailyBar]:
     trusted = result.require_trusted_value()
     rows = validate_series_for_persistence(bars, subject=subject, min_rows=min_rows)
+    if maximum_trade_date is not None and any(
+        row.trade_date > maximum_trade_date for row in rows
+    ):
+        raise ProviderUnavailableError(
+            "series contains observations after the requested end date"
+        )
     if result.subject != subject or result.quality_record_id is None:
         raise ProviderUnavailableError("series result has no matching complete lineage")
     expected_rows = _provider_series_rows(trusted, subject=subject)

@@ -28,6 +28,7 @@ from app.data_hub.trading_calendar import (
 from app.discovery.contracts import DiscoveryConfig, IndustryDiscoveryInput
 from app.discovery.scoring import IndustryDiscoveryScorer
 from app.domain.quality import DataQualityStatus, worst_quality
+from app.domain.market_symbols import CSI300_INTERNAL_SYMBOL
 from app.history.contracts import HistoryRequirementPlan
 from app.history.planning import HistoryRequirementPlanner
 from app.models import (
@@ -353,11 +354,13 @@ class HistoricalDataBootstrapService:
         return item
 
     def _daily_cache(self, symbol: str, plan: HistoryRequirementPlan, now: datetime):
-        adjustment = "unadjusted" if symbol == "CSI000300" else "qfq"
-        capability = "market.index_daily" if symbol == "CSI000300" else "market.daily.qfq"
+        adjustment = "unadjusted" if symbol == CSI300_INTERNAL_SYMBOL else "qfq"
+        capability = (
+            "market.index_daily" if symbol == CSI300_INTERNAL_SYMBOL else "market.daily.qfq"
+        )
         subject = (
             index_daily_subject(symbol, adjustment, "CNY", "share")
-            if symbol == "CSI000300"
+            if symbol == CSI300_INTERNAL_SYMBOL
             else stock_daily_subject(symbol, adjustment, "CNY", "share")
         )
         selected = resolve_cached_series(
@@ -461,12 +464,12 @@ class HistoricalDataBootstrapService:
     ) -> bool:
         item = self._item(
             run,
-            symbol="CSI000300",
+            symbol=CSI300_INTERNAL_SYMBOL,
             capability="market.index_daily",
             adjustment="unadjusted",
             plan=plan,
         )
-        cache, ready = self._daily_cache("CSI000300", plan, now)
+        cache, ready = self._daily_cache(CSI300_INTERNAL_SYMBOL, plan, now)
         if ready and not force_refresh:
             self._skip_item(item, cache, now=now)
             return True
@@ -474,14 +477,14 @@ class HistoricalDataBootstrapService:
         item.started_at = to_utc_storage_naive(now)
         try:
             result = self.router.get_index_history(
-                "CSI000300", plan.start_date, plan.end_date
+                CSI300_INTERNAL_SYMBOL, plan.start_date, plan.end_date
             )
             written = persist_index_history_window(
                 self.db,
                 self.router,
                 result=result,
                 subject=index_daily_subject(
-                    "CSI000300", "unadjusted", "CNY", "share"
+                    CSI300_INTERNAL_SYMBOL, "unadjusted", "CNY", "share"
                 ),
                 requested_start=plan.start_date,
                 requested_end=plan.end_date,
@@ -762,12 +765,12 @@ def discovery_history_status(db: Session, *, router: DataHubRouter | None = None
         "provider_health": provider_health,
         "latest_index_trade_date": db.scalar(
             select(func.max(MarketDailyBar.trade_date)).where(
-                MarketDailyBar.symbol == "CSI000300"
+                MarketDailyBar.symbol == CSI300_INTERNAL_SYMBOL
             )
         ),
         "latest_stock_trade_date": db.scalar(
             select(func.max(MarketDailyBar.trade_date)).where(
-                MarketDailyBar.symbol != "CSI000300"
+                MarketDailyBar.symbol != CSI300_INTERNAL_SYMBOL
             )
         ),
         "latest_turnover_trade_date": db.scalar(
