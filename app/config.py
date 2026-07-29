@@ -5,6 +5,9 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.providers.baostock_worker import MAX_OUTPUT_BYTES as BAOSTOCK_MAX_OUTPUT_BYTES
+from app.providers.market_breadth_worker import (
+    MAX_OUTPUT_BYTES as MARKET_BREADTH_MAX_OUTPUT_BYTES,
+)
 
 
 class Settings(BaseSettings):
@@ -94,6 +97,21 @@ class Settings(BaseSettings):
     )
     baostock_max_rows: int = Field(default=500, ge=80, le=1000)
     baostock_adapter_version: str = "1.0.0"
+    market_breadth_enabled: bool = False
+    market_breadth_worker_timeout_seconds: int = Field(default=30, ge=1, le=60)
+    market_breadth_total_budget_seconds: int = Field(default=60, ge=1, le=120)
+    market_breadth_max_response_bytes: int = Field(
+        default=MARKET_BREADTH_MAX_OUTPUT_BYTES,
+        ge=1024,
+        le=MARKET_BREADTH_MAX_OUTPUT_BYTES,
+    )
+    market_breadth_max_cross_section_rows: int = Field(default=10_000, ge=1, le=20_000)
+    market_breadth_max_pool_rows: int = Field(default=2_000, ge=1, le=2_000)
+    market_breadth_history_window_days: int = Field(default=30, ge=1, le=30)
+    market_breadth_adapter_version: str = "1.0.0"
+    market_breadth_capture_hour: int = Field(default=16, ge=15, le=23)
+    market_breadth_capture_minute: int = Field(default=10, ge=0, le=59)
+    market_breadth_capture_lease_seconds: int = Field(default=180, ge=60, le=3600)
     history_bootstrap_max_symbols: int = Field(default=500, ge=1, le=7000)
     history_bootstrap_max_rows: int = Field(default=100_000, ge=1, le=5_000_000)
     history_bootstrap_max_duration_seconds: int = Field(default=900, ge=1, le=86400)
