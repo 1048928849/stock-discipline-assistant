@@ -153,8 +153,18 @@ def test_rule_matrix_is_complete_and_raw_docx_is_ignored():
     ):
         assert f"| {category} |" in matrix
     assert "logical page" in matrix
+    tracked = subprocess.run(
+        ["git", "ls-files", "--", ".codex-input/*.docx"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert not tracked.stdout.strip()
+
     docx_files = list((ROOT / ".codex-input").glob("*.docx"))
-    assert docx_files
+    if not docx_files:
+        return
     ignored = subprocess.run(
         ["git", "check-ignore", *[str(path) for path in docx_files]],
         cwd=ROOT,
