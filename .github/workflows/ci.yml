@@ -22,6 +22,7 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: python -m ruff check .
       - run: node --check app/static/product-v1.js
+      - run: node --check app/static/selected-stock.js
       - run: git diff --check
       - name: Require exactly one Alembic head
         run: |

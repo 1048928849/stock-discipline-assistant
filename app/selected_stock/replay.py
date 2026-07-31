@@ -100,6 +100,11 @@ def replay_selected_stock(
         source_lineage=source_lineage,
         snapshot_hash=snapshot_hash,
         product_v1_status="FORMAL_EXECUTION_REMAINS_PRODUCT_V1",
+        market_price_observed_at=datetime.combine(
+            visible_stock[-1]["trade_date"],
+            datetime.min.time(),
+            tzinfo=generated_at.tzinfo,
+        ).replace(hour=15),
     )
     future = _future(stock_rows, analysis_date)
     base_close = Decimal(str(visible_stock[-1]["close"]))

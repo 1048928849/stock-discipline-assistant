@@ -72,6 +72,23 @@ class PlanStatus(str, Enum):
     EXIT = "EXIT"
 
 
+class GateStatus(str, Enum):
+    PASS = "PASS"
+    BLOCKED = "BLOCKED"
+    NOT_EVALUATED = "NOT_EVALUATED"
+
+
+class UserPriceStatus(str, Enum):
+    MARKET_QUOTE_TRUSTED = "MARKET_QUOTE_TRUSTED"
+    USER_PRICE_NOT_PROVIDED = "USER_PRICE_NOT_PROVIDED"
+    USER_PRICE_FRESH = "USER_PRICE_FRESH"
+    USER_PRICE_STALE = "USER_PRICE_STALE"
+    USER_PRICE_DATE_MISMATCH = "USER_PRICE_DATE_MISMATCH"
+    USER_PRICE_FUTURE = "USER_PRICE_FUTURE"
+    USER_PRICE_CONFLICTED = "USER_PRICE_CONFLICTED"
+    LATEST_CLOSE_ONLY = "LATEST_CLOSE_ONLY"
+
+
 class CatalystType(str, Enum):
     INDUSTRY_SUPPLY_DEMAND = "INDUSTRY_SUPPLY_DEMAND"
     EARNINGS = "EARNINGS"
@@ -90,6 +107,7 @@ class CatalystContext(ContractModel):
 
 class SelectedStockAnalysisRequest(ContractModel):
     stock_code: str = Field(pattern=r"^\d{6}$")
+    account_id: int | None = Field(default=None, ge=1)
     analysis_date: date | None = None
     current_price: Decimal | None = Field(default=None, gt=0)
     current_price_observed_at: datetime | None = None
@@ -100,11 +118,19 @@ class SelectedStockAnalysisRequest(ContractModel):
     available_cash: Decimal | None = Field(default=None, ge=0)
     risk_budget: Decimal | None = Field(default=None, gt=0)
     max_position_pct: Decimal | None = Field(default=None, gt=0, le=100)
+    daily_realized_pnl: Decimal | None = None
+    daily_unrealized_pnl: Decimal | None = None
+    daily_pnl_observed_at: datetime | None = None
+    daily_pnl_source: Literal[
+        "ACCOUNT_SNAPSHOT",
+        "BROKER_STATEMENT",
+        "USER_ACCOUNT_OBSERVATION",
+    ] | None = None
     strategy_mode: StrategyMode = StrategyMode.CSV_V2_ADVISORY
     user_focus: str | None = Field(default=None, max_length=2000)
     catalyst_context: CatalystContext | None = None
 
-    @field_validator("current_price_observed_at")
+    @field_validator("current_price_observed_at", "daily_pnl_observed_at")
     @classmethod
     def aware_price_time(cls, value: datetime | None) -> datetime | None:
         if value is not None and value.tzinfo is None:
@@ -121,14 +147,106 @@ class SelectedStockAnalysisRequest(ContractModel):
             raise ValueError("available_cash requires account_size")
         if self.current_position_quantity and self.average_cost is None:
             raise ValueError("current_position_quantity requires average_cost")
+        if self.current_position_pct and self.account_size is None:
+            raise ValueError("current_position_pct requires account_size")
+        if (
+            self.current_position_quantity == 0
+            and not self.current_position_pct
+            and self.average_cost is not None
+        ):
+            raise ValueError("average_cost cannot describe a zero position")
+        daily_pnl = (
+            self.daily_realized_pnl,
+            self.daily_unrealized_pnl,
+            self.daily_pnl_observed_at,
+            self.daily_pnl_source,
+        )
+        if any(value is not None for value in daily_pnl) and not all(
+            value is not None for value in daily_pnl
+        ):
+            raise ValueError(
+                "daily PnL requires realized, unrealized, observed_at, and source"
+            )
+        if self.daily_pnl_source is not None and self.account_size is None:
+            raise ValueError("daily PnL requires account_size")
         return self
 
 
 class GateResult(ContractModel):
     code: str
-    passed: bool
+    status: GateStatus
     reason_code: str
+    required_inputs: tuple[str, ...] = ()
+    evaluated_inputs: dict[str, Any] = Field(default_factory=dict)
+    threshold: Any | None = None
+    actual_value: Any | None = None
     evidence: tuple[str, ...] = ()
+    missing_inputs: tuple[str, ...] = ()
+    effect_on_plan: str
+    effect_on_score: str
+    effect_on_position: str
+
+
+class PriceObservation(ContractModel):
+    price: Decimal = Field(gt=0)
+    observed_at: datetime
+    source: Literal["MARKET_DAILY_CLOSE", "USER_OBSERVATION"]
+    trust_status: UserPriceStatus
+    age_seconds: int | None = Field(default=None, ge=0)
+    matched_analysis_date: bool
+    executable_for_entry: bool
+    executable_for_position: bool
+    reason_code: str
+    market_close: Decimal = Field(gt=0)
+    market_close_observed_at: datetime
+    user_price: Decimal | None = Field(default=None, gt=0)
+    user_price_observed_at: datetime | None = None
+
+    @field_validator(
+        "observed_at",
+        "market_close_observed_at",
+        "user_price_observed_at",
+    )
+    @classmethod
+    def aware_price_times(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("price context times must be timezone-aware")
+        return value
+
+
+class AccountContext(ContractModel):
+    account_id: int | None = None
+    source: Literal[
+        "SERVER_ACCOUNT",
+        "MANUAL_ACCOUNT_CONTEXT",
+        "NO_ACCOUNT_CONTEXT",
+    ]
+    trust_status: Literal[
+        "SERVER_LOADED",
+        "USER_CONFIRMED",
+        "ACCOUNT_INPUT_CONFLICT",
+        "MANUAL_ACCOUNT_CONTEXT",
+        "UNAVAILABLE",
+    ]
+    account_size: Decimal | None = Field(default=None, gt=0)
+    available_cash: Decimal | None = Field(default=None, ge=0)
+    current_position_quantity: int | None = Field(default=None, ge=0)
+    current_position_pct: Decimal | None = Field(default=None, ge=0, le=100)
+    average_cost: Decimal | None = Field(default=None, gt=0)
+    daily_realized_pnl: Decimal | None = None
+    daily_unrealized_pnl: Decimal | None = None
+    daily_loss_amount: Decimal | None = Field(default=None, ge=0)
+    daily_loss_pct: Decimal | None = Field(default=None, ge=0)
+    observed_at: datetime | None = None
+    conflict_fields: tuple[str, ...] = ()
+    confidence: Decimal = Field(ge=0, le=1)
+
+    @field_validator("observed_at")
+    @classmethod
+    def aware_account_time(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("account context observed_at must be timezone-aware")
+        return value
 
 
 class ScoreComponent(ContractModel):
@@ -168,9 +286,14 @@ class PricePlan(ContractModel):
 class PositionPlan(ContractModel):
     initial_position_pct: Decimal = Field(ge=0, le=100)
     max_position_pct: Decimal = Field(ge=0, le=100)
+    proposed_trade_pct: Decimal = Field(default=Decimal("0"), ge=0, le=100)
+    post_trade_position_pct: Decimal | None = Field(default=None, ge=0)
     quantity: int | None = Field(default=None, ge=0)
     max_quantity: int | None = Field(default=None, ge=0)
     risk_amount: Decimal | None = Field(default=None, ge=0)
+    maximum_loss_after_trade: Decimal | None = Field(default=None, ge=0)
+    t1_overnight_gap_risk_pct: Decimal | None = Field(default=None, ge=0)
+    t1_risk_amount: Decimal | None = Field(default=None, ge=0)
     add_conditions: tuple[str, ...]
     reduce_conditions: tuple[str, ...]
 
@@ -265,6 +388,8 @@ class SelectedStockAnalysisResult(ContractModel):
     invalidation_conditions: tuple[str, ...]
     next_check_condition: tuple[str, ...]
     execution_blockers: tuple[str, ...]
+    price_observation: PriceObservation
+    account_context: AccountContext
     quality_bindings: tuple[QualityBinding, ...]
     source_lineage: tuple[SourceLineage, ...]
     product_v1_comparison: StrategyComparison
@@ -304,13 +429,16 @@ PROGRESS_STATES = (
 
 
 __all__ = [
+    "AccountContext",
     "CatalystContext",
     "ContextStatus",
     "CycleState",
     "DataStatus",
+    "GateStatus",
     "GateResult",
     "HoldingPlan",
     "PlanStatus",
+    "PriceObservation",
     "PositionPlan",
     "PricePlan",
     "PROGRESS_STATES",
@@ -324,4 +452,5 @@ __all__ = [
     "StrategyComparison",
     "StrategyMode",
     "TradeMode",
+    "UserPriceStatus",
 ]

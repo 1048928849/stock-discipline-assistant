@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Any, Callable
 
 from sqlalchemy import select
@@ -25,18 +26,23 @@ from app.data_hub.trading_calendar import (
     time_storage_semantics_for_capability,
     to_shanghai_aware,
     to_utc_storage_naive,
+    utc_storage_naive_to_aware,
 )
 from app.domain.hashing import canonical_hash
 from app.domain.quality import DataQualityStatus
 from app.domain.quality_subject import SubjectRef
 from app.models import (
+    Account,
     CompanyProfile,
     DataQualityRecord,
+    Holding,
     MarketDailyBar,
     MarketRegimeSnapshot,
     SelectedStockAnalysisRun,
+    Trade,
 )
 from app.selected_stock.contracts import (
+    AccountContext,
     ContextStatus,
     DataStatus,
     QualityBinding,
@@ -330,6 +336,144 @@ class SelectedStockAnalysisService:
             "snapshot_hash": snapshot.product_snapshot_hash,
         }
 
+    @staticmethod
+    def _matches_manual(server: Decimal, supplied: Decimal, tolerance_pct: Decimal) -> bool:
+        if server == supplied:
+            return True
+        denominator = max(abs(server), Decimal("0.01"))
+        return abs(server - supplied) / denominator * Decimal("100") <= tolerance_pct
+
+    def _realized_pnl_for_day(
+        self,
+        account_id: int,
+        analysis_date: date,
+    ) -> Decimal | None:
+        trades = self.db.scalars(
+            select(Trade)
+            .where(Trade.account_id == account_id)
+            .order_by(Trade.traded_at, Trade.id)
+        ).all()
+        positions: dict[str, tuple[int, Decimal]] = {}
+        realized = Decimal("0")
+        for trade in trades:
+            quantity, average_cost = positions.get(trade.symbol, (0, Decimal("0")))
+            side = str(trade.side).upper()
+            if side in {"BUY", "买入"}:
+                total = average_cost * quantity + trade.price * trade.quantity + trade.fee
+                quantity += trade.quantity
+                average_cost = total / quantity
+            elif side in {"SELL", "卖出"}:
+                if trade.quantity > quantity:
+                    return None
+                pnl = (trade.price - average_cost) * trade.quantity - trade.fee
+                if to_shanghai_aware(
+                    trade.traded_at,
+                    naive_is_shanghai=trade.traded_at.tzinfo is None,
+                ).date() == analysis_date:
+                    realized += pnl
+                quantity -= trade.quantity
+                if quantity == 0:
+                    average_cost = Decimal("0")
+            positions[trade.symbol] = (quantity, average_cost)
+        return realized
+
+    def _account_context(
+        self,
+        request: SelectedStockAnalysisRequest,
+        *,
+        trusted_price: Decimal,
+        analysis_date: date,
+        observed_at: datetime,
+    ) -> AccountContext | None:
+        if request.account_id is None:
+            return None
+        account = self.db.get(Account, request.account_id)
+        if account is None:
+            raise SelectedStockAnalysisError(
+                "ACCOUNT_NOT_FOUND",
+                "selected-stock account_id does not exist",
+            )
+        holding = self.db.scalar(
+            select(Holding).where(
+                Holding.account_id == account.id,
+                Holding.symbol == request.stock_code,
+            )
+        )
+        quantity = holding.quantity if holding is not None else 0
+        average_cost = holding.cost_price if holding is not None and quantity > 0 else None
+        position_pct = (
+            Decimal(quantity) * trusted_price / account.total_assets * Decimal("100")
+            if quantity and account.total_assets
+            else Decimal("0")
+        )
+        tolerance = Decimal("0.5")
+        conflicts: list[str] = []
+        comparisons = (
+            ("account_size", account.total_assets, request.account_size),
+            ("available_cash", account.available_cash, request.available_cash),
+            ("average_cost", average_cost, request.average_cost),
+            ("current_position_pct", position_pct, request.current_position_pct),
+        )
+        for field, server_value, supplied in comparisons:
+            if supplied is None:
+                continue
+            if server_value is None or not self._matches_manual(
+                Decimal(server_value), Decimal(supplied), tolerance
+            ):
+                conflicts.append(field)
+        if (
+            request.current_position_quantity is not None
+            and request.current_position_quantity != quantity
+        ):
+            conflicts.append("current_position_quantity")
+        if request.daily_pnl_source is not None:
+            conflicts.append("daily_pnl")
+        realized = self._realized_pnl_for_day(account.id, analysis_date)
+        confirmed = any(
+            value is not None
+            for value in (
+                request.account_size,
+                request.available_cash,
+                request.current_position_quantity,
+                request.current_position_pct,
+                request.average_cost,
+            )
+        )
+        return AccountContext(
+            account_id=account.id,
+            source="SERVER_ACCOUNT",
+            trust_status=(
+                "ACCOUNT_INPUT_CONFLICT"
+                if conflicts
+                else "USER_CONFIRMED"
+                if confirmed
+                else "SERVER_LOADED"
+            ),
+            account_size=account.total_assets,
+            available_cash=account.available_cash,
+            current_position_quantity=quantity,
+            current_position_pct=position_pct,
+            average_cost=average_cost,
+            daily_realized_pnl=realized,
+            daily_unrealized_pnl=None,
+            daily_loss_amount=None,
+            daily_loss_pct=None,
+            observed_at=utc_storage_naive_to_aware(
+                max(
+                    value
+                    for value in (
+                        account.updated_at,
+                        holding.updated_at if holding is not None else None,
+                    )
+                    if value is not None
+                )
+            )
+            if account.updated_at is not None
+            else observed_at,
+            conflict_fields=tuple(sorted(set(conflicts))),
+            confidence=Decimal("1") if not conflicts else Decimal("0"),
+        )
+
     def _data_status(
         self,
         stock: _SeriesData,
@@ -409,6 +553,15 @@ class SelectedStockAnalysisService:
             )
             market_status, market_evidence = self._market_context(analysis_date)
             indicators["market_context"] = market_evidence
+            market_price_observed_at = self.calendar.session_close_at(
+                stock_rows[-1]["trade_date"]
+            )
+            account_context = self._account_context(
+                request,
+                trusted_price=stock_rows[-1]["close"],
+                analysis_date=analysis_date,
+                observed_at=analysis_started_at,
+            )
 
             series = tuple(
                 item for item in (stock, benchmark, industry) if item is not None
@@ -429,6 +582,9 @@ class SelectedStockAnalysisService:
                     "quality_bindings": [
                         item.model_dump(mode="json") for item in quality_bindings
                     ],
+                    "account_context": account_context.model_dump(mode="json")
+                    if account_context is not None
+                    else None,
                 }
             )
             existing = self.db.scalar(
@@ -486,6 +642,8 @@ class SelectedStockAnalysisService:
                 source_lineage=lineage,
                 snapshot_hash=snapshot.snapshot_hash,
                 product_v1_status=product_v1_status,
+                market_price_observed_at=market_price_observed_at,
+                account_context=account_context,
             )
             stored_result = result.model_dump(mode="json")
             run = SelectedStockAnalysisRun(

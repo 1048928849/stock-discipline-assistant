@@ -82,7 +82,7 @@
         <article><h4>执行阻断</h4>${list(data.execution_blockers, "fail")}</article>
       </div>
       <h3>硬门禁</h3>
-      <div class="table-wrap"><table class="selected-table"><thead><tr><th>门禁</th><th>状态</th><th>原因</th><th>证据</th></tr></thead><tbody>${gates.map((gate) => `<tr><td>${esc(gate.code)}</td><td>${status(gate.passed ? "PASS" : "BLOCKED")}</td><td>${esc(gate.reason_code)}</td><td>${esc((gate.evidence || []).join("；"))}</td></tr>`).join("")}</tbody></table></div>
+      <div class="table-wrap"><table class="selected-table"><thead><tr><th>门禁</th><th>状态</th><th>原因</th><th>证据</th></tr></thead><tbody>${gates.map((gate) => `<tr><td>${esc(gate.code)}</td><td>${status(gate.status)}</td><td>${esc(gate.reason_code)}</td><td>${esc((gate.evidence || []).join("；"))}</td></tr>`).join("")}</tbody></table></div>
       <h3>数据质量与来源</h3>
       <div class="table-wrap"><table class="selected-table"><thead><tr><th>能力</th><th>主体</th><th>质量</th><th>数据时间</th><th>质量记录</th></tr></thead><tbody>${quality.map((item) => `<tr><td>${esc(item.capability)}</td><td>${esc(item.subject_type)}:${esc(item.subject_id)}</td><td>${status(item.quality_status)}</td><td>${esc(item.observed_at)}</td><td>#${esc(item.quality_record_id)}</td></tr>`).join("")}</tbody></table></div>
       <div class="table-wrap"><table class="selected-table"><thead><tr><th>Provider</th><th>能力</th><th>来源</th><th>行数</th><th>复权 / 单位</th></tr></thead><tbody>${lineage.map((item) => `<tr><td>${esc(item.provider_id)}</td><td>${esc(item.capability)}</td><td>${esc(item.source)}</td><td>${esc(item.row_count)}</td><td>${value(item.adjustment, "-")} / ${value(item.price_unit, "-")} / ${value(item.volume_unit, "-")}</td></tr>`).join("")}</tbody></table></div>

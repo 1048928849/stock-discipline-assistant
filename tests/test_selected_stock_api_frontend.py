@@ -57,6 +57,9 @@ def _result(payload: SelectedStockAnalysisRequest):
         source_lineage=(),
         snapshot_hash="d" * 64,
         product_v1_status="FORMAL_EXECUTION_REMAINS_PRODUCT_V1",
+        market_price_observed_at=datetime(
+            2026, 6, 17, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+        ),
     )
 
 

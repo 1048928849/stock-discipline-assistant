@@ -13,12 +13,15 @@ from app.data_hub.contracts import DailyBar, DataProvider, ProviderMetadata
 from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
 from app.data_hub.trading_calendar import get_trading_calendar
-from app.models import DataQualityRecord, SelectedStockAnalysisRun
+from app.models import Account, DataQualityRecord, Holding, SelectedStockAnalysisRun
 from app.selected_stock.contracts import (
+    AccountContext,
     ContextStatus,
     DataStatus,
+    GateStatus,
     SelectedStockAnalysisRequest,
     StrategyMode,
+    UserPriceStatus,
 )
 from app.selected_stock.indicators import calculate_indicators
 from app.selected_stock.replay import replay_selected_stock
@@ -186,7 +189,7 @@ def test_strategy_manifest_and_all_hard_gates_are_stable():
         "T1_NEW_POSITION_RISK_EXCEEDED",
         "MAX_POSITION_EXCEEDED",
         "DAILY_LOSS_LIMIT_REACHED",
-        "CONFIRM_FREEZE_FAILED",
+        "SINGLE_STOCK_LOSS_LIMIT",
     }
     indicators = calculate_indicators(
         _indicator_rows(),
@@ -206,6 +209,7 @@ def test_strategy_manifest_and_all_hard_gates_are_stable():
         source_lineage=(),
         snapshot_hash="c" * 64,
         product_v1_status="FORMAL_EXECUTION_REMAINS_PRODUCT_V1",
+        market_price_observed_at=get_trading_calendar().session_close_at(END),
     )
     assert {item.code for item in result.hard_gates} == expected
     assert result.executable is False
@@ -257,13 +261,78 @@ def test_selected_stock_service_persists_exact_lineage_and_is_idempotent(session
     assert first.product_v1_comparison.conflict_status == "DATA_CONFLICT"
     assert first.technical_evidence["product_v1_shadow_signal_hash"]
     assert len(first.quality_bindings) == 2
-    assert len(first.source_lineage) == 2
+    assert len(first.source_lineage) == 4
+    assert {item.capability for item in first.source_lineage} >= {
+        "selected_stock.price_observation",
+        "selected_stock.account_context",
+    }
     assert first.source_lineage[0].details["persisted_row_count"] == 280
     assert first.source_lineage[0].details["analysis_row_count"] == 280
     assert len(session.scalars(select(SelectedStockAnalysisRun)).all()) == 1
     records = session.scalars(select(DataQualityRecord)).all()
     assert records
     assert all(record.persisted for record in records if record.quality_status != "MISSING")
+
+
+def test_selected_stock_service_loads_server_account_and_rejects_manual_conflict(session):
+    account = Account(
+        name="selected-stock-server-account",
+        total_assets=Decimal("100000"),
+        cash=Decimal("70000"),
+        available_cash=Decimal("60000"),
+    )
+    session.add(account)
+    session.flush()
+    session.add(
+        Holding(
+            account_id=account.id,
+            symbol="300308",
+            name="fixture",
+            quantity=100,
+            cost_price=Decimal("10"),
+            current_price=Decimal("12"),
+            price_source="fixture",
+        )
+    )
+    session.commit()
+    providers = ProviderRegistry()
+    providers.register(_FixtureProvider())
+    service = SelectedStockAnalysisService(
+        session,
+        router=DataHubRouter(
+            session,
+            providers,
+            calendar=get_trading_calendar(),
+            now_fn=lambda: NOW,
+        ),
+        calendar=get_trading_calendar(),
+        now_fn=lambda: NOW,
+    )
+
+    loaded = service.analyze(
+        SelectedStockAnalysisRequest(
+            stock_code="300308",
+            analysis_date=END,
+            account_id=account.id,
+        )
+    )
+    assert loaded.account_context.source == "SERVER_ACCOUNT"
+    assert loaded.account_context.trust_status == "SERVER_LOADED"
+    assert loaded.account_context.current_position_quantity == 100
+    assert loaded.account_context.available_cash == Decimal("60000.0000")
+
+    conflict = service.analyze(
+        SelectedStockAnalysisRequest(
+            stock_code="300308",
+            analysis_date=END,
+            account_id=account.id,
+            account_size=Decimal("200000"),
+        )
+    )
+    assert conflict.account_context.trust_status == "ACCOUNT_INPUT_CONFLICT"
+    assert "account_size" in conflict.account_context.conflict_fields
+    assert "ACCOUNT_INPUT_CONFLICT" in conflict.execution_blockers
+    assert conflict.position_plan.quantity is None
 
 
 def test_analysis_result_is_immutable(session):
@@ -351,3 +420,140 @@ def test_all_stock_roles_require_structured_evidence(evidence, relative, expecte
     }
     assert classify_stock_role(indicators, industry_status=ContextStatus.AVAILABLE) == expected
     assert classify_stock_role(indicators, industry_status=ContextStatus.INDUSTRY_CONTEXT_UNAVAILABLE) == StockRole.UNKNOWN
+
+
+def _risk_result(
+    request: SelectedStockAnalysisRequest,
+    *,
+    account_context: AccountContext | None = None,
+    parameters: dict | None = None,
+):
+    indicators = calculate_indicators(
+        _indicator_rows(),
+        benchmark_rows=_indicator_rows(offset=Decimal("100")),
+    )
+    return CycleStructureValidationStrategyV2().build_plan(
+        request=request,
+        generated_at=NOW,
+        analysis_date=END,
+        data_status=DataStatus.FRESH,
+        market_status=ContextStatus.AVAILABLE,
+        industry_status=ContextStatus.AVAILABLE,
+        industry_name="fixture-industry",
+        stock_row_count=280,
+        indicators=indicators,
+        quality_bindings=(),
+        source_lineage=(),
+        snapshot_hash="e" * 64,
+        product_v1_status="FORMAL_EXECUTION_REMAINS_PRODUCT_V1",
+        market_price_observed_at=get_trading_calendar().session_close_at(END),
+        account_context=account_context,
+        parameters=parameters,
+    )
+
+
+def _gate_for(result, code: str):
+    return next(item for item in result.hard_gates if item.code == code)
+
+
+def test_missing_daily_loss_is_not_evaluated_and_cannot_add_score_or_quantity():
+    result = _risk_result(
+        SelectedStockAnalysisRequest(stock_code="300308", account_size=Decimal("100000"))
+    )
+    gate = _gate_for(result, "DAILY_LOSS_LIMIT_REACHED")
+    assert gate.status == GateStatus.NOT_EVALUATED
+    assert gate.reason_code == "DAILY_LOSS_CONTEXT_UNAVAILABLE"
+    assert result.scores.risk_invalidation.score == 0
+    assert result.position_plan.quantity is None
+
+
+def test_daily_loss_limit_is_a_real_blocking_calculation():
+    result = _risk_result(
+        SelectedStockAnalysisRequest(
+            stock_code="300308",
+            account_size=Decimal("100000"),
+            daily_realized_pnl=Decimal("-2500"),
+            daily_unrealized_pnl=Decimal("0"),
+            daily_pnl_observed_at=NOW,
+            daily_pnl_source="USER_ACCOUNT_OBSERVATION",
+        )
+    )
+    gate = _gate_for(result, "DAILY_LOSS_LIMIT_REACHED")
+    assert gate.status == GateStatus.BLOCKED
+    assert result.account_context.daily_loss_pct == Decimal("2.500000")
+    assert result.position_plan.quantity is None
+
+
+def test_t1_and_new_position_allocation_limits_are_calculated():
+    result = _risk_result(
+        SelectedStockAnalysisRequest(stock_code="300308", account_size=Decimal("100000")),
+        parameters={"max_new_position_pct": 5},
+    )
+    gate = _gate_for(result, "T1_NEW_POSITION_RISK_EXCEEDED")
+    assert gate.status == GateStatus.BLOCKED
+    assert "proposed_pct=10.0000" in gate.evidence
+
+
+def test_post_trade_max_position_and_losing_add_are_blocked():
+    result = _risk_result(
+        SelectedStockAnalysisRequest(
+            stock_code="300308",
+            account_size=Decimal("100000"),
+            current_position_quantity=100,
+            current_position_pct=Decimal("25"),
+            average_cost=Decimal("100"),
+        )
+    )
+    assert _gate_for(result, "MAX_POSITION_EXCEEDED").status == GateStatus.BLOCKED
+    assert _gate_for(result, "LOSS_POSITION_ADD_BLOCKED").status == GateStatus.BLOCKED
+    assert result.holding_plan is not None
+    assert result.holding_plan.allow_add is False
+
+
+def test_single_stock_loss_limit_is_bound_to_account_equity():
+    result = _risk_result(
+        SelectedStockAnalysisRequest(stock_code="300308", account_size=Decimal("100000")),
+        parameters={"single_stock_loss_limit_pct": 0},
+    )
+    assert _gate_for(result, "SINGLE_STOCK_LOSS_LIMIT").status == GateStatus.BLOCKED
+
+
+@pytest.mark.parametrize(
+    ("observed_at", "expected"),
+    [
+        (NOW + timedelta(seconds=1), UserPriceStatus.USER_PRICE_FUTURE),
+        (NOW - timedelta(hours=1), UserPriceStatus.USER_PRICE_STALE),
+        (
+            datetime(2026, 7, 30, 14, 0, tzinfo=SHANGHAI),
+            UserPriceStatus.USER_PRICE_DATE_MISMATCH,
+        ),
+    ],
+)
+def test_untrusted_user_price_never_generates_quantity(observed_at, expected):
+    result = _risk_result(
+        SelectedStockAnalysisRequest(
+            stock_code="300308",
+            current_price=Decimal("12.79"),
+            current_price_observed_at=observed_at,
+            account_size=Decimal("100000"),
+        )
+    )
+    assert result.price_observation.trust_status == expected
+    assert result.price_observation.executable_for_position is False
+    assert result.position_plan.quantity is None
+
+
+def test_position_quantity_and_percentage_conflict_blocks_add_calculation():
+    result = _risk_result(
+        SelectedStockAnalysisRequest(
+            stock_code="300308",
+            account_size=Decimal("100000"),
+            current_position_quantity=100,
+            current_position_pct=Decimal("50"),
+            average_cost=Decimal("10"),
+        )
+    )
+    assert "POSITION_INPUT_CONFLICT" in result.execution_blockers
+    assert result.position_plan.quantity is None
+    assert result.holding_plan is not None
+    assert result.holding_plan.allow_add is False

@@ -207,6 +207,19 @@ def calculate_indicators(
         or [max(swing_high, high60)]
     )
     returns = {window: _compound_return(closes, window) for window in (5, 10, 20, 60)}
+    negative_gaps = sorted(
+        max(
+            ZERO,
+            ONE - _d(stock_rows[index]["open"]) / _d(stock_rows[index - 1]["close"]),
+        )
+        for index in range(max(1, len(stock_rows) - 120), len(stock_rows))
+        if _d(stock_rows[index - 1]["close"]) > 0
+    )
+    gap_95 = (
+        negative_gaps[min(len(negative_gaps) - 1, int(len(negative_gaps) * 0.95))]
+        if negative_gaps
+        else None
+    )
     result = {
         "latest_close": latest,
         "sma": {str(key): _q(value) for key, value in moving.items()},
@@ -280,6 +293,13 @@ def calculate_indicators(
             and abs(_d(stock_rows[-1]["open"]) / _d(stock_rows[-2]["close"]) - ONE)
             >= Decimal("0.05")
         ),
+        "overnight_gap": {
+            "negative_gap_95": _q(gap_95),
+            "recent_max_negative_gap": _q(max(negative_gaps))
+            if negative_gaps
+            else None,
+            "sample_count": len(negative_gaps),
+        },
         "large_bearish_streak": bool(
             len(stock_rows) >= 2
             and all(
