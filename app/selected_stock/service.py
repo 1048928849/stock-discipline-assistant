@@ -51,6 +51,7 @@ from app.selected_stock.contracts import (
     SourceLineage,
 )
 from app.selected_stock.indicators import calculate_indicators
+from app.selected_stock.industry import SelectedStockIndustryContextProvider
 from app.selected_stock.strategy import CycleStructureValidationStrategyV2
 from app.services.market_cache import mapping_series_bars, replace_market_series
 from app.services.research_cache import persist_company_profile
@@ -160,6 +161,7 @@ class SelectedStockAnalysisService:
         router: DataHubRouter | None = None,
         calendar: TradingCalendar | None = None,
         now_fn: Callable[[], datetime] | None = None,
+        industry_context_provider: SelectedStockIndustryContextProvider | None = None,
     ) -> None:
         self.db = db
         self.calendar = calendar or get_trading_calendar()
@@ -169,6 +171,10 @@ class SelectedStockAnalysisService:
             db,
             calendar=self.calendar,
             now_fn=self.now_fn,
+        )
+        self.industry_context_provider = (
+            industry_context_provider
+            or SelectedStockIndustryContextProvider(db, calendar=self.calendar)
         )
 
     def _now(self) -> datetime:
@@ -546,6 +552,13 @@ class SelectedStockAnalysisService:
                 _rows(benchmark.bars, through=analysis_date) if benchmark else []
             )
             industry_rows = _rows(industry.bars, through=analysis_date) if industry else None
+            industry_context = self.industry_context_provider.resolve(
+                symbol=request.stock_code,
+                industry_name=industry_name,
+                analysis_date=analysis_date,
+                industry_rows=industry_rows,
+                profile_lineage=profile_lineage,
+            )
             indicators = calculate_indicators(
                 stock_rows,
                 benchmark_rows=benchmark_rows,
@@ -585,6 +598,7 @@ class SelectedStockAnalysisService:
                     "account_context": account_context.model_dump(mode="json")
                     if account_context is not None
                     else None,
+                    "industry_context": industry_context.model_dump(mode="json"),
                 }
             )
             existing = self.db.scalar(
@@ -630,11 +644,7 @@ class SelectedStockAnalysisService:
                 analysis_date=analysis_date,
                 data_status=self._data_status(stock, benchmark, analysis_date),
                 market_status=market_status,
-                industry_status=(
-                    ContextStatus.AVAILABLE
-                    if industry is not None
-                    else ContextStatus.INDUSTRY_CONTEXT_UNAVAILABLE
-                ),
+                industry_status=industry_context.status,
                 industry_name=industry_name,
                 stock_row_count=len(stock_rows),
                 indicators=indicators,
@@ -644,6 +654,7 @@ class SelectedStockAnalysisService:
                 product_v1_status=product_v1_status,
                 market_price_observed_at=market_price_observed_at,
                 account_context=account_context,
+                industry_context=industry_context,
             )
             stored_result = result.model_dump(mode="json")
             run = SelectedStockAnalysisRun(

@@ -249,6 +249,52 @@ class AccountContext(ContractModel):
         return value
 
 
+class IndustryMapping(ContractModel):
+    symbol: str = Field(pattern=r"^\d{6}$")
+    industry_id: str
+    industry_name: str
+    classification_system: str
+    effective_date: date
+    provider: str
+    source_reference: str
+    fetched_at: datetime
+    response_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class StockRoleEvidence(ContractModel):
+    member_count: int = Field(ge=0)
+    valid_member_count: int = Field(ge=0)
+    coverage_ratio: Decimal = Field(ge=0, le=1)
+    return_rank_20: int | None = Field(default=None, ge=1)
+    return_rank_60: int | None = Field(default=None, ge=1)
+    amount_rank: int | None = Field(default=None, ge=1)
+    amount_percentile: Decimal | None = Field(default=None, ge=0, le=1)
+    industry_weight: Decimal | None = Field(default=None, ge=0)
+    up_day_elasticity: Decimal | None = None
+    down_day_resilience: Decimal | None = None
+    excess_return_20: Decimal | None = None
+    excess_return_60: Decimal | None = None
+    max_drawdown_rank_60: int | None = Field(default=None, ge=1)
+    liquidity: Decimal | None = Field(default=None, ge=0)
+    consecutive_leading_days: int = Field(default=0, ge=0)
+    evidence_complete: bool
+    reason_code: str
+
+
+class IndustryContextEvidence(ContractModel):
+    status: ContextStatus
+    mapping: IndustryMapping | None = None
+    history_row_count: int = Field(ge=0)
+    constituent_count: int = Field(ge=0)
+    valid_member_count: int = Field(ge=0)
+    coverage_ratio: Decimal = Field(ge=0, le=1)
+    quality_status: str
+    role: StockRole
+    role_evidence: StockRoleEvidence
+    reason_codes: tuple[str, ...]
+    quality_record_ids: tuple[int, ...] = ()
+
+
 class ScoreComponent(ContractModel):
     score: Decimal = Field(ge=0)
     maximum: Decimal = Field(gt=0)
@@ -369,6 +415,7 @@ class SelectedStockAnalysisResult(ContractModel):
     market_context_status: ContextStatus
     industry_context_status: ContextStatus
     industry_name: str | None
+    industry_context: IndustryContextEvidence
     benchmark_symbol: Literal["CSI000300"] = "CSI000300"
     cycle_state: CycleState
     stock_role: StockRole
@@ -437,6 +484,8 @@ __all__ = [
     "GateStatus",
     "GateResult",
     "HoldingPlan",
+    "IndustryContextEvidence",
+    "IndustryMapping",
     "PlanStatus",
     "PriceObservation",
     "PositionPlan",
@@ -448,6 +497,7 @@ __all__ = [
     "SelectedStockAnalysisRequest",
     "SelectedStockAnalysisResult",
     "SourceLineage",
+    "StockRoleEvidence",
     "StockRole",
     "StrategyComparison",
     "StrategyMode",

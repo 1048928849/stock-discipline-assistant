@@ -14,6 +14,7 @@ from app.selected_stock.contracts import (
     GateResult,
     GateStatus,
     HoldingPlan,
+    IndustryContextEvidence,
     PlanStatus,
     PositionPlan,
     PriceObservation,
@@ -24,6 +25,7 @@ from app.selected_stock.contracts import (
     SelectedStockAnalysisResult,
     SourceLineage,
     StockRole,
+    StockRoleEvidence,
     StrategyComparison,
     TradeMode,
     UserPriceStatus,
@@ -223,6 +225,36 @@ def _score(
         missing_evidence=missing,
         score_ceiling=cap,
         confidence=confidence,
+    )
+
+
+def _fallback_industry_context(
+    industry_status: ContextStatus,
+    industry_name: str | None,
+    stock_row_count: int,
+) -> IndustryContextEvidence:
+    reason = (
+        "LEGACY_INDUSTRY_CONTEXT_AVAILABLE"
+        if industry_status == ContextStatus.AVAILABLE
+        else "INDUSTRY_CONTEXT_UNAVAILABLE"
+    )
+    role_evidence = StockRoleEvidence(
+        member_count=0,
+        valid_member_count=0,
+        coverage_ratio=ZERO,
+        evidence_complete=False,
+        reason_code="ROLE_EVIDENCE_INSUFFICIENT",
+    )
+    return IndustryContextEvidence(
+        status=industry_status,
+        history_row_count=stock_row_count if industry_name else 0,
+        constituent_count=0,
+        valid_member_count=0,
+        coverage_ratio=ZERO,
+        quality_status="MISSING",
+        role=StockRole.UNKNOWN,
+        role_evidence=role_evidence,
+        reason_codes=(reason,),
     )
 
 
@@ -431,6 +463,7 @@ class CycleStructureValidationStrategyV2(TradingStrategy):
         product_v1_status: str,
         market_price_observed_at,
         account_context: AccountContext | None = None,
+        industry_context: IndustryContextEvidence | None = None,
         parameters: dict[str, Any] | None = None,
     ) -> SelectedStockAnalysisResult:
         params = self.validate_parameters(parameters or {})
@@ -476,7 +509,20 @@ class CycleStructureValidationStrategyV2(TradingStrategy):
             market_status=market_status,
             industry_status=industry_status,
         )
-        role = classify_stock_role(indicators, industry_status=industry_status)
+        effective_industry_context = industry_context or _fallback_industry_context(
+            industry_status,
+            industry_name,
+            stock_row_count,
+        )
+        if industry_context is not None:
+            indicators["role_evidence"] = industry_context.role_evidence.model_dump(
+                mode="python"
+            )
+        role = (
+            industry_context.role
+            if industry_context is not None
+            else classify_stock_role(indicators, industry_status=industry_status)
+        )
 
         account_size = account.account_size
         current_quantity = int(account.current_position_quantity or 0)
@@ -1136,6 +1182,7 @@ class CycleStructureValidationStrategyV2(TradingStrategy):
             "market_context_status": market_status,
             "industry_context_status": industry_status,
             "industry_name": industry_name,
+            "industry_context": effective_industry_context,
             "cycle_state": cycle,
             "stock_role": role,
             "trade_mode": trade_mode,
