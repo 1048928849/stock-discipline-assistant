@@ -78,6 +78,14 @@ class GateStatus(str, Enum):
     NOT_EVALUATED = "NOT_EVALUATED"
 
 
+class SurvivalRuleStatus(str, Enum):
+    PASS = "PASS"
+    WARN = "WARN"
+    BLOCK = "BLOCK"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+
+
 class UserPriceStatus(str, Enum):
     MARKET_QUOTE_TRUSTED = "MARKET_QUOTE_TRUSTED"
     USER_PRICE_NOT_PROVIDED = "USER_PRICE_NOT_PROVIDED"
@@ -186,6 +194,21 @@ class GateResult(ContractModel):
     effect_on_score: str
     effect_on_position: str
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_gate(cls, value):
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+        passed = result.pop("passed", None)
+        if "status" not in result and passed is not None:
+            result["status"] = "PASS" if passed else "BLOCKED"
+        status = result.get("status")
+        result.setdefault("effect_on_plan", "ALLOW" if status == "PASS" else "BLOCK_NEW_ACTION")
+        result.setdefault("effect_on_score", "ELIGIBLE" if status == "PASS" else "NO_POSITIVE_SCORE")
+        result.setdefault("effect_on_position", "ELIGIBLE" if status == "PASS" else "ZERO_NEW_POSITION")
+        return result
+
 
 class PriceObservation(ContractModel):
     price: Decimal = Field(gt=0)
@@ -293,6 +316,18 @@ class IndustryContextEvidence(ContractModel):
     role_evidence: StockRoleEvidence
     reason_codes: tuple[str, ...]
     quality_record_ids: tuple[int, ...] = ()
+
+
+class SurvivalRuleResult(ContractModel):
+    rule_code: str
+    rule_name: str
+    status: SurvivalRuleStatus
+    severity: Literal["INFO", "WARNING", "CRITICAL"]
+    evidence: dict[str, Any]
+    action: str
+    applicable: bool
+    reason_code: str
+    rule_version: Literal["survival_discipline_v1"] = "survival_discipline_v1"
 
 
 class ScoreComponent(ContractModel):
@@ -437,12 +472,92 @@ class SelectedStockAnalysisResult(ContractModel):
     execution_blockers: tuple[str, ...]
     price_observation: PriceObservation
     account_context: AccountContext
+    survival_discipline: tuple[SurvivalRuleResult, ...]
     quality_bindings: tuple[QualityBinding, ...]
     source_lineage: tuple[SourceLineage, ...]
     product_v1_comparison: StrategyComparison
     explanation: dict[str, Any]
     snapshot_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     result_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_snapshot(cls, value):
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+        generated_at = result.get("generated_at")
+        technical = result.get("technical_evidence") or {}
+        latest = technical.get("latest_close") or "0.01"
+        result.setdefault(
+            "price_observation",
+            {
+                "price": latest,
+                "observed_at": generated_at,
+                "source": "MARKET_DAILY_CLOSE",
+                "trust_status": "LATEST_CLOSE_ONLY",
+                "matched_analysis_date": False,
+                "executable_for_entry": False,
+                "executable_for_position": False,
+                "reason_code": "LEGACY_PRICE_CONTEXT_NOT_EVALUATED",
+                "market_close": latest,
+                "market_close_observed_at": generated_at,
+            },
+        )
+        result.setdefault(
+            "account_context",
+            {
+                "source": "NO_ACCOUNT_CONTEXT",
+                "trust_status": "UNAVAILABLE",
+                "confidence": 0,
+            },
+        )
+        legacy_role = result.get("stock_role", "UNKNOWN")
+        result.setdefault(
+            "industry_context",
+            {
+                "status": "INDUSTRY_CONTEXT_UNAVAILABLE",
+                "history_row_count": 0,
+                "constituent_count": 0,
+                "valid_member_count": 0,
+                "coverage_ratio": 0,
+                "quality_status": "MISSING",
+                "role": "UNKNOWN",
+                "role_evidence": {
+                    "member_count": 0,
+                    "valid_member_count": 0,
+                    "coverage_ratio": 0,
+                    "evidence_complete": False,
+                    "reason_code": "LEGACY_ROLE_EVIDENCE_NOT_EVALUATED",
+                },
+                "reason_codes": [
+                    "LEGACY_INDUSTRY_CONTEXT_NOT_EVALUATED",
+                    f"legacy_role={legacy_role}",
+                ],
+            },
+        )
+        if "survival_discipline" not in result:
+            result["survival_discipline"] = [
+                {
+                    "rule_code": code,
+                    "rule_name": name,
+                    "status": "INSUFFICIENT_DATA",
+                    "severity": "WARNING",
+                    "evidence": {},
+                    "action": "Re-run analysis with the current contract.",
+                    "applicable": True,
+                    "reason_code": "LEGACY_RULE_NOT_EVALUATED",
+                }
+                for code, name in (
+                    ("TREND_POSITION_COORDINATION", "Trend and position coordination"),
+                    ("CHASE_RISK", "Chasing risk"),
+                    ("HIGH_VOLUME_STALL", "High-level volume stall"),
+                    ("VOLUME_DECLINE_BREAKDOWN", "Volume decline and structure breakdown"),
+                    ("INDUSTRY_ROLE_RISK", "Mainline and stock role risk"),
+                    ("HARD_STOP_PRIORITY", "Hard stop priority"),
+                )
+            ]
+        return result
 
     @field_validator("generated_at")
     @classmethod
@@ -501,6 +616,8 @@ __all__ = [
     "StockRole",
     "StrategyComparison",
     "StrategyMode",
+    "SurvivalRuleResult",
+    "SurvivalRuleStatus",
     "TradeMode",
     "UserPriceStatus",
 ]

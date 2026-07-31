@@ -27,12 +27,14 @@ from app.selected_stock.contracts import (
     StockRole,
     StockRoleEvidence,
     StrategyComparison,
+    SurvivalRuleStatus,
     TradeMode,
     UserPriceStatus,
 )
 from app.strategies.base import StrategySnapshot, TradingStrategy
 from app.strategies.contracts import StrategyManifest, StrategySignal
 from app.strategies.hashing import implementation_hash, parameter_hash
+from app.selected_stock.survival import evaluate_survival_discipline
 
 
 ZERO = Decimal("0")
@@ -936,9 +938,25 @@ class CycleStructureValidationStrategyV2(TradingStrategy):
             )
         gates = tuple(gates)
         gate_by_code = {item.code: item for item in gates}
+        survival_discipline = evaluate_survival_discipline(
+            indicators=indicators,
+            current_price=current,
+            entry_high=entry_high,
+            hard_stop=stop,
+            proposed_position_pct=proposed_trade_pct,
+            has_position=has_position,
+            market_status=market_status,
+            industry_status=industry_status,
+            stock_role=role,
+        )
+        survival_blockers = tuple(
+            item.reason_code
+            for item in survival_discipline
+            if item.status == SurvivalRuleStatus.BLOCK
+        )
         planning_gate_blockers = tuple(
             item.reason_code for item in gates if item.status != GateStatus.PASS
-        )
+        ) + survival_blockers
         context_blockers = []
         if not price_observation.executable_for_position and request.current_price is not None:
             context_blockers.append(price_observation.reason_code)
@@ -1053,7 +1071,14 @@ class CycleStructureValidationStrategyV2(TradingStrategy):
         if industry_status != ContextStatus.AVAILABLE:
             pending.append("INDUSTRY_CONTEXT_UNAVAILABLE")
 
-        if data_status in {DataStatus.INSUFFICIENT_DATA, DataStatus.STALE, DataStatus.CONFLICTED_DATA}:
+        hard_stop_triggered = any(
+            item.reason_code == "HARD_STOP_TRIGGERED"
+            and item.status == SurvivalRuleStatus.BLOCK
+            for item in survival_discipline
+        )
+        if hard_stop_triggered:
+            plan_status = PlanStatus.EXIT if has_position else PlanStatus.NO_TRADE
+        elif data_status in {DataStatus.INSUFFICIENT_DATA, DataStatus.STALE, DataStatus.CONFLICTED_DATA}:
             plan_status = PlanStatus.INSUFFICIENT_DATA
         elif cycle == CycleState.DECLINE or gate_by_code[
             "NO_CLEAR_INVALIDATION"
@@ -1268,6 +1293,7 @@ class CycleStructureValidationStrategyV2(TradingStrategy):
             ),
             "price_observation": price_observation,
             "account_context": account,
+            "survival_discipline": survival_discipline,
             "quality_bindings": quality_bindings,
             "source_lineage": audit_lineage,
             "product_v1_comparison": StrategyComparison(

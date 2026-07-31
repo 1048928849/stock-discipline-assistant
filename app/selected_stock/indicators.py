@@ -173,6 +173,7 @@ def calculate_indicators(
     _validate_rows(benchmark_rows)
     if industry_rows:
         _validate_rows(industry_rows)
+    opens = [_d(row["open"]) for row in stock_rows]
     closes = [_d(row["close"]) for row in stock_rows]
     highs = [_d(row["high"]) for row in stock_rows]
     lows = [_d(row["low"]) for row in stock_rows]
@@ -222,6 +223,29 @@ def calculate_indicators(
     )
     result = {
         "latest_close": latest,
+        "latest_candle": {
+            "open": _q(opens[-1]),
+            "high": _q(highs[-1]),
+            "low": _q(lows[-1]),
+            "close": _q(closes[-1]),
+            "body_pct": _q(abs(closes[-1] - opens[-1]) / opens[-1])
+            if opens[-1]
+            else None,
+            "upper_wick_pct": _q(
+                (highs[-1] - max(opens[-1], closes[-1])) / opens[-1]
+            )
+            if opens[-1]
+            else None,
+            "close_position": _q(
+                (closes[-1] - lows[-1]) / (highs[-1] - lows[-1])
+            )
+            if highs[-1] > lows[-1]
+            else None,
+            "price_percentile_250": _q(
+                Decimal(sum(value <= latest for value in closes[-250:]))
+                / Decimal(len(closes[-250:]))
+            ),
+        },
         "sma": {str(key): _q(value) for key, value in moving.items()},
         "slope": {str(key): _q(value) for key, value in slopes.items()},
         "bullish_alignment": bool(

@@ -10,9 +10,13 @@ from app.selected_stock.contracts import (
     ContextStatus,
     DataStatus,
     SelectedStockAnalysisRequest,
+    SelectedStockAnalysisResult,
 )
 from app.selected_stock.indicators import calculate_indicators
 from app.selected_stock.strategy import CycleStructureValidationStrategyV2
+from app.data_hub.trading_calendar import to_utc_storage_naive
+from app.domain.hashing import canonical_hash
+from app.models import SelectedStockAnalysisRun
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -81,6 +85,33 @@ def test_selected_stock_api_success_without_llm(client, monkeypatch):
     assert body["product_v1_comparison"]["formal_execution_owner"] == "PRODUCT_V1"
 
 
+def test_legacy_immutable_snapshot_is_read_as_non_executable_not_rewritten():
+    current = _result(SelectedStockAnalysisRequest(stock_code="300308"))
+    legacy = current.model_dump(mode="json")
+    legacy.pop("price_observation")
+    legacy.pop("account_context")
+    legacy.pop("industry_context")
+    legacy.pop("survival_discipline")
+    for gate in legacy["hard_gates"]:
+        gate["passed"] = gate.pop("status") == "PASS"
+        for field in (
+            "required_inputs",
+            "evaluated_inputs",
+            "threshold",
+            "actual_value",
+            "missing_inputs",
+            "effect_on_plan",
+            "effect_on_score",
+            "effect_on_position",
+        ):
+            gate.pop(field, None)
+    restored = SelectedStockAnalysisResult.model_validate(legacy)
+    assert restored.price_observation.executable_for_position is False
+    assert restored.account_context.trust_status == "UNAVAILABLE"
+    assert restored.industry_context.role.value == "UNKNOWN"
+    assert all(item.status.value == "INSUFFICIENT_DATA" for item in restored.survival_discipline)
+
+
 def test_selected_stock_api_rejects_partial_user_price(client):
     response = client.post(
         "/api/v1/selected-stock-analysis",
@@ -88,6 +119,54 @@ def test_selected_stock_api_rejects_partial_user_price(client):
     )
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_selected_stock_history_list_detail_and_structured_compare(client, session):
+    before = _result(SelectedStockAnalysisRequest(stock_code="300308"))
+    after = _result(
+        SelectedStockAnalysisRequest(
+            stock_code="300308",
+            account_size=Decimal("100000"),
+        )
+    )
+    rows = []
+    for index, result in enumerate((before, after), start=1):
+        snapshot = result.model_dump(mode="json")
+        row = SelectedStockAnalysisRun(
+            symbol="300308",
+            analysis_date=result.analysis_date,
+            strategy_id=result.strategy_id,
+            strategy_version=result.strategy_version,
+            strategy_mode=result.strategy_mode.value,
+            status=result.plan_status.value,
+            request_hash=canonical_hash({"index": index}),
+            snapshot_hash=result.snapshot_hash,
+            result_digest=result.result_digest,
+            analysis_identity_hash=canonical_hash({"identity": index}),
+            request_snapshot={"stock_code": "300308", "index": index},
+            result_snapshot=snapshot,
+            quality_bindings=[],
+            source_lineage=[],
+            generated_at=to_utc_storage_naive(NOW),
+            created_at=to_utc_storage_naive(NOW),
+        )
+        session.add(row)
+        rows.append(row)
+    session.commit()
+
+    listing = client.get("/api/v1/selected-stock-analysis/runs?symbol=300308")
+    assert listing.status_code == 200
+    assert len(listing.json()) == 2
+    detail = client.get(f"/api/v1/selected-stock-analysis/runs/{rows[0].id}")
+    assert detail.status_code == 200
+    comparison = client.get(
+        f"/api/v1/selected-stock-analysis/runs/{rows[0].id}/compare/{rows[1].id}"
+    )
+    assert comparison.status_code == 200
+    body = comparison.json()
+    assert isinstance(body["changes"], dict)
+    assert "position" in body["changes"]
+    assert body["before"]["gates"]
 
 
 def test_selected_stock_page_contains_required_states_and_fields(client):
