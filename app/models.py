@@ -1013,6 +1013,40 @@ class PlanAnalysisRun(TimestampMixin, Base):
     error: Mapped[str | None] = mapped_column(Text)
 
 
+class SelectedStockAnalysisRun(Base):
+    """Immutable CSV_V2 advisory snapshot for one selected stock."""
+
+    __tablename__ = "selected_stock_analysis_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "analysis_identity_hash",
+            name="uq_selected_stock_analysis_identity",
+        ),
+        Index(
+            "ix_selected_stock_symbol_date",
+            "symbol",
+            "analysis_date",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(12), nullable=False)
+    analysis_date: Mapped[date] = mapped_column(Date, nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    strategy_version: Mapped[str] = mapped_column(String(30), nullable=False)
+    strategy_mode: Mapped[str] = mapped_column(String(30), nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    result_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    analysis_identity_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    result_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    quality_bindings: Mapped[list] = mapped_column(JSON, nullable=False)
+    source_lineage: Mapped[list] = mapped_column(JSON, nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME, nullable=False)
+
+
 class WatchlistItem(TimestampMixin, Base):
     __tablename__ = "watchlist_items"
     __table_args__ = (

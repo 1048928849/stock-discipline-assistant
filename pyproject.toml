@@ -48,6 +48,7 @@ markers = [
   "freestockdb_integration: requires a real local free-stockdb HTTP service",
   "baostock_integration: requires the real BaoStock remote service",
   "market_breadth_integration: requires local FreeStockDB and real AKShare network",
+  "selected_stock_integration: requires real public stock, BaoStock, and AKShare network",
 ]
 
 [tool.ruff]

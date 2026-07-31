@@ -65,6 +65,7 @@ def test_initial_schema_contains_required_tables(session):
         "discovery_candidates",
         "historical_data_bootstrap_runs",
         "historical_data_bootstrap_items",
+        "selected_stock_analysis_runs",
     }
     assert required == set(inspect(session.bind).get_table_names())
 

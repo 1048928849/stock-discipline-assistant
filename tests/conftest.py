@@ -41,6 +41,13 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(
                 pytest.mark.skip(reason="real market breadth sources are opt-in")
             )
+        if (
+            "selected_stock_integration" in item.keywords
+            and os.environ.get("RUN_SELECTED_STOCK_INTEGRATION") != "1"
+        ):
+            item.add_marker(
+                pytest.mark.skip(reason="real selected-stock sources are opt-in")
+            )
 
 
 @pytest.fixture(autouse=True)
