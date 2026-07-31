@@ -138,6 +138,14 @@ def _lineage(series: _SeriesData) -> SourceLineage:
     )
 
 
+def _industry_identity_payload(context) -> dict[str, Any]:
+    payload = context.model_dump(mode="json")
+    mapping = payload.get("mapping")
+    if mapping is not None:
+        mapping.pop("fetched_at", None)
+    return payload
+
+
 def _rows(bars: tuple[MarketDailyBar, ...], *, through: date) -> list[dict[str, Any]]:
     return [
         {
@@ -598,7 +606,7 @@ class SelectedStockAnalysisService:
                     "account_context": account_context.model_dump(mode="json")
                     if account_context is not None
                     else None,
-                    "industry_context": industry_context.model_dump(mode="json"),
+                    "industry_context": _industry_identity_payload(industry_context),
                 }
             )
             existing = self.db.scalar(

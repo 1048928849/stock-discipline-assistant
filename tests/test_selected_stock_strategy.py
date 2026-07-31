@@ -19,13 +19,19 @@ from app.selected_stock.contracts import (
     ContextStatus,
     DataStatus,
     GateStatus,
+    IndustryContextEvidence,
+    IndustryMapping,
     SelectedStockAnalysisRequest,
+    StockRoleEvidence,
     StrategyMode,
     UserPriceStatus,
 )
 from app.selected_stock.indicators import calculate_indicators
 from app.selected_stock.replay import replay_selected_stock
-from app.selected_stock.service import SelectedStockAnalysisService
+from app.selected_stock.service import (
+    SelectedStockAnalysisService,
+    _industry_identity_payload,
+)
 from app.selected_stock.strategy import (
     DEFAULT_PARAMETERS,
     CycleStructureValidationStrategyV2,
@@ -272,6 +278,47 @@ def test_selected_stock_service_persists_exact_lineage_and_is_idempotent(session
     records = session.scalars(select(DataQualityRecord)).all()
     assert records
     assert all(record.persisted for record in records if record.quality_status != "MISSING")
+
+
+def test_industry_identity_ignores_fetch_time_but_binds_business_evidence():
+    def context(fetched_at, response_digest="a" * 64):
+        return IndustryContextEvidence(
+            status=ContextStatus.INDUSTRY_CONTEXT_UNAVAILABLE,
+            mapping=IndustryMapping(
+                symbol="300308",
+                industry_id="industry:fixture",
+                industry_name="fixture",
+                classification_system="PROVIDER_INDUSTRY_CLASSIFICATION",
+                effective_date=END,
+                provider="fixture-profile",
+                source_reference="fundamental.profile",
+                fetched_at=fetched_at,
+                response_digest=response_digest,
+            ),
+            history_row_count=0,
+            constituent_count=0,
+            valid_member_count=0,
+            coverage_ratio=Decimal("0"),
+            quality_status="MISSING",
+            role=StockRole.UNKNOWN,
+            role_evidence=StockRoleEvidence(
+                member_count=0,
+                valid_member_count=0,
+                coverage_ratio=Decimal("0"),
+                evidence_complete=False,
+                reason_code="ROLE_EVIDENCE_INSUFFICIENT",
+            ),
+            reason_codes=("INDUSTRY_HISTORY_INSUFFICIENT_OR_MISALIGNED",),
+        )
+
+    first = _industry_identity_payload(context(NOW))
+    second = _industry_identity_payload(context(NOW + timedelta(seconds=1)))
+    changed = _industry_identity_payload(
+        context(NOW + timedelta(seconds=1), response_digest="b" * 64)
+    )
+
+    assert first == second
+    assert first != changed
 
 
 def test_selected_stock_service_loads_server_account_and_rejects_manual_conflict(session):
