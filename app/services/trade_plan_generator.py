@@ -15,6 +15,7 @@ from app.services.trade_plan.persistence import (
     save_preview_snapshot,
     save_plan,
 )
+from app.services.transaction import transaction_scope
 
 
 def _floor_lot(value: float | Decimal) -> int:
@@ -22,8 +23,9 @@ def _floor_lot(value: float | Decimal) -> int:
 
 
 def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -> dict:
-    preview = generate_trade_plan(db, request)
-    save_preview_snapshot(db, request.account_id, preview)
+    with transaction_scope(db):
+        preview = generate_trade_plan(db, request)
+        save_preview_snapshot(db, request.account_id, preview)
     return preview
 
 

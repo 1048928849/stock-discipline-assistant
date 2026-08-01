@@ -53,7 +53,7 @@ GATES = (
 )
 
 
-def ensure_default_rule_version(db: Session) -> RuleVersion:
+def ensure_default_rule_version(db: Session, *, commit: bool = True) -> RuleVersion:
     rule_set = db.scalar(select(RuleSet).where(RuleSet.code == "mi_trend_conservative"))
     if rule_set is None:
         rule_set = RuleSet(
@@ -81,8 +81,11 @@ def ensure_default_rule_version(db: Session) -> RuleVersion:
             active=True,
         )
         db.add(version)
-        db.commit()
-        db.refresh(version)
+        if commit:
+            db.commit()
+            db.refresh(version)
+        else:
+            db.flush()
     return version
 
 

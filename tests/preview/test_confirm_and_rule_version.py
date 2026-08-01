@@ -28,6 +28,7 @@ def test_confirm_uses_frozen_snapshot_without_recalculation(client, session, mon
     assert response.status_code == 201, response.text
     plan = session.get(TradePlan, response.json()["id"])
     assert plan.engine_snapshot["_confirmation"]["legacy_recalculate_confirm"] is False
+    assert plan.engine_snapshot["_confirmation"]["confirm_mode"] == "SNAPSHOT_CONFIRM"
 
 
 def test_confirm_without_snapshot_uses_legacy_recalculation(client, session):
@@ -44,6 +45,7 @@ def test_confirm_without_snapshot_uses_legacy_recalculation(client, session):
     assert response.status_code == 201, response.text
     plan = session.get(TradePlan, response.json()["id"])
     assert plan.engine_snapshot["_confirmation"]["legacy_recalculate_confirm"] is True
+    assert plan.engine_snapshot["_confirmation"]["confirm_mode"] == "LEGACY_RECALCULATE"
 
 
 def test_confirm_rejects_snapshot_with_invalid_integrity_hash(client, session):

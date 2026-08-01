@@ -15,7 +15,7 @@ class RuleVersionManager:
         self.db = db
 
     def ensure_active_version(self) -> RuleVersion:
-        current = ensure_default_rule_version(self.db)
+        current = ensure_default_rule_version(self.db, commit=False)
         if all(key in current.parameters for key in GENERATOR_PARAMETERS):
             return current
         current.active = False
@@ -29,8 +29,7 @@ class RuleVersionManager:
             active=True,
         )
         self.db.add(version)
-        self.db.commit()
-        self.db.refresh(version)
+        self.db.flush()
         return version
 
     def create_snapshot_version(self, version: RuleVersion) -> RuleVersionSnapshot:
