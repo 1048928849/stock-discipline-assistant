@@ -36,5 +36,8 @@ def test_initial_schema_contains_required_tables(session):
         "plan_execution_events",
         "plan_execution_fills",
         "preview_snapshots",
+        "strategies",
+        "strategy_versions",
+        "strategy_lifecycle_events",
     }
     assert required == set(inspect(session.bind).get_table_names())

@@ -5,7 +5,7 @@ from decimal import Decimal
 
 from app.domain.preview import PreviewSnapshot
 from app.domain.trade_plan import TradePlanVersion
-from app.models import RuleVersion, TradePlan
+from app.models import RuleVersion, StrategyVersionRecord, TradePlan
 from app.schemas_workflow import TradePlanSaveRequest
 
 
@@ -17,6 +17,7 @@ class TradePlanMapper:
         preview: dict,
         frozen: PreviewSnapshot,
         rule: RuleVersion,
+        strategy_version: StrategyVersionRecord,
         version: TradePlanVersion,
         confirm_mode: str,
     ) -> TradePlan:
@@ -35,6 +36,8 @@ class TradePlanMapper:
         return TradePlan(
             account_id=request.account_id,
             rule_version_id=rule.id,
+            strategy_id=strategy_version.strategy_id,
+            strategy_version_id=strategy_version.id,
             symbol=request.symbol,
             name=preview["company_name"],
             status=preview["status"],

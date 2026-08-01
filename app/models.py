@@ -406,11 +406,58 @@ class RuleVersion(TimestampMixin, Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class StrategyRecord(Base):
+    __tablename__ = "strategies"
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    name: Mapped[str] = mapped_column(String(150))
+    description: Mapped[str] = mapped_column(Text)
+    category: Mapped[str] = mapped_column(String(80), index=True)
+    owner: Mapped[str] = mapped_column(String(100))
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class StrategyVersionRecord(Base):
+    __tablename__ = "strategy_versions"
+    __table_args__ = (
+        UniqueConstraint("strategy_id", "version", name="uq_strategy_version"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_id: Mapped[str] = mapped_column(
+        ForeignKey("strategies.id", ondelete="CASCADE"), index=True
+    )
+    version: Mapped[str] = mapped_column(String(30))
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    rule_snapshot: Mapped[dict] = mapped_column(JSON)
+    parameter_snapshot: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class StrategyLifecycleEventRecord(Base):
+    __tablename__ = "strategy_lifecycle_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_id: Mapped[str] = mapped_column(
+        ForeignKey("strategies.id", ondelete="CASCADE"), index=True
+    )
+    strategy_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("strategy_versions.id", ondelete="SET NULL"), index=True
+    )
+    from_status: Mapped[str | None] = mapped_column(String(20))
+    to_status: Mapped[str] = mapped_column(String(20), index=True)
+    event_type: Mapped[str] = mapped_column(String(50))
+    reason: Mapped[str | None] = mapped_column(Text)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class TradePlan(TimestampMixin, Base):
     __tablename__ = "trade_plans"
     id: Mapped[int] = mapped_column(primary_key=True)
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
     rule_version_id: Mapped[int] = mapped_column(ForeignKey("rule_versions.id"), index=True)
+    strategy_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    strategy_version_id: Mapped[int | None] = mapped_column(Integer, index=True)
     symbol: Mapped[str] = mapped_column(String(12), index=True)
     name: Mapped[str | None] = mapped_column(String(100))
     status: Mapped[str] = mapped_column(String(20), index=True, default="DRAFT")

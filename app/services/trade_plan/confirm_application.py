@@ -12,6 +12,7 @@ from app.services.persistence import (
 )
 from app.services.preview_snapshot import snapshot_payload, verify_hash
 from app.services.rule_version_manager import RuleVersionManager
+from app.services.strategy_management import StrategyManagementService
 from app.services.trade_plan.legacy_confirm import recalculate_legacy_preview
 from app.services.trade_plan.lifecycle import next_version
 from app.services.transaction import transaction_scope
@@ -42,12 +43,14 @@ def confirm_trade_plan(db: Session, request: TradePlanSaveRequest) -> dict:
             raise AppError(422, "PLAN_NOT_SAVABLE", "缺少可靠买入区或硬止损，不能保存正式计划")
 
         rule = RuleVersionManager(db).ensure_active_version()
+        strategy_version = StrategyManagementService(db).ensure_platform_breakout()
         version = next_version(plans.latest(request.account_id, request.symbol))
         plan = TradePlanMapper().to_orm(
             request=request,
             preview=preview,
             frozen=frozen,
             rule=rule,
+            strategy_version=strategy_version,
             version=version,
             confirm_mode=confirm_mode,
         )
