@@ -6,40 +6,88 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.domain.preview.models import PreviewSnapshot, thaw
 from app.domain.trade_plan import TradePlanSnapshot
 from app.errors import AppError
 from app.models import (
+    PreviewSnapshotRecord,
     RuleVersion,
     TradePlan,
     TradePlanAIAnalysis,
     TradePlanCheck,
 )
 from app.schemas_workflow import TradePlanPreviewRequest, TradePlanSaveRequest
+from app.services.preview_snapshot import (
+    create_snapshot,
+    load_snapshot,
+    snapshot_payload as preview_snapshot_payload,
+    verify_hash,
+)
+from app.services.rule_version_manager import RuleVersionManager
 from app.services.trade_plan.assembler import assemble_preview
-from app.services.trade_plan.compatibility import GENERATOR_PARAMETERS, GENERATOR_RULES
 from app.services.trade_plan.lifecycle import confirm_preview, next_version, snapshot_payload
-from app.services.workflow import ensure_default_rule_version
 
 
 def ensure_generator_rule_version(db: Session) -> RuleVersion:
-    current = ensure_default_rule_version(db)
-    if all(key in current.parameters for key in GENERATOR_PARAMETERS):
-        return current
-    current.active = False
-    parameters = {**current.parameters, **GENERATOR_PARAMETERS}
-    version = RuleVersion(
-        rule_set_id=current.rule_set_id,
-        version="1.2.0" if "platform_min_days" in current.parameters else "1.1.0",
-        parameters=parameters,
-        rules={**current.rules, **GENERATOR_RULES},
-        change_note="集中一键计划的账户、风险、分批仓位和市场降风险参数；旧计划保持原规则版本。",
-        effective_from=date.today(),
-        active=True,
+    return RuleVersionManager(db).ensure_active_version()
+
+
+def _snapshot_record_payload(record: PreviewSnapshotRecord) -> dict:
+    return {
+        "snapshot_id": record.id,
+        "symbol": record.symbol,
+        "preview_hash": record.preview_hash,
+        "strategy_snapshot": record.strategy_snapshot,
+        "feature_snapshot": record.feature_snapshot,
+        "risk_snapshot": record.risk_snapshot,
+        "decision_snapshot": record.decision_snapshot,
+        "price_snapshot": record.price_snapshot,
+        "rule_version_snapshot": record.rule_version_snapshot,
+        "account_snapshot": record.account_snapshot,
+        "market_snapshot": record.market_snapshot,
+        "preview_payload": record.preview_payload,
+        "created_at": record.created_at,
+        "hash": record.snapshot_hash,
+    }
+
+
+def get_preview_snapshot(
+    db: Session, account_id: int, symbol: str, preview_hash: str
+) -> PreviewSnapshot | None:
+    record = db.scalar(
+        select(PreviewSnapshotRecord).where(
+            PreviewSnapshotRecord.account_id == account_id,
+            PreviewSnapshotRecord.symbol == symbol,
+            PreviewSnapshotRecord.preview_hash == preview_hash,
+        )
     )
-    db.add(version)
+    return load_snapshot(_snapshot_record_payload(record)) if record else None
+
+
+def save_preview_snapshot(db: Session, account_id: int, preview: dict) -> PreviewSnapshot:
+    existing = get_preview_snapshot(db, account_id, preview["symbol"], preview["preview_hash"])
+    if existing is not None:
+        return existing
+    snapshot = create_snapshot(preview)
+    record = PreviewSnapshotRecord(
+        account_id=account_id,
+        symbol=snapshot.symbol,
+        preview_hash=snapshot.preview_hash,
+        snapshot_hash=snapshot.hash,
+        strategy_snapshot=thaw(snapshot.strategy_snapshot),
+        feature_snapshot=thaw(snapshot.feature_snapshot),
+        risk_snapshot=thaw(snapshot.risk_snapshot),
+        decision_snapshot=thaw(snapshot.decision_snapshot),
+        price_snapshot=thaw(snapshot.price_snapshot),
+        rule_version_snapshot=thaw(snapshot.rule_version_snapshot),
+        account_snapshot=thaw(snapshot.account_snapshot),
+        market_snapshot=thaw(snapshot.market_snapshot),
+        preview_payload=thaw(snapshot.preview_payload),
+    )
+    db.add(record)
     db.commit()
-    db.refresh(version)
-    return version
+    db.refresh(record)
+    return load_snapshot(_snapshot_record_payload(record))
 
 
 def save_preview(preview: dict) -> TradePlanSnapshot:
@@ -48,14 +96,22 @@ def save_preview(preview: dict) -> TradePlanSnapshot:
 
 
 def save_plan(db: Session, request: TradePlanSaveRequest) -> dict:
-    from app.services.trade_plan.application import generate_trade_plan
+    frozen = get_preview_snapshot(db, request.account_id, request.symbol, request.preview_hash)
+    legacy_recalculate_confirm = frozen is None
+    if frozen is not None:
+        if not verify_hash(frozen):
+            raise AppError(409, "PREVIEW_SNAPSHOT_INVALID", "预览快照完整性校验失败，请重新生成预览")
+        preview = preview_snapshot_payload(frozen)
+    else:
+        from app.services.trade_plan.application import generate_trade_plan
 
-    preview_request = TradePlanPreviewRequest(
-        **request.model_dump(exclude={"preview_hash", "ai_analysis_id"})
-    )
-    preview = generate_trade_plan(db, preview_request)
-    if preview["preview_hash"] != request.preview_hash:
-        raise AppError(409, "PREVIEW_CHANGED", "数据或规则已变化，请重新生成预览后再确认保存")
+        preview_request = TradePlanPreviewRequest(
+            **request.model_dump(exclude={"preview_hash", "ai_analysis_id"})
+        )
+        preview = generate_trade_plan(db, preview_request)
+        if preview["preview_hash"] != request.preview_hash:
+            raise AppError(409, "PREVIEW_CHANGED", "数据或规则已变化，请重新生成预览后再确认保存")
+        frozen = save_preview_snapshot(db, request.account_id, preview)
     latest = db.scalar(
         select(TradePlan)
         .where(TradePlan.account_id == request.account_id, TradePlan.symbol == request.symbol)
@@ -108,7 +164,13 @@ def save_plan(db: Session, request: TradePlanSaveRequest) -> dict:
         plan_version=plan_version.version,
         parent_plan_id=plan_version.parent_plan_id,
         preview_hash=snapshot.preview_hash,
-        engine_snapshot=dict(snapshot_payload(snapshot)),
+        engine_snapshot={
+            **dict(snapshot_payload(snapshot)),
+            "_confirmation": {
+                "legacy_recalculate_confirm": legacy_recalculate_confirm,
+                "preview_snapshot_id": frozen.snapshot_id,
+            },
+        },
         market_snapshot={
             "market_state": request.market_state,
             "sector_state": request.sector_state,

@@ -453,6 +453,30 @@ class TradePlan(TimestampMixin, Base):
     execution_summary: Mapped[dict | None] = mapped_column(JSON)
 
 
+class PreviewSnapshotRecord(Base):
+    __tablename__ = "preview_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id", "symbol", "preview_hash", name="uq_preview_snapshot_scope"
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    preview_hash: Mapped[str] = mapped_column(String(64), index=True)
+    snapshot_hash: Mapped[str] = mapped_column(String(64))
+    strategy_snapshot: Mapped[dict] = mapped_column(JSON)
+    feature_snapshot: Mapped[dict] = mapped_column(JSON)
+    risk_snapshot: Mapped[dict] = mapped_column(JSON)
+    decision_snapshot: Mapped[dict] = mapped_column(JSON)
+    price_snapshot: Mapped[dict] = mapped_column(JSON)
+    rule_version_snapshot: Mapped[dict] = mapped_column(JSON)
+    account_snapshot: Mapped[dict] = mapped_column(JSON)
+    market_snapshot: Mapped[dict] = mapped_column(JSON)
+    preview_payload: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class TradePlanCheck(Base):
     __tablename__ = "trade_plan_checks"
     __table_args__ = (UniqueConstraint("trade_plan_id", "gate_code", name="uq_trade_plan_gate"),)

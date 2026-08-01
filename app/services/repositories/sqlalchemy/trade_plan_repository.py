@@ -5,7 +5,7 @@ from app.services.repositories.sqlalchemy.account_repository import (
     SqlAlchemyAccountRepository,
 )
 from app.services.repositories.sqlalchemy.market_repository import SqlAlchemyMarketRepository
-from app.services.trade_plan.persistence import ensure_generator_rule_version
+from app.services.rule_version_manager import RuleVersionManager
 
 
 class SqlAlchemyTradePlanRepository:
@@ -36,7 +36,7 @@ class SqlAlchemyTradePlanRepository:
         return self.market.load_qfq_frame(symbol)
 
     def ensure_rule_version(self) -> RuleVersionRecord:
-        item = ensure_generator_rule_version(self.db)
+        item = RuleVersionManager(self.db).ensure_active_version()
         return RuleVersionRecord(
             version=item.version,
             parameters=item.parameters,
