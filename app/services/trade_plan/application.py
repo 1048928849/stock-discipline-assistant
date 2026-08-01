@@ -2,31 +2,24 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from types import SimpleNamespace
+from typing import Any
 
 import pandas as pd
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
 from app.domain.features import FeatureQuality
+from app.domain.repository import HoldingRecord, TradePlanReadRepository
 from app.domain.risk import RiskContext, RiskStatus
 from app.errors import AppError
-from app.models import (
-    Account,
-    CompanyProfile,
-    Holding,
-    MarketDailyBar,
-    MarketQuote,
-)
 from app.schemas_workflow import TradePlanPreviewRequest
 from app.services.decision_engine import compatibility_context, evaluate_decision
 from app.services.features import FeaturePipeline
+from app.services.price_planner import plan_prices
+from app.services.repository import build_trade_plan_repository
 from app.services.risk_engine import (
     evaluate_risk,
     legacy_position_calculation,
 )
 from app.services.strategy_evaluation import evaluate_platform_breakout, strategy_gates
-from app.services.technical_snapshots import load_qfq_frame
 from app.services.trade_plan.assembler import assemble_preview
 from app.services.trade_plan.compatibility import (
     GENERATOR_PARAMETERS,
@@ -34,27 +27,23 @@ from app.services.trade_plan.compatibility import (
     legacy_gate,
     legacy_preview,
 )
-from app.services.trade_plan.persistence import ensure_generator_rule_version
 
 
-def generate_trade_plan(db: Session, request: TradePlanPreviewRequest) -> dict:
-    account = db.get(Account, request.account_id)
+def generate_trade_plan(
+    db: Any,
+    request: TradePlanPreviewRequest,
+    repository: TradePlanReadRepository | None = None,
+) -> dict:
+    repository = repository or build_trade_plan_repository(db)
+    account = repository.get_account(request.account_id)
     if account is None:
         raise AppError(404, "ACCOUNT_NOT_FOUND", "账户不存在")
-    rule = ensure_generator_rule_version(db)
+    rule = repository.ensure_rule_version()
     parameters = {**GENERATOR_PARAMETERS, **rule.parameters}
-    profile = db.scalar(select(CompanyProfile).where(CompanyProfile.symbol == request.symbol))
-    stored_holding = db.scalar(
-        select(Holding).where(
-            Holding.account_id == request.account_id, Holding.symbol == request.symbol
-        )
-    )
-    latest_bar = db.scalar(
-        select(MarketDailyBar)
-        .where(MarketDailyBar.symbol == request.symbol)
-        .order_by(MarketDailyBar.trade_date.desc(), MarketDailyBar.fetched_at.desc())
-    )
-    quote = db.scalar(select(MarketQuote).where(MarketQuote.symbol == request.symbol))
+    profile = repository.get_company_profile(request.symbol)
+    stored_holding = repository.get_holding(request.account_id, request.symbol)
+    latest_bar = repository.get_latest_bar(request.symbol)
+    quote = repository.get_quote(request.symbol)
     holding = stored_holding
     if request.position_mode == "空仓":
         holding = None
@@ -66,7 +55,8 @@ def generate_trade_plan(db: Session, request: TradePlanPreviewRequest) -> dict:
             if latest_bar
             else request.holding_cost_price
         )
-        holding = SimpleNamespace(
+        holding = HoldingRecord(
+            symbol=request.symbol,
             quantity=request.holding_quantity,
             cost_price=request.holding_cost_price,
             current_price=reference_price,
@@ -76,7 +66,7 @@ def generate_trade_plan(db: Session, request: TradePlanPreviewRequest) -> dict:
         )
     missing = []
     try:
-        frame = load_qfq_frame(db, request.symbol)
+        frame = repository.load_qfq_frame(request.symbol)
     except ValueError as exc:
         frame = None
         missing.append(str(exc))
@@ -168,28 +158,18 @@ def generate_trade_plan(db: Session, request: TradePlanPreviewRequest) -> dict:
     )
     gates.extend(strategy_gates(strategy_result))
     current_price = float(quote.price) if quote else pattern["latest_close"] if pattern else None
-    stop = None
-    entry_reference = None
-    reward_risk = None
-    first_target = None
-    second_target = None
-    if pattern and pattern["valid_platform"]:
-        atr_buffer = pattern["atr14"] * float(parameters["atr_buffer_multiple"])
-        recent_low = float(frame["Low"].tail(10).min())
-        stop = round(max(pattern["platform_lower"], recent_low) - atr_buffer, 4)
-        entry_reference = round(pattern["turn_trigger_price"], 4)
-        if stop < entry_reference:
-            platform_target = pattern["platform_upper"] + (
-                pattern["platform_upper"] - pattern["platform_lower"]
-            )
-            minimum_r_target = entry_reference + float(parameters["minimum_reward_risk"]) * (
-                entry_reference - stop
-            )
-            raw_first_target = max(platform_target, minimum_r_target)
-            first_target = round(raw_first_target, 4)
-            second_target = round(entry_reference + 3 * (entry_reference - stop), 4)
-            reward_risk = (raw_first_target - entry_reference) / (entry_reference - stop)
-    holdings = db.scalars(select(Holding).where(Holding.account_id == account.id)).all()
+    price_plan = plan_prices(
+        strategy_result=strategy_result,
+        feature_snapshot=feature_snapshot,
+        market_data=frame,
+        parameters=parameters,
+    )
+    stop = price_plan.stop_price
+    entry_reference = price_plan.entry_reference
+    reward_risk = price_plan.reward_risk
+    first_target = price_plan.first_target
+    second_target = price_plan.second_target
+    holdings = list(repository.get_holdings(account.id))
     if request.position_mode == "空仓":
         holdings = [item for item in holdings if item.symbol != request.symbol]
     elif request.position_mode == "持仓" and holding is not None:
@@ -313,12 +293,8 @@ def generate_trade_plan(db: Session, request: TradePlanPreviewRequest) -> dict:
     first_reduction_triggered = decision_result.position_evidence["first_reduction_triggered"]
     confirmation_add_allowed = decision_result.position_evidence["confirmation_add_allowed"]
     current_allowed = final_status == "READY" and trial_quantity >= 100
-    buy_low = (
-        round(entry_reference - pattern["atr14"] * 0.2, 4) if entry_reference and pattern else None
-    )
-    buy_high = (
-        round(entry_reference + pattern["atr14"] * 0.2, 4) if entry_reference and pattern else None
-    )
+    buy_low = price_plan.entry_zone.low
+    buy_high = price_plan.entry_zone.high
     reasons = [item["evidence"] for item in gates if item["status"] in {"不通过", "无法判断"}]
     next_items = [item["evidence"] for item in gates if item["status"] in {"警告", "无法判断"}][:5]
     sources = [
@@ -423,9 +399,7 @@ def generate_trade_plan(db: Session, request: TradePlanPreviewRequest) -> dict:
             "trigger_condition": "收盘越过转强触发价、超过前一日高点，且成交量不低于20日均量。",
             "hard_stop": stop,
             "stop_cannot_move_down": True,
-            "structure_invalidation": f"收盘跌破平台下沿 {pattern['platform_lower']} 或放量跌回平台。"
-            if pattern
-            else "数据不足，无法判断",
+            "structure_invalidation": price_plan.structure_invalidation,
             "logic_invalidation": request.logic_invalidation
             or "行业/公司核心假设、业绩订单需求或治理风险恶化时退出。",
             "abandon_conditions": GENERATOR_RULES["hard_prohibitions"],
