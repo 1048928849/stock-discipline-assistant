@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import date, datetime, timedelta
-from decimal import ROUND_FLOOR, Decimal
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pandas as pd
@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.domain.features import FeatureQuality
+from app.domain.risk import RiskContext, RiskStatus
 from app.errors import AppError
 from app.models import (
     Account,
@@ -26,6 +27,11 @@ from app.models import (
 from app.schemas_workflow import TradePlanPreviewRequest, TradePlanSaveRequest
 from app.services.decision_engine import compatibility_context, evaluate_decision
 from app.services.features import FeaturePipeline
+from app.services.risk_engine import (
+    evaluate_risk,
+    floor_lot,
+    legacy_position_calculation,
+)
 from app.services.strategy_evaluation import evaluate_platform_breakout, strategy_gates
 from app.services.technical_snapshots import load_qfq_frame
 from app.services.workflow import ensure_default_rule_version
@@ -70,6 +76,11 @@ GENERATOR_RULES = {
 }
 
 
+def _floor_lot(value: float | Decimal) -> int:
+    """Backward-compatible delegate; lot calculation lives in Risk Engine."""
+    return floor_lot(value)
+
+
 def ensure_generator_rule_version(db: Session) -> RuleVersion:
     current = ensure_default_rule_version(db)
     if all(key in current.parameters for key in GENERATOR_PARAMETERS):
@@ -103,10 +114,6 @@ def _gate(
         "source": source,
         "data_time": data_time,
     }
-
-
-def _floor_lot(value: float | Decimal) -> int:
-    return max(0, int(Decimal(str(value)).to_integral_value(rounding=ROUND_FLOOR)) // 100 * 100)
 
 
 def _preview_digest(preview: dict) -> str:
@@ -266,7 +273,6 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
     gates.extend(strategy_gates(strategy_result))
     current_price = float(quote.price) if quote else pattern["latest_close"] if pattern else None
     stop = None
-    stop_distance_pct = None
     entry_reference = None
     reward_risk = None
     first_target = None
@@ -277,7 +283,6 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
         stop = round(max(pattern["platform_lower"], recent_low) - atr_buffer, 4)
         entry_reference = round(pattern["turn_trigger_price"], 4)
         if stop < entry_reference:
-            stop_distance_pct = (entry_reference - stop) / entry_reference * 100
             platform_target = pattern["platform_upper"] + (
                 pattern["platform_upper"] - pattern["platform_lower"]
             )
@@ -288,13 +293,52 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             first_target = round(raw_first_target, 4)
             second_target = round(entry_reference + 3 * (entry_reference - stop), 4)
             reward_risk = (raw_first_target - entry_reference) / (entry_reference - stop)
-    stop_status = (
-        "无法判断"
-        if stop is None
-        else "不通过"
-        if stop_distance_pct > float(parameters["maximum_stop_distance_pct"])
-        else "通过"
+    holdings = db.scalars(select(Holding).where(Holding.account_id == account.id)).all()
+    if request.position_mode == "空仓":
+        holdings = [item for item in holdings if item.symbol != request.symbol]
+    elif request.position_mode == "持仓" and holding is not None:
+        holdings = [item for item in holdings if item.symbol != request.symbol] + [holding]
+    total_value = sum(Decimal(item.quantity) * item.current_price for item in holdings)
+    industry = profile.industry if profile else None
+    industry_value = sum(
+        Decimal(item.quantity) * item.current_price
+        for item in holdings
+        if industry and item.sector == industry
     )
+    existing_value = Decimal(holding.quantity) * holding.current_price if holding else Decimal(0)
+    risk_result = evaluate_risk(
+        RiskContext(
+            account_context={
+                "equity": account.total_assets,
+                "available_cash": account.available_cash,
+                "risk_pct": request.risk_pct,
+                "max_position_pct": request.max_position_pct,
+                "max_total_position_pct": request.max_total_position_pct,
+                "max_industry_position_pct": request.max_industry_position_pct,
+                "trial_position_ratio": parameters["trial_position_ratio"],
+            },
+            position_context={
+                "existing_symbol_value": existing_value,
+                "total_position_value": total_value,
+            },
+            entry_context={"entry_price": entry_reference},
+            stop_context={
+                "stop_price": stop,
+                "maximum_stop_distance_pct": parameters["maximum_stop_distance_pct"],
+                "reward_risk": reward_risk,
+                "minimum_reward_risk": parameters["minimum_reward_risk"],
+            },
+            market_context={"state": request.market_state},
+            sector_context={
+                "state": request.sector_state,
+                "sector_position_value": industry_value,
+            },
+        )
+    )
+    calculations = legacy_position_calculation(risk_result)
+    trial_quantity = calculations.get("trial_quantity", 0)
+    stop_distance_pct = risk_result.calculation_details.get("stop_distance_pct")
+    stop_status = risk_result.calculation_details.get("stop_status", "无法判断")
     gates.append(
         _gate(
             "stop",
@@ -308,13 +352,7 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             [] if stop is not None else ["平台下沿、有效低点或ATR"],
         )
     )
-    rr_status = (
-        "无法判断"
-        if reward_risk is None
-        else "通过"
-        if reward_risk >= float(parameters["minimum_reward_risk"])
-        else "不通过"
-    )
+    rr_status = risk_result.calculation_details.get("reward_risk_status", "无法判断")
     gates.append(
         _gate(
             "reward_risk",
@@ -327,61 +365,12 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
             data_time,
         )
     )
-    holdings = db.scalars(select(Holding).where(Holding.account_id == account.id)).all()
-    if request.position_mode == "空仓":
-        holdings = [item for item in holdings if item.symbol != request.symbol]
-    elif request.position_mode == "持仓" and holding is not None:
-        holdings = [item for item in holdings if item.symbol != request.symbol] + [holding]
-    total_value = sum(Decimal(item.quantity) * item.current_price for item in holdings)
-    industry = profile.industry if profile else None
-    industry_value = sum(
-        Decimal(item.quantity) * item.current_price
-        for item in holdings
-        if industry and item.sector == industry
-    )
-    calculations = {}
-    final_quantity = trial_quantity = 0
-    if entry_reference and stop and entry_reference > stop:
-        equity = account.total_assets
-        risk_budget = equity * request.risk_pct / Decimal("100")
-        per_share_risk = Decimal(str(entry_reference - stop))
-        risk_qty = _floor_lot(risk_budget / per_share_risk)
-        cash_qty = _floor_lot(account.available_cash / Decimal(str(entry_reference)))
-        existing_value = (
-            Decimal(holding.quantity) * holding.current_price if holding else Decimal(0)
-        )
-        single_remaining = max(
-            Decimal(0), equity * request.max_position_pct / Decimal("100") - existing_value
-        )
-        single_qty = _floor_lot(single_remaining / Decimal(str(entry_reference)))
-        total_remaining = max(
-            Decimal(0), equity * request.max_total_position_pct / Decimal("100") - total_value
-        )
-        total_qty = _floor_lot(total_remaining / Decimal(str(entry_reference)))
-        industry_remaining = max(
-            Decimal(0),
-            equity * request.max_industry_position_pct / Decimal("100") - industry_value,
-        )
-        industry_qty = _floor_lot(industry_remaining / Decimal(str(entry_reference)))
-        final_quantity = min(risk_qty, cash_qty, single_qty, total_qty, industry_qty)
-        trial_quantity = _floor_lot(final_quantity * float(parameters["trial_position_ratio"]))
-        calculations = {
-            "risk_budget": round(float(risk_budget), 2),
-            "per_share_risk": round(float(per_share_risk), 4),
-            "risk_allowed_quantity": risk_qty,
-            "cash_allowed_quantity": cash_qty,
-            "single_position_allowed_quantity": single_qty,
-            "total_position_allowed_quantity": total_qty,
-            "industry_concentration_allowed_quantity": industry_qty,
-            "final_allowed_quantity": final_quantity,
-            "trial_quantity": trial_quantity,
-            "trial_amount": round(trial_quantity * entry_reference, 2),
-            "trial_account_pct": round(trial_quantity * entry_reference / float(equity) * 100, 2),
-            "maximum_loss": round(trial_quantity * float(per_share_risk), 2),
-            "formula": "最终数量=min(风险预算、可用资金、单股仓位、总仓位、行业集中度允许数量)，再向下取100股整手",
-        }
     position_status = (
-        "无法判断" if not calculations else "不通过" if final_quantity < 100 else "通过"
+        "无法判断"
+        if risk_result.status is RiskStatus.INSUFFICIENT_DATA
+        else "不通过"
+        if risk_result.status is RiskStatus.BLOCKED
+        else "通过"
     )
     gates.append(
         _gate(
