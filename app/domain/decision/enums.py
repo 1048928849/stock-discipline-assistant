@@ -1,0 +1,11 @@
+from enum import Enum
+
+
+class TradeDecision(str, Enum):
+    BUY_PROHIBITED = "BUY_PROHIBITED"
+    WAIT = "WAIT"
+    TRIAL_ALLOWED = "TRIAL_ALLOWED"
+    HOLD = "HOLD"
+    CONDITIONAL_ADD = "CONDITIONAL_ADD"
+    REDUCE = "REDUCE"
+    PLAN_INVALID_EXIT = "PLAN_INVALID_EXIT"

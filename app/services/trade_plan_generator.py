@@ -24,6 +24,7 @@ from app.models import (
     TradePlanCheck,
 )
 from app.schemas_workflow import TradePlanPreviewRequest, TradePlanSaveRequest
+from app.services.decision_engine import compatibility_context, evaluate_decision
 from app.services.features import FeaturePipeline
 from app.services.strategy_evaluation import evaluate_platform_breakout, strategy_gates
 from app.services.technical_snapshots import load_qfq_frame
@@ -406,60 +407,26 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
         )
     )
     statuses = {item["code"]: item["status"] for item in gates}
-    critical_unknown = any(
-        statuses[code] == "无法判断"
-        for code in ("market", "sector", "large_cycle", "platform", "stop", "reward_risk", "data")
-    )
-    hard_fail = any(
-        statuses[code] == "不通过"
-        for code in (
-            "market",
-            "sector",
-            "large_cycle",
-            "platform",
-            "pullback",
-            "stop",
-            "reward_risk",
-            "position",
+    decision_result = evaluate_decision(
+        compatibility_context(
+            strategy_result=strategy_result,
+            gate_statuses=statuses,
+            entry_capacity_allowed=trial_quantity >= 100,
+            position_context={
+                "has_position": holding is not None,
+                "current_price": current_price,
+                "cost_price": holding.cost_price if holding else None,
+                "stop_loss_price": holding.stop_loss_price if holding else None,
+                "target_price": holding.target_price if holding else None,
+                "platform_broken": pattern["platform_broken"] if pattern else False,
+            },
         )
     )
-    if hard_fail:
-        final_status = "NO_TRADE"
-    elif critical_unknown:
-        final_status = "INSUFFICIENT_DATA"
-    elif (
-        statuses["breakout"] != "通过"
-        or statuses["pullback"] != "通过"
-        or statuses["turn_stronger"] != "通过"
-    ):
-        final_status = "WAIT"
-    else:
-        final_status = "READY"
-    if holding:
-        floating_profit = current_price is not None and current_price > float(holding.cost_price)
-        hard_stop_triggered = bool(
-            current_price is not None
-            and holding.stop_loss_price is not None
-            and current_price <= float(holding.stop_loss_price)
-        )
-        first_reduction_triggered = bool(
-            current_price is not None
-            and holding.target_price is not None
-            and current_price >= float(holding.target_price)
-        )
-        confirmation_add_allowed = bool(
-            floating_profit
-            and final_status == "READY"
-            and current_price > float(holding.stop_loss_price or 0)
-            and not hard_stop_triggered
-        )
-        if not confirmation_add_allowed and final_status == "READY":
-            final_status = "WAIT"
-    else:
-        floating_profit = None
-        hard_stop_triggered = False
-        first_reduction_triggered = False
-        confirmation_add_allowed = False
+    final_status = decision_result.legacy_plan_status
+    floating_profit = decision_result.position_evidence["floating_profit"]
+    hard_stop_triggered = decision_result.position_evidence["hard_stop_triggered"]
+    first_reduction_triggered = decision_result.position_evidence["first_reduction_triggered"]
+    confirmation_add_allowed = decision_result.position_evidence["confirmation_add_allowed"]
     current_allowed = final_status == "READY" and trial_quantity >= 100
     buy_low = (
         round(entry_reference - pattern["atr14"] * 0.2, 4) if entry_reference and pattern else None

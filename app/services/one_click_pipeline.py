@@ -28,15 +28,19 @@ from app.schemas_workflow import (
     TradePlanPreviewRequest,
     TradePlanSaveRequest,
 )
-from app.services.trade_plan_ai import run_ai_analysis
 from app.services.company_research import refresh_company_research_if_needed
 from app.services.data_sources import UnifiedDataService
+from app.services.decision_engine import (
+    evaluate_decision,
+    legacy_decision_dict,
+    preview_decision_context,
+)
+from app.services.trade_plan_ai import run_ai_analysis
 from app.services.trade_plan_generator import (
     GENERATOR_PARAMETERS,
     generate_trade_plan_preview,
     save_generated_plan,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -551,35 +555,6 @@ def _research_inventory(db: Session, symbol: str) -> tuple[dict, dict]:
     )
 
 
-def _decision(preview: dict, position_mode: str) -> dict:
-    holding = preview["existing_position"]
-    if position_mode == "持仓":
-        if holding["hard_stop_triggered"] or preview.get("pattern", {}).get("platform_broken"):
-            status, label = "PLAN_INVALID_EXIT", "计划失效，需要退出"
-        elif holding["first_reduction_triggered"]:
-            status, label = "REDUCE", "建议减仓"
-        elif holding["confirmation_add_allowed"]:
-            status, label = "CONDITIONAL_ADD", "允许条件式加仓"
-        elif preview["status"] == "NO_TRADE":
-            status, label = "REDUCE", "建议减仓"
-        else:
-            status, label = "HOLD", "允许持有"
-    elif preview["status"] == "READY" and preview["current_buy_allowed"]:
-        status, label = "TRIAL_ALLOWED", "允许试仓"
-    elif preview["status"] == "NO_TRADE":
-        status, label = "BUY_PROHIBITED", "禁止买入"
-    else:
-        status, label = "WAIT", "等待观察"
-    return {
-        "status": status,
-        "label": label,
-        "next_action": preview["next_observations"][0]
-        if preview["next_observations"]
-        else "等待下一次有效触发并重新分析。",
-        "rule_authority": "最终状态、仓位、止损和加仓均由确定性规则引擎决定，AI无权修改。",
-    }
-
-
 def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
     account, created_account = _default_account(db, payload)
     run = PlanAnalysisRun(
@@ -691,7 +666,9 @@ def run_one_click_analysis(db: Session, payload: OneClickPlanRequest) -> dict:
             sector_data_time=sector_step.get("data_time", datetime.now().isoformat()),
         )
         preview = generate_trade_plan_preview(db, generator_request)
-        decision = _decision(preview, payload.position_mode)
+        decision = legacy_decision_dict(
+            evaluate_decision(preview_decision_context(preview, payload.position_mode))
+        )
         preview["decision"] = decision
         preview["market_assessment"] = market
         preview["industry_assessment"] = sector
