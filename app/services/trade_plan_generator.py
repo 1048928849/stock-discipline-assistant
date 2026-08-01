@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import date, datetime, timedelta
-from decimal import Decimal, ROUND_FLOOR
+from decimal import ROUND_FLOOR, Decimal
 from types import SimpleNamespace
 
 import pandas as pd
@@ -25,9 +25,9 @@ from app.models import (
 )
 from app.schemas_workflow import TradePlanPreviewRequest, TradePlanSaveRequest
 from app.services.features import FeaturePipeline
+from app.services.strategy_evaluation import evaluate_platform_breakout, strategy_gates
 from app.services.technical_snapshots import load_qfq_frame
 from app.services.workflow import ensure_default_rule_version
-
 
 GENERATOR_PARAMETERS = {
     "default_account_equity": 300000,
@@ -247,99 +247,22 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
     gates.append(
         _gate("mode", "交易模式和周期", "通过", request.trade_mode, "用户选择", now.isoformat())
     )
-    if frame is not None:
+    if timeframe_facts is not None:
         weekly = timeframe_facts["weekly_state"]
         monthly = timeframe_facts["monthly_state"]
         daily = timeframe_facts["daily_state"]
-        large_state = timeframe_facts["large_state"]
-        gates.append(
-            _gate(
-                "large_cycle",
-                "月线、周线大周期方向",
-                "不通过"
-                if weekly["state"] == "向下"
-                else "通过"
-                if large_state == "向上"
-                else "警告",
-                f"月线 {monthly['state']}（{monthly['evidence']}）；周线 {weekly['state']}（{weekly['evidence']}）。",
-                source,
-                data_time,
-            )
-        )
-        gates.append(
-            _gate(
-                "platform",
-                "日线平台和趋势结构",
-                "通过" if pattern["valid_platform"] else "不通过",
-                f"观察 {pattern['platform_days']} 日，上沿 {pattern['platform_upper']}，下沿 {pattern['platform_lower']}，区间振幅 {pattern['platform_range_pct']}%。",
-                source,
-                data_time,
-            )
-        )
-        breakout = pattern["breakout"]
-        gates.append(
-            _gate(
-                "breakout",
-                "突破成交量",
-                "通过"
-                if breakout and breakout["volume_confirmed"]
-                else "警告"
-                if breakout
-                else "无法判断",
-                (
-                    f"{breakout['date']} 收盘 {breakout['price']} 突破，成交量为平台均量 {breakout['volume_ratio']:.2f} 倍。"
-                    if breakout
-                    else f"尚未收盘突破平台上沿 {pattern['platform_upper']}。"
-                ),
-                source,
-                data_time,
-                [] if breakout else ["有效突破"],
-            )
-        )
-        pull_status = (
-            "不通过"
-            if pattern["platform_broken"]
-            else "通过"
-            if pattern["pullback_seen"] and pattern["pullback_shrinking"]
-            else "警告"
-            if pattern["pullback_seen"]
-            else "无法判断"
-        )
-        gates.append(
-            _gate(
-                "pullback",
-                "回踩缩量及结构",
-                pull_status,
-                f"回踩区 {pattern['pullback_range'] or '尚未出现'}；量能比 {pattern['pullback_volume_ratio']}; 是否破位：{'是' if pattern['platform_broken'] else '否'}。",
-                source,
-                data_time,
-                [] if pattern["pullback_seen"] else ["突破后的回踩样本"],
-            )
-        )
-        gates.append(
-            _gate(
-                "turn_stronger",
-                "再次转强条件",
-                "通过" if pattern["turned_stronger"] else "无法判断",
-                f"触发价 {pattern['turn_trigger_price']}；要求收盘越过触发价、超过前一日高点且成交量不低于20日均量。",
-                source,
-                data_time,
-                [] if pattern["turned_stronger"] else ["再次放量转强"],
-            )
-        )
     else:
         weekly = monthly = daily = {"state": "无法判断", "evidence": "日线数据不足"}
-        large_state = "无法判断"
-        for code, name in (
-            ("large_cycle", "月线、周线大周期方向"),
-            ("platform", "日线平台和趋势结构"),
-            ("breakout", "突破成交量"),
-            ("pullback", "回踩缩量及结构"),
-            ("turn_stronger", "再次转强条件"),
-        ):
-            gates.append(
-                _gate(code, name, "无法判断", "历史行情数据不足。", source, data_time, missing)
-            )
+    strategy_result = evaluate_platform_breakout(
+        symbol=request.symbol,
+        feature_snapshot=feature_snapshot,
+        parameters=parameters,
+        position_mode=request.position_mode,
+        position_context={"has_position": holding is not None},
+        market_context={"state": request.market_state, "missing_data": tuple(missing)},
+        sector_context={"state": request.sector_state},
+    )
+    gates.extend(strategy_gates(strategy_result))
     current_price = float(quote.price) if quote else pattern["latest_close"] if pattern else None
     stop = None
     stop_distance_pct = None
@@ -507,7 +430,7 @@ def generate_trade_plan_preview(db: Session, request: TradePlanPreviewRequest) -
     elif (
         statuses["breakout"] != "通过"
         or statuses["pullback"] != "通过"
-        or not pattern["turned_stronger"]
+        or statuses["turn_stronger"] != "通过"
     ):
         final_status = "WAIT"
     else:

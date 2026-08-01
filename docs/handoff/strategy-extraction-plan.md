@@ -87,15 +87,15 @@
 
 | 项目 | 状态 |
 |---|---|
-| 领域枚举、不可变模型和 Strategy Protocol | 待迁移 |
-| StrategyRegistry | 待迁移 |
-| 大周期方向规则 | 待迁移 |
-| 平台结构规则 | 待迁移 |
-| 突破量能规则 | 待迁移 |
-| 回踩结构规则 | 待迁移 |
-| 再次转强规则 | 待迁移 |
-| 旧 Gate 兼容适配 | 待迁移 |
+| 领域枚举、不可变模型和 Strategy Protocol | 已迁移 |
+| StrategyRegistry | 已迁移 |
+| 大周期方向规则 | 已迁移 |
+| 平台结构规则 | 已迁移 |
+| 突破量能规则 | 已迁移 |
+| 回踩结构规则 | 已迁移 |
+| 再次转强规则 | 已迁移 |
+| 旧 Gate 兼容适配 | 已迁移 |
 | Risk Logic | 保留 |
 | Decision Logic | 延后 |
 | Persistence Logic | 保留 |
-| 已知行为问题 | 发现问题；只记录 |
+| 已知行为问题 | 发现问题；已记录于 `strategy-extraction-issues.md` |
