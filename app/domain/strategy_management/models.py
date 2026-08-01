@@ -7,6 +7,7 @@ from types import MappingProxyType
 from typing import Any
 
 from app.domain.strategy_management.enums import StrategyLifecycle
+from app.domain.strategy_research import EvidenceRecord, StrategyResearchRecord, ValidationRecord
 
 
 def freeze(value: Any) -> Any:
@@ -39,6 +40,9 @@ class StrategyVersion:
     created_at: datetime
     activated_at: datetime | None = None
     retired_at: datetime | None = None
+    research_record: StrategyResearchRecord | None = None
+    evidence_records: tuple[EvidenceRecord, ...] = ()
+    validation_records: tuple[ValidationRecord, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "rule_snapshot", freeze(self.rule_snapshot))

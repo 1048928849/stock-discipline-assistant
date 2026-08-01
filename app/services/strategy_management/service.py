@@ -241,6 +241,9 @@ class StrategyManagementService:
                     strategy_version_id=version.id,
                 )
             )
+            from app.services.strategy_research import StrategyResearchService
+
+            StrategyResearchService(self.db).ensure_platform_breakout_research(version.id)
             result = version
         return result
 

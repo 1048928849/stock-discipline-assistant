@@ -43,8 +43,12 @@ class SqlAlchemyStrategyRepository:
             status=StrategyLifecycle(record.status),
         )
 
-    @staticmethod
-    def _version(record: StrategyVersionRecord) -> StrategyVersion:
+    def _version(self, record: StrategyVersionRecord) -> StrategyVersion:
+        from app.services.strategy_research.repository import (
+            SqlAlchemyStrategyResearchRepository,
+        )
+
+        history = SqlAlchemyStrategyResearchRepository(self.db).get_history(record.id)
         return StrategyVersion(
             id=record.id,
             strategy_id=record.strategy_id,
@@ -55,6 +59,9 @@ class SqlAlchemyStrategyRepository:
             created_at=record.created_at,
             activated_at=record.activated_at,
             retired_at=record.retired_at,
+            research_record=history.research_record,
+            evidence_records=history.evidence_records,
+            validation_records=history.validation_records,
         )
 
     def strategy_record(self, strategy_id: str) -> StrategyRecord | None:

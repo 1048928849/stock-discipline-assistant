@@ -39,5 +39,8 @@ def test_initial_schema_contains_required_tables(session):
         "strategies",
         "strategy_versions",
         "strategy_lifecycle_events",
+        "strategy_research_records",
+        "strategy_evidence_records",
+        "strategy_validation_records",
     }
     assert required == set(inspect(session.bind).get_table_names())

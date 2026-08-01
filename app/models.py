@@ -451,6 +451,50 @@ class StrategyLifecycleEventRecord(Base):
     occurred_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class StrategyResearchRecordModel(Base):
+    __tablename__ = "strategy_research_records"
+    __table_args__ = (
+        UniqueConstraint("strategy_version_id", name="uq_strategy_research_version"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_version_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_versions.id", ondelete="CASCADE"), index=True
+    )
+    hypothesis: Mapped[str] = mapped_column(Text)
+    thesis: Mapped[str] = mapped_column(Text)
+    causal_chain: Mapped[list] = mapped_column(JSON)
+    market_conditions: Mapped[list] = mapped_column(JSON)
+    applicable_scenarios: Mapped[list] = mapped_column(JSON)
+    failure_conditions: Mapped[list] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class StrategyEvidenceRecordModel(Base):
+    __tablename__ = "strategy_evidence_records"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_version_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_versions.id", ondelete="CASCADE"), index=True
+    )
+    type: Mapped[str] = mapped_column(String(30), index=True)
+    source: Mapped[str] = mapped_column(String(200))
+    content: Mapped[str] = mapped_column(Text)
+    reference: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class StrategyValidationRecordModel(Base):
+    __tablename__ = "strategy_validation_records"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_version_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_versions.id", ondelete="CASCADE"), index=True
+    )
+    validation_type: Mapped[str] = mapped_column(String(80), index=True)
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    sample_size: Mapped[int] = mapped_column(Integer, default=0)
+    result_summary: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class TradePlan(TimestampMixin, Base):
     __tablename__ = "trade_plans"
     id: Mapped[int] = mapped_column(primary_key=True)
