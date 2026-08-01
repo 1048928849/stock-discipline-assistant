@@ -1,0 +1,9 @@
+from typing import Any, Protocol
+
+
+class TradePlanPersistence(Protocol):
+    def save_plan(self, request: Any) -> dict: ...
+
+    def get_history(self, account_id: int, symbol: str) -> list[dict]: ...
+
+    def compare_versions(self, first_id: int, second_id: int) -> dict: ...
