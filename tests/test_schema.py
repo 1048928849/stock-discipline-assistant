@@ -4,6 +4,7 @@ from sqlalchemy import inspect
 def test_initial_schema_contains_required_tables(session):
     required = {
         "accounts",
+        "account_equity_snapshots",
         "holdings",
         "trades",
         "trade_reviews",
@@ -11,6 +12,8 @@ def test_initial_schema_contains_required_tables(session):
         "discipline_events",
         "market_quotes",
         "market_daily_bars",
+        "market_minute_bars",
+        "institutional_transaction_evidence",
         "market_source_logs",
         "x_watch_accounts",
         "x_watch_queries",
@@ -35,5 +38,12 @@ def test_initial_schema_contains_required_tables(session):
         "company_research_refreshes",
         "plan_execution_events",
         "plan_execution_fills",
+        "preview_snapshots",
+        "strategies",
+        "strategy_versions",
+        "strategy_lifecycle_events",
+        "strategy_research_records",
+        "strategy_evidence_records",
+        "strategy_validation_records",
     }
     assert required == set(inspect(session.bind).get_table_names())

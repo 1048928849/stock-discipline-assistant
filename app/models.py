@@ -2,12 +2,12 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     Date,
     DateTime,
     ForeignKey,
     Integer,
-    JSON,
     Numeric,
     String,
     Text,
@@ -17,7 +17,6 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
-
 
 MONEY = Numeric(20, 4)
 PRICE = Numeric(18, 4)
@@ -40,6 +39,21 @@ class Account(TimestampMixin, Base):
     holdings: Mapped[list["Holding"]] = relationship(
         back_populates="account", cascade="all, delete-orphan"
     )
+
+
+class AccountEquitySnapshot(Base):
+    __tablename__ = "account_equity_snapshots"
+    __table_args__ = (
+        UniqueConstraint("account_id", "snapshot_date", name="uq_account_equity_date"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), index=True
+    )
+    snapshot_date: Mapped[date] = mapped_column(Date, index=True)
+    equity: Mapped[Decimal] = mapped_column(MONEY)
+    source: Mapped[str] = mapped_column(String(30), default="account_update")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class Holding(TimestampMixin, Base):
@@ -139,6 +153,40 @@ class MarketDailyBar(Base):
     close: Mapped[Decimal] = mapped_column(PRICE)
     volume: Mapped[Decimal] = mapped_column(Numeric(24, 4))
     source: Mapped[str] = mapped_column(String(50))
+    fetched_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class MarketMinuteBar(Base):
+    __tablename__ = "market_minute_bars"
+    __table_args__ = (
+        UniqueConstraint("symbol", "trade_time", "source", name="uq_minute_bar_source"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    trade_time: Mapped[datetime] = mapped_column(DateTime, index=True)
+    open: Mapped[Decimal] = mapped_column(PRICE)
+    high: Mapped[Decimal] = mapped_column(PRICE)
+    low: Mapped[Decimal] = mapped_column(PRICE)
+    close: Mapped[Decimal] = mapped_column(PRICE)
+    volume: Mapped[Decimal] = mapped_column(Numeric(24, 4))
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(24, 4))
+    source: Mapped[str] = mapped_column(String(50))
+    fetched_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class InstitutionalTransactionEvidence(Base):
+    __tablename__ = "institutional_transaction_evidence"
+    __table_args__ = (UniqueConstraint("evidence_key", name="uq_institutional_evidence_key"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    evidence_key: Mapped[str] = mapped_column(String(100))
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    event_date: Mapped[date] = mapped_column(Date, index=True)
+    evidence_type: Mapped[str] = mapped_column(String(30), index=True)
+    price: Mapped[Decimal | None] = mapped_column(PRICE)
+    institutional: Mapped[bool] = mapped_column(Boolean, default=False)
+    source: Mapped[str] = mapped_column(String(100))
+    source_url: Mapped[str | None] = mapped_column(String(1000))
+    raw_data: Mapped[dict | None] = mapped_column(JSON)
     fetched_at: Mapped[datetime] = mapped_column(DateTime)
 
 
@@ -406,11 +454,98 @@ class RuleVersion(TimestampMixin, Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class StrategyRecord(Base):
+    __tablename__ = "strategies"
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    name: Mapped[str] = mapped_column(String(150))
+    description: Mapped[str] = mapped_column(Text)
+    category: Mapped[str] = mapped_column(String(80), index=True)
+    owner: Mapped[str] = mapped_column(String(100))
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class StrategyVersionRecord(Base):
+    __tablename__ = "strategy_versions"
+    __table_args__ = (UniqueConstraint("strategy_id", "version", name="uq_strategy_version"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_id: Mapped[str] = mapped_column(
+        ForeignKey("strategies.id", ondelete="CASCADE"), index=True
+    )
+    version: Mapped[str] = mapped_column(String(30))
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    rule_snapshot: Mapped[dict] = mapped_column(JSON)
+    parameter_snapshot: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class StrategyLifecycleEventRecord(Base):
+    __tablename__ = "strategy_lifecycle_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_id: Mapped[str] = mapped_column(
+        ForeignKey("strategies.id", ondelete="CASCADE"), index=True
+    )
+    strategy_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("strategy_versions.id", ondelete="SET NULL"), index=True
+    )
+    from_status: Mapped[str | None] = mapped_column(String(20))
+    to_status: Mapped[str] = mapped_column(String(20), index=True)
+    event_type: Mapped[str] = mapped_column(String(50))
+    reason: Mapped[str | None] = mapped_column(Text)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class StrategyResearchRecordModel(Base):
+    __tablename__ = "strategy_research_records"
+    __table_args__ = (UniqueConstraint("strategy_version_id", name="uq_strategy_research_version"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_version_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_versions.id", ondelete="CASCADE"), index=True
+    )
+    hypothesis: Mapped[str] = mapped_column(Text)
+    thesis: Mapped[str] = mapped_column(Text)
+    causal_chain: Mapped[list] = mapped_column(JSON)
+    market_conditions: Mapped[list] = mapped_column(JSON)
+    applicable_scenarios: Mapped[list] = mapped_column(JSON)
+    failure_conditions: Mapped[list] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class StrategyEvidenceRecordModel(Base):
+    __tablename__ = "strategy_evidence_records"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_version_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_versions.id", ondelete="CASCADE"), index=True
+    )
+    type: Mapped[str] = mapped_column(String(30), index=True)
+    source: Mapped[str] = mapped_column(String(200))
+    content: Mapped[str] = mapped_column(Text)
+    reference: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class StrategyValidationRecordModel(Base):
+    __tablename__ = "strategy_validation_records"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy_version_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_versions.id", ondelete="CASCADE"), index=True
+    )
+    validation_type: Mapped[str] = mapped_column(String(80), index=True)
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    sample_size: Mapped[int] = mapped_column(Integer, default=0)
+    result_summary: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class TradePlan(TimestampMixin, Base):
     __tablename__ = "trade_plans"
     id: Mapped[int] = mapped_column(primary_key=True)
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
     rule_version_id: Mapped[int] = mapped_column(ForeignKey("rule_versions.id"), index=True)
+    strategy_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    strategy_version_id: Mapped[int | None] = mapped_column(Integer, index=True)
     symbol: Mapped[str] = mapped_column(String(12), index=True)
     name: Mapped[str | None] = mapped_column(String(100))
     status: Mapped[str] = mapped_column(String(20), index=True, default="DRAFT")
@@ -451,6 +586,28 @@ class TradePlan(TimestampMixin, Base):
     source_snapshot: Mapped[list | None] = mapped_column(JSON)
     execution_status: Mapped[str] = mapped_column(String(30), index=True, default="draft")
     execution_summary: Mapped[dict | None] = mapped_column(JSON)
+
+
+class PreviewSnapshotRecord(Base):
+    __tablename__ = "preview_snapshots"
+    __table_args__ = (
+        UniqueConstraint("account_id", "symbol", "preview_hash", name="uq_preview_snapshot_scope"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    preview_hash: Mapped[str] = mapped_column(String(64), index=True)
+    snapshot_hash: Mapped[str] = mapped_column(String(64))
+    strategy_snapshot: Mapped[dict] = mapped_column(JSON)
+    feature_snapshot: Mapped[dict] = mapped_column(JSON)
+    risk_snapshot: Mapped[dict] = mapped_column(JSON)
+    decision_snapshot: Mapped[dict] = mapped_column(JSON)
+    price_snapshot: Mapped[dict] = mapped_column(JSON)
+    rule_version_snapshot: Mapped[dict] = mapped_column(JSON)
+    account_snapshot: Mapped[dict] = mapped_column(JSON)
+    market_snapshot: Mapped[dict] = mapped_column(JSON)
+    preview_payload: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class TradePlanCheck(Base):

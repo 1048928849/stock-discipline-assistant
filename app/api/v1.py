@@ -16,8 +16,8 @@ from app.schemas import (
     HoldingRead,
     HoldingUpdate,
 )
+from app.services.account_equity import record_account_equity
 from app.services.portfolio import holding_metrics
-
 
 router = APIRouter(prefix="/api/v1")
 
@@ -57,6 +57,8 @@ def list_accounts(db: Session = Depends(get_db)):
 def create_account(payload: AccountCreate, db: Session = Depends(get_db)):
     account = Account(**payload.model_dump())
     db.add(account)
+    db.flush()
+    record_account_equity(db, account)
     db.commit()
     db.refresh(account)
     return account
@@ -72,6 +74,7 @@ def update_account(account_id: int, payload: AccountUpdate, db: Session = Depend
     account = get_account_or_404(db, account_id)
     for key, value in payload.model_dump().items():
         setattr(account, key, value)
+    record_account_equity(db, account)
     db.commit()
     db.refresh(account)
     return account
