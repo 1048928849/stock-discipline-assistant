@@ -13,6 +13,7 @@ from app.domain.strategy_research import (
     ValidationRecord,
     ValidationStatus,
 )
+from app.domain.strategy_validation import ValidationReport, ValidationVerdict
 from app.errors import AppError
 from app.models import StrategyVersionRecord
 from app.services.strategy_research.repository import SqlAlchemyStrategyResearchRepository
@@ -136,6 +137,34 @@ class StrategyResearchService:
                 result_summary=result_summary,
             )
         return result
+
+    def record_validation_report(
+        self,
+        *,
+        strategy_version_id: int,
+        validation_type: str,
+        report: ValidationReport,
+    ) -> ValidationRecord:
+        status = {
+            ValidationVerdict.PASSED: ValidationStatus.PASSED,
+            ValidationVerdict.FAILED: ValidationStatus.FAILED,
+            ValidationVerdict.INSUFFICIENT_DATA: ValidationStatus.INSUFFICIENT_DATA,
+        }[report.verdict]
+        metrics = report.metrics
+        summary = (
+            f"verdict={report.verdict.value}; expectancy_r={metrics.expectancy_r}; "
+            f"profit_factor={metrics.profit_factor}; max_drawdown_r="
+            f"{metrics.maximum_drawdown_r}; tail_loss_r={metrics.tail_loss_r}; "
+            f"cost_r={metrics.total_cost_r}; failures={list(report.failures)}; "
+            f"warnings={list(report.warnings)}"
+        )
+        return self.add_validation(
+            strategy_version_id=strategy_version_id,
+            validation_type=validation_type,
+            status=status,
+            sample_size=metrics.sample_size,
+            result_summary=summary,
+        )
 
     def get_history(self, strategy_version_id: int) -> StrategyResearchHistory:
         self._version(strategy_version_id)

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from enum import Enum
 from typing import Any
 
 import pandas as pd
@@ -11,8 +13,11 @@ from app.domain.repository import HoldingRecord, TradePlanReadRepository
 from app.domain.risk import RiskContext, RiskStatus
 from app.errors import AppError
 from app.schemas_workflow import TradePlanPreviewRequest
+from app.services.account_equity import account_drawdown
 from app.services.decision_engine import compatibility_context, evaluate_decision
 from app.services.features import FeaturePipeline
+from app.services.event_anchor_data import load_event_anchor_inputs
+from app.services.portfolio_risk_context import calculate_portfolio_risk
 from app.services.price_planner import plan_prices
 from app.services.repository import build_trade_plan_repository
 from app.services.risk_engine import (
@@ -27,6 +32,18 @@ from app.services.trade_plan.compatibility import (
     legacy_gate,
     legacy_preview,
 )
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    return value
 
 
 def generate_trade_plan(
@@ -47,13 +64,11 @@ def generate_trade_plan(
     holding = stored_holding
     if request.position_mode == "空仓":
         holding = None
-    elif request.position_mode == "持仓" and request.holding_quantity and request.holding_cost_price:
+    elif (
+        request.position_mode == "持仓" and request.holding_quantity and request.holding_cost_price
+    ):
         reference_price = (
-            quote.price
-            if quote
-            else latest_bar.close
-            if latest_bar
-            else request.holding_cost_price
+            quote.price if quote else latest_bar.close if latest_bar else request.holding_cost_price
         )
         holding = HoldingRecord(
             symbol=request.symbol,
@@ -62,7 +77,9 @@ def generate_trade_plan(
             current_price=reference_price,
             stop_loss_price=stored_holding.stop_loss_price if stored_holding else None,
             target_price=stored_holding.target_price if stored_holding else None,
-            sector=stored_holding.sector if stored_holding else (profile.industry if profile else None),
+            sector=stored_holding.sector
+            if stored_holding
+            else (profile.industry if profile else None),
         )
     missing = []
     try:
@@ -158,11 +175,22 @@ def generate_trade_plan(
     )
     gates.extend(strategy_gates(strategy_result))
     current_price = float(quote.price) if quote else pattern["latest_close"] if pattern else None
+    minute_sessions, institutional_evidence = (
+        load_event_anchor_inputs(
+            db,
+            request.symbol,
+            as_of=pd.Timestamp(data_date).date() if data_date else date.today(),
+        )
+        if db is not None
+        else ({}, ())
+    )
     price_plan = plan_prices(
         strategy_result=strategy_result,
         feature_snapshot=feature_snapshot,
         market_data=frame,
         parameters=parameters,
+        minute_sessions=minute_sessions,
+        institutional_evidence=institutional_evidence,
     )
     stop = price_plan.stop_price
     entry_reference = price_plan.entry_reference
@@ -182,6 +210,29 @@ def generate_trade_plan(
         if industry and item.sector == industry
     )
     existing_value = Decimal(holding.quantity) * holding.current_price if holding else Decimal(0)
+    risk_holdings = [
+        HoldingRecord(
+            symbol=item.symbol,
+            quantity=item.quantity,
+            cost_price=item.cost_price,
+            current_price=item.current_price,
+            stop_loss_price=Decimal(str(stop)),
+            target_price=item.target_price,
+            sector=item.sector,
+        )
+        if item.symbol == request.symbol and item.stop_loss_price is None and stop is not None
+        else item
+        for item in holdings
+    ]
+    portfolio_risk = calculate_portfolio_risk(
+        risk_holdings,
+        equity=account.total_assets,
+    )
+    drawdown = (
+        account_drawdown(db, account.id, current_equity=account.total_assets)
+        if db is not None
+        else None
+    )
     risk_result = evaluate_risk(
         RiskContext(
             account_context={
@@ -192,10 +243,16 @@ def generate_trade_plan(
                 "max_total_position_pct": request.max_total_position_pct,
                 "max_industry_position_pct": request.max_industry_position_pct,
                 "trial_position_ratio": parameters["trial_position_ratio"],
+                "max_portfolio_risk_pct": parameters.get("max_portfolio_risk_pct", 5),
+                "current_drawdown_pct": drawdown.drawdown_pct if drawdown else 0,
+                "max_account_drawdown_pct": parameters.get("max_account_drawdown_pct", 8),
             },
             position_context={
                 "existing_symbol_value": existing_value,
                 "total_position_value": total_value,
+                "open_risk_amount": portfolio_risk.open_risk_amount,
+                "portfolio_risk_complete": portfolio_risk.complete,
+                "holdings_without_stop": portfolio_risk.holdings_without_stop,
             },
             entry_context={"entry_price": entry_reference},
             stop_context={
@@ -371,6 +428,20 @@ def generate_trade_plan(
             if holding
             else "当前账户未持有该股票。",
         },
+        "account_risk": {
+            "portfolio_open_risk": float(portfolio_risk.open_risk_amount),
+            "portfolio_open_risk_pct": portfolio_risk.open_risk_pct,
+            "risk_complete": portfolio_risk.complete,
+            "holdings_without_stop": portfolio_risk.holdings_without_stop,
+            "warnings": list(portfolio_risk.warnings),
+            "peak_equity": float(drawdown.peak_equity) if drawdown else None,
+            "current_drawdown_pct": drawdown.drawdown_pct if drawdown else None,
+            "drawdown_observations": drawdown.observation_count if drawdown else 0,
+            "drawdown_circuit_breaker": risk_result.calculation_details.get(
+                "drawdown_circuit_breaker", False
+            ),
+            "stress_losses": risk_result.calculation_details.get("stress_losses", {}),
+        },
         "multi_timeframe": {
             "monthly": monthly,
             "weekly": weekly,
@@ -378,6 +449,9 @@ def generate_trade_plan(
             "60min": {"state": "无法判断", "evidence": "尚未接入可靠60分钟数据"},
         },
         "pattern": pattern,
+        "market_structure": _json_value(asdict(price_plan.market_structure))
+        if price_plan.market_structure
+        else None,
         "chart": [
             {
                 "date": pd.Timestamp(index).date().isoformat(),

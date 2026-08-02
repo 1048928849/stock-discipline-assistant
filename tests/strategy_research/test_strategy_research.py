@@ -1,10 +1,14 @@
+from datetime import date, timedelta
+
 import pytest
 
 from app.domain.strategy_management import StrategyLifecycle
 from app.domain.strategy_research import EvidenceType, ValidationStatus
+from app.domain.strategy_validation import ValidationTrade
 from app.errors import AppError
 from app.services.strategy_management import StrategyManagementService
 from app.services.strategy_research import StrategyResearchService
+from app.services.strategy_validation_engine import evaluate_validation
 
 
 def draft_version(session):
@@ -38,9 +42,7 @@ def research_payload(version_id: int) -> dict:
 
 def test_create_research_record(session):
     version = draft_version(session)
-    record = StrategyResearchService(session).create_research_record(
-        **research_payload(version.id)
-    )
+    record = StrategyResearchService(session).create_research_record(**research_payload(version.id))
 
     assert record.strategy_version_id == version.id
     assert record.causal_chain == ("整理", "突破", "回踩", "确认")
@@ -93,9 +95,7 @@ def test_strategy_version_aggregates_research_associations(session):
         result_summary="等待影子样本",
     )
 
-    linked = StrategyManagementService(session).repository.get_version(
-        "research_asset", "1.0.0"
-    )
+    linked = StrategyManagementService(session).repository.get_version("research_asset", "1.0.0")
     assert linked.research_record.hypothesis == "结构确认后具有可控风险机会"
     assert len(linked.evidence_records) == 1
     assert len(linked.validation_records) == 1
@@ -138,6 +138,33 @@ def test_active_strategy_research_core_is_immutable(session):
             **research_payload(active.id),
         )
     assert error.value.code == "ACTIVE_STRATEGY_RESEARCH_IMMUTABLE"
-    assert management.repository.get_version(
-        "platform_breakout_pullback", "1.0.0"
-    ).status is StrategyLifecycle.ACTIVE
+    assert (
+        management.repository.get_version("platform_breakout_pullback", "1.0.0").status
+        is StrategyLifecycle.ACTIVE
+    )
+
+
+def test_validation_report_is_persisted_as_append_only_result(session):
+    version = draft_version(session)
+    trades = []
+    for index in range(30):
+        signal = date(2024, 1, 1) + timedelta(days=index * 3)
+        trades.append(
+            ValidationTrade(
+                str(index),
+                signal,
+                signal + timedelta(days=1),
+                signal + timedelta(days=2),
+                1 if index % 2 == 0 else -0.3,
+            )
+        )
+    report = evaluate_validation(trades)
+
+    saved = StrategyResearchService(session).record_validation_report(
+        strategy_version_id=version.id,
+        validation_type="walk_forward",
+        report=report,
+    )
+
+    assert saved.status is ValidationStatus.PASSED
+    assert "expectancy_r=" in saved.result_summary

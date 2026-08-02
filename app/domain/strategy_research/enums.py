@@ -14,3 +14,4 @@ class ValidationStatus(str, Enum):
     RUNNING = "RUNNING"
     PASSED = "PASSED"
     FAILED = "FAILED"
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"

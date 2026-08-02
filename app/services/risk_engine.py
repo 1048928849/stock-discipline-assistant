@@ -6,8 +6,7 @@ from typing import Any
 from app.domain.risk import RiskConstraint, RiskContext, RiskEvaluationResult, RiskStatus
 
 POSITION_FORMULA = (
-    "最终数量=min(风险预算、可用资金、单股仓位、总仓位、行业集中度允许数量)，"
-    "再向下取100股整手"
+    "最终数量=min(风险预算、可用资金、单股仓位、总仓位、行业集中度允许数量)，再向下取100股整手"
 )
 
 
@@ -50,7 +49,22 @@ def evaluate_risk(context: RiskContext) -> RiskEvaluationResult:
     risk_ratio = _decimal(risk_pct)
     per_share_risk = entry_price - stop_price
     risk_budget = equity * risk_ratio / Decimal(100)
-    risk_quantity = floor_lot(risk_budget / per_share_risk)
+    current_drawdown_pct = _decimal(account.get("current_drawdown_pct", 0))
+    max_drawdown_pct = account.get("max_account_drawdown_pct")
+    drawdown_blocked = max_drawdown_pct is not None and current_drawdown_pct >= _decimal(
+        max_drawdown_pct
+    )
+    consecutive_losses = max(0, int(account.get("consecutive_losses", 0)))
+    default_multiplier = 0.5 if consecutive_losses >= 3 else 1
+    loss_streak_multiplier = max(
+        Decimal(0),
+        min(
+            Decimal(1),
+            _decimal(account.get("loss_streak_risk_multiplier", default_multiplier)),
+        ),
+    )
+    effective_risk_budget = risk_budget * loss_streak_multiplier
+    risk_quantity = floor_lot(effective_risk_budget / per_share_risk)
     cash_quantity = floor_lot(available_cash / entry_price)
 
     existing_value = _decimal(position.get("existing_symbol_value", 0))
@@ -66,26 +80,37 @@ def evaluate_risk(context: RiskContext) -> RiskEvaluationResult:
     )
     sector_remaining = max(
         Decimal(0),
-        equity * _decimal(account["max_industry_position_pct"]) / Decimal(100)
-        - sector_value,
+        equity * _decimal(account["max_industry_position_pct"]) / Decimal(100) - sector_value,
     )
     single_quantity = floor_lot(single_remaining / entry_price)
     total_quantity = floor_lot(total_remaining / entry_price)
     sector_quantity = floor_lot(sector_remaining / entry_price)
-    constraints = (
+    constraints_list = [
         RiskConstraint("risk_budget", risk_quantity),
         RiskConstraint("cash", cash_quantity),
         RiskConstraint("single_position", single_quantity),
         RiskConstraint("total_position", total_quantity),
         RiskConstraint("sector_exposure", sector_quantity),
-    )
+    ]
+    max_portfolio_risk_pct = account.get("max_portfolio_risk_pct")
+    if max_portfolio_risk_pct is not None:
+        open_risk = _decimal(position.get("open_risk_amount", 0))
+        portfolio_remaining = max(
+            Decimal(0),
+            equity * _decimal(max_portfolio_risk_pct) / Decimal(100) - open_risk,
+        )
+        constraints_list.append(
+            RiskConstraint("portfolio_open_risk", floor_lot(portfolio_remaining / per_share_risk))
+        )
+    portfolio_risk_incomplete = not bool(position.get("portfolio_risk_complete", True))
+    if portfolio_risk_incomplete:
+        constraints_list.append(RiskConstraint("portfolio_stop_completeness", 0))
+    if drawdown_blocked:
+        constraints_list.append(RiskConstraint("account_drawdown_circuit_breaker", 0))
+    constraints = tuple(constraints_list)
     allowed_quantity = min(item.limit for item in constraints)
-    binding_constraint = next(
-        item.name for item in constraints if item.limit == allowed_quantity
-    )
-    trial_quantity = floor_lot(
-        allowed_quantity * float(account.get("trial_position_ratio", 0))
-    )
+    binding_constraint = next(item.name for item in constraints if item.limit == allowed_quantity)
+    trial_quantity = floor_lot(allowed_quantity * float(account.get("trial_position_ratio", 0)))
     stop_distance_pct = float(per_share_risk / entry_price * Decimal(100))
     maximum_stop_distance = float(context.stop_context["maximum_stop_distance_pct"])
     reward_risk = context.stop_context.get("reward_risk")
@@ -99,11 +124,32 @@ def evaluate_risk(context: RiskContext) -> RiskEvaluationResult:
         else "不通过"
     )
     status = RiskStatus.PASS if allowed_quantity >= 100 else RiskStatus.BLOCKED
-    blocking_reasons = (
-        () if status is RiskStatus.PASS else ("最终允许数量不足100股",)
-    )
+    blocking_reasons_list: list[str] = []
+    if drawdown_blocked:
+        blocking_reasons_list.append("账户回撤达到熔断阈值，禁止新增风险")
+    if portfolio_risk_incomplete:
+        missing_stops = int(position.get("holdings_without_stop", 0))
+        blocking_reasons_list.append(
+            f"{missing_stops}个现有持仓缺少硬止损，无法可靠计算组合开放风险"
+        )
+    if allowed_quantity < 100:
+        blocking_reasons_list.append("最终允许数量不足100股")
+    blocking_reasons = tuple(blocking_reasons_list)
+    stress_losses: dict[str, float] = {}
+    for gap_pct in account.get("stress_gap_pcts", (3, 5, 10)):
+        gap = _decimal(gap_pct)
+        gap_exit = entry_price * (Decimal(1) - gap / Decimal(100))
+        stressed_exit = min(stop_price, gap_exit)
+        stress_losses[f"gap_down_{float(gap):g}_pct"] = round(
+            allowed_quantity * float(entry_price - stressed_exit), 2
+        )
     details = {
         "risk_budget": round(float(risk_budget), 2),
+        "effective_risk_budget": round(float(effective_risk_budget), 2),
+        "current_drawdown_pct": float(current_drawdown_pct),
+        "drawdown_circuit_breaker": drawdown_blocked,
+        "consecutive_losses": consecutive_losses,
+        "loss_streak_risk_multiplier": float(loss_streak_multiplier),
         "per_share_risk": round(float(per_share_risk), 4),
         "risk_allowed_quantity": risk_quantity,
         "cash_allowed_quantity": cash_quantity,
@@ -113,14 +159,13 @@ def evaluate_risk(context: RiskContext) -> RiskEvaluationResult:
         "final_allowed_quantity": allowed_quantity,
         "trial_quantity": trial_quantity,
         "trial_amount": round(trial_quantity * float(entry_price), 2),
-        "trial_account_pct": round(
-            trial_quantity * float(entry_price) / float(equity) * 100, 2
-        ),
+        "trial_account_pct": round(trial_quantity * float(entry_price) / float(equity) * 100, 2),
         "maximum_loss": round(trial_quantity * float(per_share_risk), 2),
         "formula": POSITION_FORMULA,
         "stop_distance_pct": stop_distance_pct,
         "stop_status": stop_status,
         "reward_risk_status": reward_risk_status,
+        "stress_losses": stress_losses,
     }
     return RiskEvaluationResult(
         status=status,
@@ -137,9 +182,16 @@ def evaluate_risk(context: RiskContext) -> RiskEvaluationResult:
 def legacy_position_calculation(result: RiskEvaluationResult) -> dict[str, Any]:
     if result.status is RiskStatus.INSUFFICIENT_DATA:
         return {}
-    hidden = {"stop_distance_pct", "stop_status", "reward_risk_status"}
-    return {
-        key: value
-        for key, value in result.calculation_details.items()
-        if key not in hidden
+    hidden = {
+        "stop_distance_pct",
+        "stop_status",
+        "reward_risk_status",
+        # V2账户风险诊断先保留在领域结果中，旧API不静默增加字段。
+        "effective_risk_budget",
+        "current_drawdown_pct",
+        "drawdown_circuit_breaker",
+        "consecutive_losses",
+        "loss_streak_risk_multiplier",
+        "stress_losses",
     }
+    return {key: value for key, value in result.calculation_details.items() if key not in hidden}

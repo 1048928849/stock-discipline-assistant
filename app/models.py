@@ -2,12 +2,12 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     Date,
     DateTime,
     ForeignKey,
     Integer,
-    JSON,
     Numeric,
     String,
     Text,
@@ -17,7 +17,6 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
-
 
 MONEY = Numeric(20, 4)
 PRICE = Numeric(18, 4)
@@ -40,6 +39,21 @@ class Account(TimestampMixin, Base):
     holdings: Mapped[list["Holding"]] = relationship(
         back_populates="account", cascade="all, delete-orphan"
     )
+
+
+class AccountEquitySnapshot(Base):
+    __tablename__ = "account_equity_snapshots"
+    __table_args__ = (
+        UniqueConstraint("account_id", "snapshot_date", name="uq_account_equity_date"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), index=True
+    )
+    snapshot_date: Mapped[date] = mapped_column(Date, index=True)
+    equity: Mapped[Decimal] = mapped_column(MONEY)
+    source: Mapped[str] = mapped_column(String(30), default="account_update")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class Holding(TimestampMixin, Base):
@@ -139,6 +153,40 @@ class MarketDailyBar(Base):
     close: Mapped[Decimal] = mapped_column(PRICE)
     volume: Mapped[Decimal] = mapped_column(Numeric(24, 4))
     source: Mapped[str] = mapped_column(String(50))
+    fetched_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class MarketMinuteBar(Base):
+    __tablename__ = "market_minute_bars"
+    __table_args__ = (
+        UniqueConstraint("symbol", "trade_time", "source", name="uq_minute_bar_source"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    trade_time: Mapped[datetime] = mapped_column(DateTime, index=True)
+    open: Mapped[Decimal] = mapped_column(PRICE)
+    high: Mapped[Decimal] = mapped_column(PRICE)
+    low: Mapped[Decimal] = mapped_column(PRICE)
+    close: Mapped[Decimal] = mapped_column(PRICE)
+    volume: Mapped[Decimal] = mapped_column(Numeric(24, 4))
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(24, 4))
+    source: Mapped[str] = mapped_column(String(50))
+    fetched_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class InstitutionalTransactionEvidence(Base):
+    __tablename__ = "institutional_transaction_evidence"
+    __table_args__ = (UniqueConstraint("evidence_key", name="uq_institutional_evidence_key"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    evidence_key: Mapped[str] = mapped_column(String(100))
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    event_date: Mapped[date] = mapped_column(Date, index=True)
+    evidence_type: Mapped[str] = mapped_column(String(30), index=True)
+    price: Mapped[Decimal | None] = mapped_column(PRICE)
+    institutional: Mapped[bool] = mapped_column(Boolean, default=False)
+    source: Mapped[str] = mapped_column(String(100))
+    source_url: Mapped[str | None] = mapped_column(String(1000))
+    raw_data: Mapped[dict | None] = mapped_column(JSON)
     fetched_at: Mapped[datetime] = mapped_column(DateTime)
 
 
@@ -419,9 +467,7 @@ class StrategyRecord(Base):
 
 class StrategyVersionRecord(Base):
     __tablename__ = "strategy_versions"
-    __table_args__ = (
-        UniqueConstraint("strategy_id", "version", name="uq_strategy_version"),
-    )
+    __table_args__ = (UniqueConstraint("strategy_id", "version", name="uq_strategy_version"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     strategy_id: Mapped[str] = mapped_column(
         ForeignKey("strategies.id", ondelete="CASCADE"), index=True
@@ -453,9 +499,7 @@ class StrategyLifecycleEventRecord(Base):
 
 class StrategyResearchRecordModel(Base):
     __tablename__ = "strategy_research_records"
-    __table_args__ = (
-        UniqueConstraint("strategy_version_id", name="uq_strategy_research_version"),
-    )
+    __table_args__ = (UniqueConstraint("strategy_version_id", name="uq_strategy_research_version"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     strategy_version_id: Mapped[int] = mapped_column(
         ForeignKey("strategy_versions.id", ondelete="CASCADE"), index=True
@@ -547,9 +591,7 @@ class TradePlan(TimestampMixin, Base):
 class PreviewSnapshotRecord(Base):
     __tablename__ = "preview_snapshots"
     __table_args__ = (
-        UniqueConstraint(
-            "account_id", "symbol", "preview_hash", name="uq_preview_snapshot_scope"
-        ),
+        UniqueConstraint("account_id", "symbol", "preview_hash", name="uq_preview_snapshot_scope"),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)

@@ -4,6 +4,7 @@ from sqlalchemy import inspect
 def test_initial_schema_contains_required_tables(session):
     required = {
         "accounts",
+        "account_equity_snapshots",
         "holdings",
         "trades",
         "trade_reviews",
@@ -11,6 +12,8 @@ def test_initial_schema_contains_required_tables(session):
         "discipline_events",
         "market_quotes",
         "market_daily_bars",
+        "market_minute_bars",
+        "institutional_transaction_evidence",
         "market_source_logs",
         "x_watch_accounts",
         "x_watch_queries",

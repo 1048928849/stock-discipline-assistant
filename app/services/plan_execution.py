@@ -6,6 +6,7 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.domain.trade_plan import audit_legacy_event_history, canonical_position_state
 from app.errors import AppError
 from app.models import (
     PlanExecutionEvent,
@@ -14,7 +15,6 @@ from app.models import (
     TradePlanCheck,
 )
 from app.schemas_workflow import PlanExecutionEvaluate, PlanExecutionFillCreate
-
 
 EXECUTION_STATUSES = {
     "draft",
@@ -108,11 +108,19 @@ def _calculate_summary(db: Session, plan: TradePlan, current_price: Decimal | No
         if fill.side == "买入":
             if fill.quantity % 100:
                 violations.append(
-                    {"code": "invalid_lot", "message": "买入数量不是A股100股整数倍", "fill_id": fill.id}
+                    {
+                        "code": "invalid_lot",
+                        "message": "买入数量不是A股100股整数倍",
+                        "fill_id": fill.id,
+                    }
                 )
             if fill.trigger_confirmed is False:
                 violations.append(
-                    {"code": "entry_without_trigger", "message": "未满足计划条件即买入", "fill_id": fill.id}
+                    {
+                        "code": "entry_without_trigger",
+                        "message": "未满足计划条件即买入",
+                        "fill_id": fill.id,
+                    }
                 )
             if not (plan.buy_zone_low <= fill.price <= plan.buy_zone_high):
                 violations.append(
@@ -136,12 +144,20 @@ def _calculate_summary(db: Session, plan: TradePlan, current_price: Decimal | No
             entry_prices.append(fill.price)
             if quantity > plan.planned_quantity:
                 violations.append(
-                    {"code": "over_position", "message": "实际持仓超过冻结计划数量", "fill_id": fill.id}
+                    {
+                        "code": "over_position",
+                        "message": "实际持仓超过冻结计划数量",
+                        "fill_id": fill.id,
+                    }
                 )
         else:
             if fill.quantity > quantity:
                 violations.append(
-                    {"code": "sell_exceeds_position", "message": "卖出数量超过计划跟踪持仓", "fill_id": fill.id}
+                    {
+                        "code": "sell_exceeds_position",
+                        "message": "卖出数量超过计划跟踪持仓",
+                        "fill_id": fill.id,
+                    }
                 )
             sold = min(fill.quantity, quantity)
             realized += (fill.price - average_cost) * sold - fill.fee
@@ -157,17 +173,13 @@ def _calculate_summary(db: Session, plan: TradePlan, current_price: Decimal | No
             }
         )
     target_entry = (plan.buy_zone_low + plan.buy_zone_high) / 2
-    actual_entry = (
-        sum(entry_prices, Decimal("0")) / len(entry_prices) if entry_prices else None
-    )
+    actual_entry = sum(entry_prices, Decimal("0")) / len(entry_prices) if entry_prices else None
     deviation_pct = (
         float((actual_entry / target_entry - 1) * 100)
         if actual_entry is not None and target_entry
         else None
     )
-    checks = db.scalars(
-        select(TradePlanCheck).where(TradePlanCheck.trade_plan_id == plan.id)
-    ).all()
+    checks = db.scalars(select(TradePlanCheck).where(TradePlanCheck.trade_plan_id == plan.id)).all()
     required = (
         plan.buy_zone_low,
         plan.buy_zone_high,
@@ -179,10 +191,10 @@ def _calculate_summary(db: Session, plan: TradePlan, current_price: Decimal | No
         plan.no_trade_condition,
         plan.planned_risk_amount,
     )
-    completeness = round(sum(value not in (None, "") for value in required) / len(required) * 100, 2)
-    unique_violations = {
-        (item["code"], item.get("fill_id")): item for item in violations
-    }
+    completeness = round(
+        sum(value not in (None, "") for value in required) / len(required) * 100, 2
+    )
+    unique_violations = {(item["code"], item.get("fill_id")): item for item in violations}
     compliance_denominator = max(1, len(checks) + len(fills))
     compliance = round(
         max(0, compliance_denominator - len(unique_violations)) / compliance_denominator * 100,
@@ -191,15 +203,14 @@ def _calculate_summary(db: Session, plan: TradePlan, current_price: Decimal | No
     risk_amount = Decimal(plan.planned_risk_amount or 0)
     summary = {
         "execution_status": plan.execution_status,
+        "lifecycle_state": canonical_position_state(plan.execution_status, quantity=quantity).value,
         "net_quantity": quantity,
         "average_cost": round(float(average_cost), 4) if quantity else None,
         "realized_pnl": round(float(realized), 2),
         "realized_r": round(float(realized / risk_amount), 4) if risk_amount > 0 else None,
         "planned_quantity": plan.planned_quantity,
         "over_position": quantity > plan.planned_quantity,
-        "entry_price_deviation_pct": round(deviation_pct, 4)
-        if deviation_pct is not None
-        else None,
+        "entry_price_deviation_pct": round(deviation_pct, 4) if deviation_pct is not None else None,
         "violations": list(unique_violations.values()),
         "rule_execution_rate": compliance,
         "plan_completeness": completeness,
@@ -210,9 +221,7 @@ def _calculate_summary(db: Session, plan: TradePlan, current_price: Decimal | No
     return summary
 
 
-def add_manual_fill(
-    db: Session, plan_id: int, payload: PlanExecutionFillCreate
-) -> dict:
+def add_manual_fill(db: Session, plan_id: int, payload: PlanExecutionFillCreate) -> dict:
     plan = _plan(db, plan_id)
     if plan.execution_status in {"draft", None}:
         raise AppError(409, "PLAN_NOT_CONFIRMED", "计划尚未确认，不能录入执行成交")
@@ -251,9 +260,7 @@ def add_manual_fill(
     return execution_detail(db, plan.id)
 
 
-def evaluate_plan_execution(
-    db: Session, plan_id: int, payload: PlanExecutionEvaluate
-) -> dict:
+def evaluate_plan_execution(db: Session, plan_id: int, payload: PlanExecutionEvaluate) -> dict:
     plan = _plan(db, plan_id)
     ordered = (
         ("invalidated", payload.invalidated, "invalidated"),
@@ -284,9 +291,7 @@ def evaluate_plan_execution(
     return execution_detail(db, plan.id, current_price=payload.current_price)
 
 
-def execution_detail(
-    db: Session, plan_id: int, current_price: Decimal | None = None
-) -> dict:
+def execution_detail(db: Session, plan_id: int, current_price: Decimal | None = None) -> dict:
     plan = _plan(db, plan_id)
     if current_price is None and plan.execution_summary:
         stored_price = plan.execution_summary.get("current_price")
@@ -302,11 +307,30 @@ def execution_detail(
         .where(PlanExecutionFill.trade_plan_id == plan.id)
         .order_by(PlanExecutionFill.executed_at, PlanExecutionFill.id)
     ).all()
+    event_payloads = [
+        {
+            "id": item.id,
+            "event_type": item.event_type,
+            "from_status": item.from_status,
+            "to_status": item.to_status,
+            "event_time": item.event_time.isoformat(),
+            "source": item.source,
+            "details": item.details,
+            "notes": item.notes,
+        }
+        for item in events
+    ]
+    lifecycle_issues = audit_legacy_event_history(event_payloads)
     return {
         "plan_id": plan.id,
         "symbol": plan.symbol,
         "plan_version": plan.plan_version,
         "execution_status": plan.execution_status,
+        "lifecycle_state": summary["lifecycle_state"],
+        "lifecycle_audit": {
+            "valid": not lifecycle_issues,
+            "issues": list(lifecycle_issues),
+        },
         "summary": summary,
         "fills": [
             {
@@ -323,18 +347,6 @@ def execution_detail(
             }
             for item in fills
         ],
-        "events": [
-            {
-                "id": item.id,
-                "event_type": item.event_type,
-                "from_status": item.from_status,
-                "to_status": item.to_status,
-                "event_time": item.event_time.isoformat(),
-                "source": item.source,
-                "details": item.details,
-                "notes": item.notes,
-            }
-            for item in events
-        ],
+        "events": event_payloads,
         "disclaimer": "成交由用户手工录入；系统不连接券商、不自动下单。",
     }

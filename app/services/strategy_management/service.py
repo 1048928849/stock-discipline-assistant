@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.domain.strategy_management import (
@@ -14,7 +14,7 @@ from app.domain.strategy_management import (
     StrategyVersion,
 )
 from app.errors import AppError
-from app.models import StrategyVersionRecord, TradePlan
+from app.models import StrategyValidationRecordModel, StrategyVersionRecord, TradePlan
 from app.services.strategy_management.lifecycle import require_transition
 from app.services.strategy_management.repository import SqlAlchemyStrategyRepository
 from app.services.trade_plan.compatibility import GENERATOR_PARAMETERS
@@ -170,6 +170,22 @@ class StrategyManagementService:
                 require_transition(current, target)
             except ValueError as exc:
                 raise AppError(409, "STRATEGY_LIFECYCLE_INVALID", str(exc)) from exc
+            if target is StrategyLifecycle.ACTIVE:
+                passed = self.db.scalar(
+                    select(StrategyValidationRecordModel.id)
+                    .where(
+                        StrategyValidationRecordModel.strategy_version_id == record.id,
+                        StrategyValidationRecordModel.status == "PASSED",
+                        StrategyValidationRecordModel.sample_size >= 30,
+                    )
+                    .limit(1)
+                )
+                if passed is None:
+                    raise AppError(
+                        409,
+                        "STRATEGY_VALIDATION_REQUIRED",
+                        "策略至少需要一条样本量不少于30且通过的验证记录才能激活",
+                    )
             now = datetime.now()  # noqa: DTZ005 - database stores local naive time
             record.status = target.value
             if target is StrategyLifecycle.ACTIVE:
@@ -247,9 +263,7 @@ class StrategyManagementService:
             result = version
         return result
 
-    def _required_version_record(
-        self, strategy_id: str, version: str
-    ) -> StrategyVersionRecord:
+    def _required_version_record(self, strategy_id: str, version: str) -> StrategyVersionRecord:
         record = self.repository.version_record(strategy_id, version)
         if record is None:
             raise AppError(404, "STRATEGY_VERSION_NOT_FOUND", "策略版本不存在")
