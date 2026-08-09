@@ -4,15 +4,46 @@
 
 - Provider: AKShare `1.18.81`, Eastmoney industry-board APIs.
 - Capability attempted: `industry.membership.native` discovery prerequisite.
+- Request type: HTTPS `GET` of the Eastmoney industry-board universe, followed only on
+  success by native constituent and board-history requests.
 - Local time zone: Asia/Shanghai.
-- Retries: 1 for the bounded probe.
-- Result: the Eastmoney industry-universe request failed through the configured proxy before
-  a provider taxonomy or constituent universe could be obtained.
-- Root exception: `ProxyError` for `17.push2.eastmoney.com`.
+- Outer timeout: 20 seconds. AKShare's request returned after 13.643 seconds, so the outer
+  timeout did not fire.
+- Retries: one bounded application probe. AKShare's internal request helper exhausted its
+  own bounded retry sequence; no application-level retry was added.
+- DNS: successful for `17.push2.eastmoney.com` (`43.144.251.121`, 0.012 seconds).
+- Direct TCP: successful on port 443 (0.037 seconds).
+- Direct TLS: successful with TLS 1.2 (0.130 seconds).
+- HTTP control request: a one-row Eastmoney request returned HTTP 200 on one direct route;
+  another route followed `17.push2delay.eastmoney.com` and ended with an unexpected TLS EOF.
+- Actual provider result: AKShare's industry-universe request failed before a usable HTTP
+  response or provider taxonomy was obtained. The root exception was
+  `requests.exceptions.ProxyError` for `17.push2.eastmoney.com`, caused by
+  `RemoteDisconnected("Remote end closed connection without response")` while connecting
+  through AKShare's request path.
+- Failure stage: not DNS, TCP, or the initial direct TLS handshake. It is the HTTP request
+  path used by AKShare (proxy/remote disconnect before an HTTP status was available).
+- Subprocess lifecycle: the provider probe ran in a child process, returned exit code 1, and
+  was reaped normally. No orphan remained.
 - Formal A-share blocker: `EXTERNAL_INDUSTRY_DATA_BLOCKED`.
 - Formal BSE blocker: `BSE_INDUSTRY_SOURCE_UNAVAILABLE`.
 
 Missing values below remain missing. They are not converted to zero, neutral, PASS, or a role.
+
+## Alternative-provider check
+
+A separate, bounded Baostock probe logged in successfully and returned one record for
+`sz.300308`: `C39计算机、通信和其他电子设备制造业` under `证监会行业分类`. It returned no
+record for `bj.920985`; logout completed, the child exited with code 0 in 1.486 seconds, and
+the subprocess was reaped normally.
+
+Baostock is therefore reachable but is not a verified substitute for this capability. Its
+record is a per-security CSRC classification, not the Eastmoney native board taxonomy used
+by the selected-stock industry's breadth series. The probe did not provide the matching
+native industry ID, exact constituent universe, board history, or amount-coverage evidence
+required by the schema contract. Mixing that classification with Eastmoney board history
+would violate the same-taxonomy/provider rule. For `920985`, the empty result supplies no BSE
+membership evidence at all. No other provider was validated with all of those contracts.
 
 ## Symbol results
 
