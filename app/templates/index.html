@@ -221,7 +221,7 @@
         <select name="market_stage"><option>SECOND_CONFIRMATION</option><option>STATE_CHANGE</option><option>ACCELERATION</option><option>CLIMAX</option><option>UNKNOWN</option></select>
         <input name="current_price" type="number" min="0.01" step="0.0001" placeholder="当前价格" required><input name="entry_low" type="number" min="0.01" step="0.0001" placeholder="计划区下沿" required><input name="entry_high" type="number" min="0.01" step="0.0001" placeholder="计划区上沿" required>
         <input name="hard_stop" type="number" min="0.01" step="0.0001" placeholder="硬止损" required><input name="proposed_quantity" type="number" min="0" step="100" placeholder="拟交易数量" required><input name="max_quantity" type="number" min="0" step="100" placeholder="计划最大数量" required>
-        <label class="checkbox-label"><input name="chase_risk" type="checkbox">CHASE_RISK</label><label class="checkbox-label"><input name="losing_add" type="checkbox">当前价格低于成本</label>
+        <label class="checkbox-label"><input name="research_after_spike" type="checkbox">研究开始于大涨后</label><label class="checkbox-label"><input name="low_authority_reason" type="checkbox">观点/情绪是主要理由</label><label class="checkbox-label"><input name="conflicted_context" type="checkbox">当前信息相互冲突</label>
         <button class="primary-action">执行纪律检查</button>
       </form>
       <div id="discipline-decision-sheet" class="discipline-decision"><div class="missing-data">纪律检查只表示该层是否阻断，不代表 Product V1 发出买入信号。</div></div>

@@ -67,3 +67,27 @@ APIs under `/api/v1/trading-discipline` cover playbooks, training programs, pre-
 checks, immutable theses, evidence, reviews, and dashboard metrics. The “交易训练 / 纪律”
 page presents N/20 progress, process score, recurring errors, independent P&L/compliance
 labels, and a pre-trade decision sheet on desktop and mobile.
+
+## A-share decision guardrails 1.0
+
+The end-to-end decision card evaluates exactly seven ordered gates:
+`INFORMATION → CHANGE → HIERARCHY → STAGE → PRICE_BEHAVIOR →
+RISK_INVALIDATION → POSITION`.
+
+Its first-class actions are `OBSERVE`, `WAIT_FOR_CONFIRMATION`,
+`EXECUTION_CANDIDATE`, and `ABANDON`. Observation is productive: it persists the evidence
+already seen, evidence still required, invalidation, and next reassessment trigger.
+`EXECUTION_CANDIDATE` remains non-executable and must still pass Product V1 authority.
+
+Hard vetoes cannot be offset by the 100-point score: `RESEARCH_STARTED_AFTER_SPIKE`,
+`LOW_AUTHORITY_PRIMARY_REASON`, `MARKET_STAGE_UNRESOLVED`, `MISSING_INVALIDATION`,
+`UPSIDE_FIRST_DECISION_PROCESS`, `POST_WIN_RISK_ESCALATION`,
+`LOSS_RECOVERY_TRADE_RISK`, and `DECISION_CONTEXT_CONFLICTED`. Observable
+`TRADE_HORIZON_DRIFT` is also blocked: a failed short-term thesis cannot silently become a
+long-term thesis. A genuinely new investment thesis requires a new linked immutable snapshot.
+
+Price behavior compares expected with actual behavior and returns
+`STRONGER_THAN_EXPECTED`, `AS_EXPECTED`, `WEAKER_THAN_EXPECTED`, or `NOT_EVALUATED`.
+It never substitutes a narrative about “main-force intention.” Account DecisionContext uses
+only observable recent win/loss, re-entry timing, risk escalation, and conflicting-information
+counts; it does not diagnose psychology.

@@ -22,7 +22,7 @@ from app.models import (
     TradingPlaybook,
     TradingTrainingProgram,
 )
-from app.trading_discipline.contracts import EvidenceTier, PreTradeContext
+from app.trading_discipline.contracts import EvidenceTier, PreTradeContext, TradeDecisionInput
 from app.trading_discipline.service import RULE_VERSION, TradingDisciplineService
 
 
@@ -180,6 +180,12 @@ def pretrade_check(payload: PreTradeContext, db: Session = Depends(get_db)):
         if result.status.value == "PASS"
         else "DISCIPLINE_CONSTRAINT_ACTIVE",
     }
+
+
+@router.post("/decision-card")
+def decision_card(payload: TradeDecisionInput):
+    """Seven ordered gates; never creates formal execution authority."""
+    return service.seven_gate_decision(payload).model_dump(mode="json")
 
 
 @router.get("/evidence")

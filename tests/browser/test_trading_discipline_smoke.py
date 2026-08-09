@@ -49,30 +49,26 @@ def test_trading_discipline_browser_smoke(page: Page, viewport: tuple[int, int])
         "playbook_quality_conclusion": None,
     }
     pretrade = {
-        "id": 1,
-        "status": "BLOCK",
-        "action": "BUY",
-        "score": 80,
-        "category_scores": {
-            "PREDEFINED_PLAYBOOK": 20,
-            "PREEXISTING_ENTRY_CONDITION": 20,
-            "PREDEFINED_INVALIDATION": 20,
-            "PREDEFINED_POSITION": 20,
-            "RULE_STABILITY": 0,
-        },
-        "reason_codes": ["ENTRY_AFTER_CLIMAX"],
+        "final_action": "OBSERVE",
+        "new_risk_blocked": True,
+        "price_behavior": "WEAKER_THAN_EXPECTED",
         "executable": False,
         "formal_authority": "DISCIPLINE_ONLY",
-        "snapshot_hash": "a" * 64,
-        "decision_meaning": "DISCIPLINE_CONSTRAINT_ACTIVE",
-        "rules": [
+        "gates": [
             {
-                "rule_code": "CHASE_RISK",
+                "rule_code": "STAGE",
                 "status": "BLOCK",
-                "reason_code": "ENTRY_AFTER_CLIMAX",
-                "effect_on_action": "BLOCK_EXPANSION",
+                "reason_code": "STAGE_NOT_SATISFIED",
+                "effect_on_action": "OBSERVE_OR_BLOCK",
             }
         ],
+        "observation_plan": {
+            "evidence_seen": ["state change"],
+            "evidence_required": ["second confirmation"],
+            "invalidation": ["hard stop"],
+            "next_reassessment_trigger": "NEXT_DAILY_CLOSE",
+        },
+        "decision_card": {"information_decision_interference": ["RESEARCH_STARTED_AFTER_SPIKE"]},
     }
     page.route(
         "**/api/v1/trading-discipline/dashboard?**",
@@ -81,7 +77,7 @@ def test_trading_discipline_browser_smoke(page: Page, viewport: tuple[int, int])
         ),
     )
     page.route(
-        "**/api/v1/trading-discipline/pretrade-check",
+        "**/api/v1/trading-discipline/decision-card",
         lambda route: route.fulfill(
             status=200, content_type="application/json", body=json.dumps(pretrade)
         ),
@@ -102,7 +98,8 @@ def test_trading_discipline_browser_smoke(page: Page, viewport: tuple[int, int])
         form.locator("input[name=proposed_quantity]").fill("100")
         form.locator("input[name=max_quantity]").fill("600")
         form.locator("button").click()
-        page.get_by_text("BLOCKED_BY_DISCIPLINE / NOT_EVALUATED", exact=True).wait_for()
+        page.get_by_text("OBSERVE", exact=True).wait_for()
+        page.get_by_text("复查触发：NEXT_DAILY_CLOSE", exact=True).wait_for()
         assert (
             page.evaluate(
                 "document.documentElement.scrollWidth > document.documentElement.clientWidth"

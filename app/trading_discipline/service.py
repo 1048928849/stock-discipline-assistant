@@ -5,8 +5,10 @@ from decimal import Decimal
 from app.domain.hashing import canonical_hash
 from app.trading_discipline.contracts import (
     DetectionStatus,
+    DecisionGateName,
     DivergenceAssessment,
     EvidenceTier,
+    FinalAction,
     EvidenceAuthorityResult,
     GateStatus,
     MarketStage,
@@ -17,10 +19,15 @@ from app.trading_discipline.contracts import (
     ProposedAction,
     ConfirmationBiasInput,
     ProcessConflictResult,
+    ObservationPlan,
+    PriceBehaviorAssessment,
     RuleEvaluation,
     StageAssessment,
     StageEvidence,
     StressStatus,
+    SevenGateDecision,
+    TradeDecisionCard,
+    TradeDecisionInput,
 )
 
 
@@ -511,6 +518,174 @@ class TradingDisciplineService:
         if data_quality not in {"VERIFIED_TICK", "VERIFIED_L2", "VERIFIED_MINUTE"}:
             return DivergenceAssessment.INSUFFICIENT_DATA
         return DivergenceAssessment.UNKNOWN
+
+    def seven_gate_decision(self, item: TradeDecisionInput) -> SevenGateDecision:
+        vetoes: list[str] = []
+        context = item.decision_context
+        if item.research_started_after_spike:
+            vetoes.append("RESEARCH_STARTED_AFTER_SPIKE")
+        if item.information_is_primary_reason and item.information_tier in {
+            EvidenceTier.ANALYSIS,
+            EvidenceTier.SENTIMENT,
+        }:
+            vetoes.append("LOW_AUTHORITY_PRIMARY_REASON")
+        if item.market_stage is MarketStage.UNKNOWN:
+            vetoes.append("MARKET_STAGE_UNRESOLVED")
+        if not item.invalidation:
+            vetoes.append("MISSING_INVALIDATION")
+        if item.upside_first_process:
+            vetoes.append("UPSIDE_FIRST_DECISION_PROCESS")
+        if (
+            context.recent_large_win_pct is not None
+            and context.recent_large_win_pct >= Decimal("10")
+            and context.previous_risk_pct is not None
+            and context.proposed_risk_pct is not None
+            and context.proposed_risk_pct > context.previous_risk_pct * Decimal("1.5")
+        ):
+            vetoes.append("POST_WIN_RISK_ESCALATION")
+        if (
+            context.recent_large_loss_pct is not None
+            and context.recent_large_loss_pct <= Decimal("-5")
+            and context.sessions_since_loss_exit is not None
+            and context.sessions_since_loss_exit <= 2
+        ):
+            vetoes.append("LOSS_RECOVERY_TRADE_RISK")
+        if context.conflicting_information_count >= 3:
+            vetoes.append("DECISION_CONTEXT_CONFLICTED")
+        if (
+            item.original_trade_horizon
+            and item.proposed_trade_horizon
+            and item.original_trade_horizon != item.proposed_trade_horizon
+            and (item.original_thesis_failed or item.invalidation_triggered)
+        ):
+            vetoes.append("TRADE_HORIZON_DRIFT")
+        if item.post_position_information_search and item.position_stress is StressStatus.CRITICAL:
+            vetoes.extend(["POST_POSITION_NEW_REASON", "POSITION_ABOVE_PLAN"])
+        if item.expected_behavior_score is None or item.actual_behavior_score is None:
+            behavior = PriceBehaviorAssessment.NOT_EVALUATED
+        elif item.actual_behavior_score > item.expected_behavior_score:
+            behavior = PriceBehaviorAssessment.STRONGER_THAN_EXPECTED
+        elif item.actual_behavior_score < item.expected_behavior_score:
+            behavior = PriceBehaviorAssessment.WEAKER_THAN_EXPECTED
+        else:
+            behavior = PriceBehaviorAssessment.AS_EXPECTED
+
+        gate_specs = [
+            (
+                DecisionGateName.INFORMATION,
+                item.information_tier is not None
+                and not (
+                    item.information_is_primary_reason
+                    and item.information_tier in {EvidenceTier.ANALYSIS, EvidenceTier.SENTIMENT}
+                ),
+                "INFORMATION_AUTHORITY_ACCEPTABLE",
+            ),
+            (
+                DecisionGateName.CHANGE,
+                item.state_change_status in {DetectionStatus.CANDIDATE, DetectionStatus.CONFIRMED},
+                "STATE_CHANGE_EVIDENCE_PRESENT",
+            ),
+            (
+                DecisionGateName.HIERARCHY,
+                bool(item.stock_hierarchy_role and item.stock_hierarchy_role != "UNKNOWN"),
+                "HIERARCHY_VERIFIED",
+            ),
+            (
+                DecisionGateName.STAGE,
+                item.market_stage is not MarketStage.UNKNOWN,
+                "MARKET_STAGE_RESOLVED",
+            ),
+            (
+                DecisionGateName.PRICE_BEHAVIOR,
+                behavior is not PriceBehaviorAssessment.NOT_EVALUATED,
+                f"PRICE_BEHAVIOR_{behavior.value}",
+            ),
+            (
+                DecisionGateName.RISK_INVALIDATION,
+                bool(item.invalidation) and not item.invalidation_triggered,
+                "INVALIDATION_DEFINED_AND_INTACT",
+            ),
+            (
+                DecisionGateName.POSITION,
+                item.position_stress is not StressStatus.CRITICAL,
+                "POSITION_WITHIN_OBJECTIVE_LIMITS",
+            ),
+        ]
+        gates = [
+            RuleEvaluation(
+                rule_code=name.value,
+                status=GateStatus.PASS
+                if passed
+                else (
+                    GateStatus.BLOCK
+                    if name in {DecisionGateName.RISK_INVALIDATION, DecisionGateName.POSITION}
+                    else GateStatus.NOT_EVALUATED
+                ),
+                required_inputs=[name.value.lower()],
+                evaluated_inputs=[name.value.lower()] if passed else [],
+                missing_inputs=[] if passed else [name.value.lower()],
+                evidence={},
+                reason_code=reason if passed else f"{name.value}_NOT_SATISFIED",
+                effect_on_action="NONE" if passed else "OBSERVE_OR_BLOCK",
+                source_refs=[],
+            )
+            for name, passed, reason in gate_specs
+        ]
+        hard_abandon = (
+            item.invalidation_triggered or item.original_thesis_failed or bool(item.upstream_blocks)
+        )
+        if hard_abandon:
+            final = FinalAction.ABANDON
+        elif vetoes:
+            final = FinalAction.OBSERVE
+        elif (
+            item.state_change_status in {DetectionStatus.CANDIDATE, DetectionStatus.CONFIRMED}
+            and not item.second_confirmation_present
+        ):
+            final = FinalAction.WAIT_FOR_CONFIRMATION
+        elif all(g.status is GateStatus.PASS for g in gates):
+            final = FinalAction.EXECUTION_CANDIDATE
+        else:
+            final = FinalAction.OBSERVE
+        observation = ObservationPlan(
+            evidence_seen=item.evidence_seen,
+            evidence_required=item.evidence_required
+            or [g.rule_code for g in gates if g.status is not GateStatus.PASS],
+            invalidation=item.invalidation,
+            next_reassessment_trigger=item.next_reassessment_trigger
+            or "NEXT_DAILY_CLOSE_OR_NEW_VERIFIED_FACT",
+        )
+        interference = list(dict.fromkeys(vetoes + item.upstream_blocks))
+        card = TradeDecisionCard(
+            new_variable=item.new_variable,
+            information_tier=item.information_tier,
+            stock_hierarchy_role=item.stock_hierarchy_role,
+            market_stage=item.market_stage,
+            why_researching_now=item.why_researching_now,
+            expected_behavior_if_thesis_correct=item.expected_behavior,
+            invalidation=item.invalidation,
+            position_rationale=item.position_rationale,
+            information_decision_interference=interference,
+            final_action=final,
+        )
+        payload = {
+            "input": item.model_dump(mode="json"),
+            "gates": [gate.model_dump(mode="json") for gate in gates],
+            "vetoes": vetoes,
+            "behavior": behavior.value,
+            "final": final.value,
+            "observation": observation.model_dump(mode="json"),
+        }
+        return SevenGateDecision(
+            gates=gates,
+            veto_reason_codes=list(dict.fromkeys(vetoes)),
+            price_behavior=behavior,
+            observation_plan=observation,
+            decision_card=card,
+            final_action=final,
+            new_risk_blocked=final in {FinalAction.OBSERVE, FinalAction.ABANDON},
+            decision_hash=canonical_hash(payload),
+        )
 
 
 __all__ = ["PLAYBOOK_CODE", "RULE_VERSION", "SCORE_CATEGORIES", "TradingDisciplineService"]

@@ -257,3 +257,103 @@ class EvidenceAuthorityResult(Contract):
     may_modify_formal_plan: bool = False
     formal_execution_authority: bool = False
     requires_validation: bool
+
+
+class DecisionGateName(str, Enum):
+    INFORMATION = "INFORMATION"
+    CHANGE = "CHANGE"
+    HIERARCHY = "HIERARCHY"
+    STAGE = "STAGE"
+    PRICE_BEHAVIOR = "PRICE_BEHAVIOR"
+    RISK_INVALIDATION = "RISK_INVALIDATION"
+    POSITION = "POSITION"
+
+
+class FinalAction(str, Enum):
+    OBSERVE = "OBSERVE"
+    WAIT_FOR_CONFIRMATION = "WAIT_FOR_CONFIRMATION"
+    EXECUTION_CANDIDATE = "EXECUTION_CANDIDATE"
+    ABANDON = "ABANDON"
+
+
+class PriceBehaviorAssessment(str, Enum):
+    STRONGER_THAN_EXPECTED = "STRONGER_THAN_EXPECTED"
+    AS_EXPECTED = "AS_EXPECTED"
+    WEAKER_THAN_EXPECTED = "WEAKER_THAN_EXPECTED"
+    NOT_EVALUATED = "NOT_EVALUATED"
+
+
+class DecisionContext(Contract):
+    recent_large_win_pct: Decimal | None = None
+    recent_large_loss_pct: Decimal | None = None
+    sessions_since_loss_exit: int | None = None
+    previous_risk_pct: Decimal | None = None
+    proposed_risk_pct: Decimal | None = None
+    conflicting_information_count: int = 0
+
+
+class ObservationPlan(Contract):
+    evidence_seen: list[str]
+    evidence_required: list[str]
+    invalidation: list[str]
+    next_reassessment_trigger: str
+
+
+class TradeDecisionInput(Contract):
+    symbol: str
+    decision_at: datetime
+    new_variable: str | None = None
+    information_tier: EvidenceTier | None = None
+    information_is_primary_reason: bool = False
+    stock_hierarchy_role: str | None = None
+    market_stage: MarketStage = MarketStage.UNKNOWN
+    why_researching_now: str | None = None
+    research_started_after_spike: bool = False
+    state_change_status: DetectionStatus = DetectionStatus.NOT_EVALUATED
+    second_confirmation_present: bool = False
+    expected_behavior: list[str] = Field(default_factory=list)
+    actual_behavior: list[str] = Field(default_factory=list)
+    actual_behavior_score: Decimal | None = None
+    expected_behavior_score: Decimal | None = None
+    invalidation: list[str] = Field(default_factory=list)
+    invalidation_triggered: bool = False
+    position_rationale: str | None = None
+    proposed_action: ProposedAction = ProposedAction.BUY
+    position_stress: StressStatus = StressStatus.NORMAL
+    post_position_information_search: bool = False
+    upside_first_process: bool = False
+    original_trade_horizon: str | None = None
+    proposed_trade_horizon: str | None = None
+    original_thesis_failed: bool = False
+    evidence_seen: list[str] = Field(default_factory=list)
+    evidence_required: list[str] = Field(default_factory=list)
+    next_reassessment_trigger: str | None = None
+    decision_context: DecisionContext = Field(default_factory=DecisionContext)
+    upstream_blocks: list[str] = Field(default_factory=list)
+
+
+class TradeDecisionCard(Contract):
+    new_variable: str | None
+    information_tier: EvidenceTier | None
+    stock_hierarchy_role: str | None
+    market_stage: MarketStage
+    why_researching_now: str | None
+    expected_behavior_if_thesis_correct: list[str]
+    invalidation: list[str]
+    position_rationale: str | None
+    information_decision_interference: list[str]
+    final_action: FinalAction
+
+
+class SevenGateDecision(Contract):
+    gates: list[RuleEvaluation]
+    veto_reason_codes: list[str]
+    price_behavior: PriceBehaviorAssessment
+    observation_plan: ObservationPlan
+    decision_card: TradeDecisionCard
+    final_action: FinalAction
+    new_risk_blocked: bool
+    executable: bool = False
+    formal_authority: str = "DISCIPLINE_ONLY"
+    rule_version: str = "A_SHARE_DECISION_GUARDRAILS_1.0.0"
+    decision_hash: str
