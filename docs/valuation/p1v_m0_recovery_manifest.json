@@ -1,0 +1,137 @@
+{
+  "program": "P1V-M0",
+  "status": "VALUATION_GOLDEN_PARTIAL",
+  "method": {
+    "method_id": "ORIGINAL_EPS_PE_TARGET_PRICE",
+    "version": "UNRESOLVED",
+    "purpose": "Recover the historical target-price calculation without replacing or improving it.",
+    "proven_framework": [
+      "estimate future EPS or earnings",
+      "assign PE multiples to forecast periods or scenarios",
+      "target_price = forecast_eps * target_pe",
+      "compare target price with a historical reference price",
+      "calculate upside or downside"
+    ],
+    "formula_status": "DERIVED_SUMMARY_ONLY",
+    "golden_complete": false,
+    "missing_critical_fields": [
+      "calculation_date",
+      "reference_price",
+      "reference_price_date",
+      "financial_data_as_of",
+      "forecast_years",
+      "forecast_eps_or_derivation_inputs",
+      "pe_assignments",
+      "scenario_rules",
+      "historical_target_prices",
+      "historical_upside_downside",
+      "rounding_rules"
+    ]
+  },
+  "contexts": {
+    "HISTORICAL_REPRODUCTION": {
+      "description": "Uses immutable original as-of inputs and must reproduce the original outputs.",
+      "available": false,
+      "block_reason": "No complete primary calculation evidence was recovered."
+    },
+    "CURRENT_ANALYSIS": {
+      "description": "Will use current trusted data plus explicit current assumptions in P1V-M1.",
+      "available": false,
+      "block_reason": "P1V-M1 numerical implementation is blocked while the historical method remains unresolved."
+    }
+  },
+  "authority": {
+    "classification": "RESEARCH_EVIDENCE",
+    "executable": false,
+    "cannot": [
+      "create ENTRY_ALLOWED",
+      "override NO_TRADE",
+      "loosen a hard stop",
+      "raise a formal position cap",
+      "override a P1T hard veto",
+      "make CSV_V2 executable",
+      "auto-confirm or freeze a plan",
+      "execute an order"
+    ],
+    "high_upside_is_execution_permission": false
+  },
+  "stocks": [
+    {
+      "stock_code": "300308",
+      "company": "中际旭创",
+      "explicitly_recovered": [],
+      "inferred": [],
+      "golden_values": [],
+      "missing_evidence": "Original valuation calculation date, as-of inputs, forecast years, EPS/profit values, PE assignments, scenarios, target prices, reference price and rounding are absent.",
+      "confidence": "INSUFFICIENT_FOR_GOLDEN"
+    },
+    {
+      "stock_code": "600406",
+      "company": "国电南瑞",
+      "explicitly_recovered": [],
+      "inferred": [],
+      "golden_values": [],
+      "missing_evidence": "No original calculation artifact or numerical input/output was recovered.",
+      "confidence": "INSUFFICIENT_FOR_GOLDEN"
+    },
+    {
+      "stock_code": "002112",
+      "company": "三变科技",
+      "explicitly_recovered": [],
+      "inferred": [],
+      "golden_values": [],
+      "missing_evidence": "No original calculation artifact or numerical input/output was recovered.",
+      "confidence": "INSUFFICIENT_FOR_GOLDEN"
+    }
+  ],
+  "evidence": [
+    {
+      "id": "E1",
+      "classification": "DERIVED_SUMMARY",
+      "source_artifact": "P1V-M0 program attachment",
+      "source_location": "pasted-text.txt:62-76",
+      "finding": "States the EPS/earnings -> PE -> target price -> upside/downside framework but explicitly says it is insufficient and forbids inference of missing assumptions.",
+      "may_establish_golden_numbers": false
+    },
+    {
+      "id": "E2",
+      "classification": "SECONDARY_REFERENCE",
+      "source_artifact": "Phase 1 Master Program attachment",
+      "source_location": "pasted-text.txt:920-983",
+      "finding": "Explicitly records that the exact calculation method for all three companies is not present in the supplied repository context and prohibits replacement with generic PE, PEG, DCF, analyst consensus or industry PE.",
+      "may_establish_golden_numbers": false
+    },
+    {
+      "id": "E3",
+      "classification": "UNRELATED",
+      "source_artifact": "app/services/company_research.py",
+      "source_location": "app/services/company_research.py:252-262",
+      "finding": "Current product derives implied growth scenarios from PE history; it is not evidence of the historical target-price method.",
+      "may_establish_golden_numbers": false
+    },
+    {
+      "id": "E4",
+      "classification": "UNRELATED",
+      "source_artifact": "ChatGPT conversation 选股方法分析",
+      "source_location": "thread 6a6d7fb5-aae8-83ea-8f0a-70c1f086f804, turns 22d2e926-d549-46dc-83a7-d07d11d9c6c8 and bfd301ab-2249-48b2-ba10-4b3e12969e37",
+      "finding": "The recovered 980/981.33 material is an intraday VWAP/cost-anchor calculation and explicitly says it is not a PE valuation target.",
+      "may_establish_golden_numbers": false
+    },
+    {
+      "id": "E5",
+      "classification": "SECONDARY_REFERENCE",
+      "source_artifact": "ChatGPT conversation 中际旭创跳水分析",
+      "source_location": "thread 6a7575d0-92dc-83ea-8066-0b27e81eebb3",
+      "finding": "Contains current fundamental and valuation-risk discussion, but no original three-stock target-price calculation inputs or outputs.",
+      "may_establish_golden_numbers": false
+    }
+  ],
+  "data_source_gap_analysis": [
+    {"input": "historical reference price and date", "classification": "HISTORICAL_VALUE_REQUIRED"},
+    {"input": "reported profit and shares outstanding", "classification": "AUTO_TRUSTED"},
+    {"input": "original manually estimated forecast profit or EPS", "classification": "MANUAL_REQUIRED"},
+    {"input": "original PE assignment", "classification": "HISTORICAL_VALUE_REQUIRED"},
+    {"input": "original scenario definitions", "classification": "HISTORICAL_VALUE_REQUIRED"},
+    {"input": "future current trusted financial data", "classification": "AUTO_SINGLE_SOURCE"}
+  ]
+}
