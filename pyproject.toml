@@ -35,6 +35,8 @@ dev = [
   "pytest-cov>=5,<7",
   "ruff>=0.15.22,<0.16",
   "mypy>=1.11,<3",
+  "playwright>=1.50,<2",
+  "pytest-playwright>=0.7,<1",
 ]
 
 [tool.setuptools.packages.find]
@@ -49,6 +51,7 @@ markers = [
   "baostock_integration: requires the real BaoStock remote service",
   "market_breadth_integration: requires local FreeStockDB and real AKShare network",
   "selected_stock_integration: requires real public stock, BaoStock, and AKShare network",
+  "browser_smoke: requires a running local app and Playwright Chromium",
 ]
 
 [tool.ruff]

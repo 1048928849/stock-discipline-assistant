@@ -91,12 +91,60 @@ jobs:
           connection.close(); engine.dispose()"
       - run: python -m pytest -m mysql_integration
 
+  browser-smoke:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: sqlite:////tmp/stock-discipline-browser-smoke.db
+      SCHEDULER_ENABLED: "false"
+      BROWSER_SMOKE_BASE_URL: http://127.0.0.1:8765
+      BROWSER_SMOKE_ARTIFACTS: browser-smoke-artifacts
+      RUN_BROWSER_SMOKE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m playwright install --with-deps chromium
+      - name: Upgrade temporary SQLite database
+        run: python -m alembic upgrade head
+      - name: Run deterministic desktop and mobile smoke
+        run: |
+          python -m uvicorn app.main:app --host 127.0.0.1 --port 8765 > /tmp/browser-smoke-server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          python - <<'PY'
+          import time
+          import urllib.request
+
+          for _ in range(60):
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:8765/selected-stock-analysis") as response:
+                      if response.status == 200:
+                          break
+              except Exception:
+                  time.sleep(0.25)
+          else:
+              raise SystemExit("local app did not become ready")
+          PY
+          python -m pytest tests/browser/test_selected_stock_smoke.py --browser chromium
+      - name: Upload browser smoke artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-smoke-artifacts
+          path: |
+            browser-smoke-artifacts
+            /tmp/browser-smoke-server.log
+
   required:
     if: always()
     needs:
       - quality
       - sqlite
       - mysql8
+      - browser-smoke
     runs-on: ubuntu-latest
     steps:
       - name: Require all validation jobs
@@ -104,7 +152,9 @@ jobs:
           QUALITY_RESULT: ${{ needs.quality.result }}
           SQLITE_RESULT: ${{ needs.sqlite.result }}
           MYSQL_RESULT: ${{ needs.mysql8.result }}
+          BROWSER_SMOKE_RESULT: ${{ needs.browser-smoke.result }}
         run: |
           test "$QUALITY_RESULT" = success
           test "$SQLITE_RESULT" = success
           test "$MYSQL_RESULT" = success
+          test "$BROWSER_SMOKE_RESULT" = success
