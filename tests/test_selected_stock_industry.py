@@ -160,13 +160,17 @@ def _seed_industry(session, *, ready_members: int = 5) -> tuple[list[dict], Sour
         for index, day in enumerate(sessions)
     ]
     lineage = SourceLineage(
-        capability="fundamental.profile",
-        provider_id="fixture-profile",
+        capability="industry.membership.native",
+        provider_id="selected-industry-fixture",
         source="fixture",
         row_count=1,
         observed_at=NOW,
         fetched_at=NOW,
         response_digest="a" * 64,
+        details={
+            "classification_system": "EASTMONEY_INDUSTRY",
+            "provider_industry_id": constituent_subject.subject_id,
+        },
     )
     return industry_rows, lineage
 

@@ -119,6 +119,14 @@ def industry_constituents_subject(industry: str) -> SubjectRef:
     )
 
 
+def industry_membership_subject(symbol: str) -> SubjectRef:
+    return SubjectRef(
+        subject_type="stock",
+        subject_id=_required_component(symbol, name="symbol"),
+        semantic_key="industry-membership/native",
+    )
+
+
 def industry_universe_subject(*, constituents: bool = False) -> SubjectRef:
     return SubjectRef(
         subject_type="market",
@@ -196,6 +204,7 @@ __all__ = [
     "company_industry_chain_subject",
     "index_daily_subject",
     "industry_constituents_subject",
+    "industry_membership_subject",
     "industry_capital_flow_subject",
     "industry_universe_subject",
     "market_amount_subject",

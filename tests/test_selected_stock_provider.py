@@ -28,6 +28,8 @@ from app.providers.selected_stock_history_worker import (
     _frame_rows,
     process,
 )
+from app.providers.akshare_provider import AKShareProvider
+from app.data_hub.contracts import IndustryConstituent, ProviderUnavailableError
 
 
 @pytest.mark.parametrize(
@@ -48,6 +50,54 @@ def test_selected_stock_worker_maps_exchange_prefixes(symbol, expected):
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 FETCHED = datetime(2026, 7, 31, 16, 0, tzinfo=SHANGHAI)
+
+
+def test_native_industry_membership_requires_exact_constituent_inclusion(monkeypatch):
+    provider = AKShareProvider(now_fn=lambda: FETCHED)
+    monkeypatch.setattr(provider, "list_industries", lambda: ["通信设备", "电子元件"])
+
+    def members(industry):
+        symbol = "300308" if industry == "通信设备" else "300502"
+        return [
+            IndustryConstituent(
+                industry=industry,
+                symbol=symbol,
+                name=symbol,
+                weight=None,
+                observed_at=FETCHED,
+                source="fixture",
+                fetched_at=FETCHED,
+            )
+        ]
+
+    monkeypatch.setattr(provider, "get_industry_constituents", members)
+    result = provider.get_native_industry_membership("300308", date(2026, 7, 31))
+    assert len(result) == 1
+    assert result[0].classification_system == "EASTMONEY_INDUSTRY"
+    assert result[0].provider_industry_name == "通信设备"
+    assert result[0].membership_evidence.startswith("300308 present")
+
+
+def test_native_industry_membership_does_not_fuzzy_match(monkeypatch):
+    provider = AKShareProvider(now_fn=lambda: FETCHED)
+    monkeypatch.setattr(provider, "list_industries", lambda: ["通信设备"])
+    monkeypatch.setattr(
+        provider,
+        "get_industry_constituents",
+        lambda industry: [
+            IndustryConstituent(
+                industry=industry,
+                symbol="300502",
+                name="fixture",
+                weight=None,
+                observed_at=FETCHED,
+                source="fixture",
+                fetched_at=FETCHED,
+            )
+        ],
+    )
+    with pytest.raises(ProviderUnavailableError, match="INDUSTRY_MEMBERSHIP_NOT_FOUND"):
+        provider.get_native_industry_membership("300308", date(2026, 7, 31))
 
 
 def _response(**updates):

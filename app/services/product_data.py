@@ -34,6 +34,7 @@ from app.models import (
     IndustryChain,
     IndustryChainNode,
     IndustryConstituentSnapshot,
+    IndustryTaxonomyBinding,
     IndustryMarketSnapshot,
     MappingEvidence,
     MarketAmountSnapshot,
@@ -51,6 +52,7 @@ PRODUCT_CAPABILITIES = frozenset(
         "market.amount.daily",
         "market.industry.daily",
         "market.industry.constituents",
+        "industry.membership.native",
         "company.concepts",
         "company.industry_chain",
     }
@@ -309,6 +311,34 @@ def _persist_constituents(db: Session, result: ProviderResult, rows: list[dict])
     return len(rows)
 
 
+def _persist_industry_membership(
+    db: Session, result: ProviderResult, rows: list[dict]
+) -> int:
+    symbol = result.subject.subject_id
+    for row in rows:
+        if str(row["symbol"]) != symbol:
+            raise ProviderUnavailableError("industry membership symbol does not match subject")
+        db.add(
+            IndustryTaxonomyBinding(
+                symbol=symbol,
+                classification_system=row["classification_system"],
+                provider_id=result.provider_id,
+                provider_industry_id=row["provider_industry_id"],
+                provider_industry_code=row.get("provider_industry_code"),
+                provider_industry_name=row["provider_industry_name"],
+                level=row["level"],
+                effective_date=row["effective_date"],
+                observed_at=_observed_at(row, result),
+                fetched_at=_fetched_at(row, result),
+                source_reference=row["source"],
+                response_digest=result.normalized_digest or "",
+                membership_evidence=row["membership_evidence"],
+                quality_record_id=result.quality_record_id,
+            )
+        )
+    return len(rows)
+
+
 def _persist_concepts(db: Session, result: ProviderResult, rows: list[dict]) -> int:
     symbol = result.subject.subject_id
     db.execute(delete(CompanyConcept).where(CompanyConcept.symbol == symbol))
@@ -433,6 +463,7 @@ _PERSISTERS = {
     "market.amount.daily": _persist_amount,
     "market.industry.daily": _persist_industry,
     "market.industry.constituents": _persist_constituents,
+    "industry.membership.native": _persist_industry_membership,
     "company.concepts": _persist_concepts,
     "company.industry_chain": _persist_chain,
 }
@@ -569,6 +600,17 @@ def _stored_rows(
                     IndustryConstituentSnapshot.quality_record_id == quality_record_id,
                 )
                 .order_by(IndustryConstituentSnapshot.symbol)
+            )
+        )
+    if capability == "industry.membership.native":
+        return list(
+            db.scalars(
+                select(IndustryTaxonomyBinding)
+                .where(
+                    IndustryTaxonomyBinding.symbol == subject.subject_id,
+                    IndustryTaxonomyBinding.quality_record_id == quality_record_id,
+                )
+                .order_by(IndustryTaxonomyBinding.provider_industry_id)
             )
         )
     if capability == "company.concepts":

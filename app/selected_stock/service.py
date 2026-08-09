@@ -40,6 +40,7 @@ from app.models import (
     MarketRegimeSnapshot,
     SelectedStockAnalysisRun,
     Trade,
+    IndustryTaxonomyBinding,
 )
 from app.selected_stock.contracts import (
     AccountContext,
@@ -54,6 +55,7 @@ from app.selected_stock.indicators import calculate_indicators
 from app.selected_stock.industry import SelectedStockIndustryContextProvider
 from app.selected_stock.strategy import CycleStructureValidationStrategyV2
 from app.services.market_cache import mapping_series_bars, replace_market_series
+from app.services.product_data import persist_product_result
 from app.services.research_cache import persist_company_profile
 
 
@@ -307,6 +309,60 @@ class SelectedStockAnalysisService:
         except Exception:
             return (profile.industry if profile else None), None
 
+    def _native_industry_membership(
+        self, symbol: str, analysis_date: date
+    ) -> tuple[str | None, SourceLineage | None]:
+        binding = self.db.scalar(
+            select(IndustryTaxonomyBinding)
+            .where(
+                IndustryTaxonomyBinding.symbol == symbol,
+                IndustryTaxonomyBinding.effective_date <= analysis_date,
+            )
+            .order_by(
+                IndustryTaxonomyBinding.effective_date.desc(),
+                IndustryTaxonomyBinding.id.desc(),
+            )
+        )
+        try:
+            result = self.router.get_native_industry_membership(symbol, analysis_date)
+            persist_product_result(self.db, self.router, result)
+            binding = self.db.scalar(
+                select(IndustryTaxonomyBinding)
+                .where(IndustryTaxonomyBinding.quality_record_id == result.quality_record_id)
+                .order_by(IndustryTaxonomyBinding.id)
+            )
+        except Exception:
+            pass
+        if binding is None:
+            return None, None
+        record = self.db.get(DataQualityRecord, binding.quality_record_id)
+        if record is None or record.quality_status not in {
+            HubQualityStatus.VERIFIED.value,
+            HubQualityStatus.SINGLE_SOURCE.value,
+        }:
+            return None, None
+        observed_at = _aware_record_time(record, binding.observed_at)
+        fetched_at = _aware_record_time(record, binding.fetched_at)
+        return binding.provider_industry_name, SourceLineage(
+            capability="industry.membership.native",
+            provider_id=binding.provider_id,
+            source=binding.source_reference,
+            row_count=1,
+            observed_at=observed_at,
+            fetched_at=fetched_at,
+            response_digest=binding.response_digest,
+            details={
+                "quality_record_id": binding.quality_record_id,
+                "classification_system": binding.classification_system,
+                "provider_industry_id": binding.provider_industry_id,
+                "provider_industry_code": binding.provider_industry_code,
+                "provider_industry_name": binding.provider_industry_name,
+                "level": binding.level,
+                "effective_date": binding.effective_date.isoformat(),
+                "membership_evidence": binding.membership_evidence,
+            },
+        )
+
     def _industry_series(
         self, industry: str | None, start: date, end: date
     ) -> _SeriesData | None:
@@ -323,6 +379,20 @@ class SelectedStockAnalysisService:
             return self._persist_result(result=result, subject=subject, through=end)
         except Exception:
             return cached
+
+    def _refresh_native_industry_evidence(
+        self, industry_name: str | None, start: date, end: date
+    ) -> None:
+        if not industry_name:
+            return
+        for fetch in (
+            lambda: self.router.get_industry_daily(industry_name, start, end),
+            lambda: self.router.get_industry_constituents(industry_name),
+        ):
+            try:
+                persist_product_result(self.db, self.router, fetch())
+            except Exception:
+                continue
 
     def _market_context(self, analysis_date: date) -> tuple[ContextStatus, dict[str, Any]]:
         snapshot = self.db.scalar(
@@ -552,7 +622,13 @@ class SelectedStockAnalysisService:
         with self.db.begin_nested():
             stock = self._stock_series(request.stock_code, start, analysis_date)
             benchmark = self._benchmark_series(start, analysis_date)
-            industry_name, profile_lineage = self._company_profile(request.stock_code)
+            self._company_profile(request.stock_code)
+            industry_name, profile_lineage = self._native_industry_membership(
+                request.stock_code, analysis_date
+            )
+            self._refresh_native_industry_evidence(
+                industry_name, start, analysis_date
+            )
             industry = self._industry_series(industry_name, start, analysis_date)
 
             stock_rows = _rows(stock.bars, through=analysis_date)

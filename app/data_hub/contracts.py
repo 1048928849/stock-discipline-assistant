@@ -135,6 +135,21 @@ class IndustryConstituent:
 
 
 @dataclass(frozen=True)
+class IndustryMembership:
+    symbol: str
+    classification_system: str
+    provider_industry_id: str
+    provider_industry_code: str | None
+    provider_industry_name: str
+    level: str
+    effective_date: date
+    membership_evidence: str
+    observed_at: datetime
+    source: str
+    fetched_at: datetime
+
+
+@dataclass(frozen=True)
 class IndustryCapitalFlow:
     industry_key: str
     industry_name: str

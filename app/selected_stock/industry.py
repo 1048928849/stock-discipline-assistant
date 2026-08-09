@@ -143,7 +143,7 @@ class SelectedStockIndustryContextProvider:
         self.calendar = calendar or get_trading_calendar()
 
     def _constituents(
-        self, industry: str, analysis_date: date
+        self, industry: str, analysis_date: date, *, provider_id: str
     ) -> tuple[list[IndustryConstituentSnapshot], DataQualityRecord | None]:
         subject = industry_constituents_subject(industry)
         record = self.db.scalar(
@@ -155,6 +155,7 @@ class SelectedStockIndustryContextProvider:
                 DataQualityRecord.semantic_key == subject.semantic_key,
                 DataQualityRecord.persisted.is_(True),
                 DataQualityRecord.quality_status.in_(TRUSTED),
+                DataQualityRecord.provider_id == provider_id,
             )
             .order_by(DataQualityRecord.observed_at.desc(), DataQualityRecord.id.desc())
         )
@@ -260,9 +261,14 @@ class SelectedStockIndustryContextProvider:
             return _empty("INDUSTRY_MAPPING_UNAVAILABLE")
         mapping = IndustryMapping(
             symbol=symbol,
-            industry_id=industry_constituents_subject(industry_name).subject_id,
+            industry_id=str(
+                profile_lineage.details.get("provider_industry_id")
+                or industry_constituents_subject(industry_name).subject_id
+            ),
             industry_name=industry_name,
-            classification_system="PROVIDER_INDUSTRY_CLASSIFICATION",
+            classification_system=str(
+                profile_lineage.details.get("classification_system") or "UNKNOWN"
+            ),
             effective_date=analysis_date,
             provider=profile_lineage.provider_id,
             source_reference=profile_lineage.capability,
@@ -278,7 +284,11 @@ class SelectedStockIndustryContextProvider:
         ):
             result = _empty("INDUSTRY_HISTORY_INSUFFICIENT_OR_MISALIGNED", mapping=mapping)
             return result.model_copy(update={"history_row_count": len(history)})
-        constituents, constituent_record = self._constituents(industry_name, analysis_date)
+        constituents, constituent_record = self._constituents(
+            industry_name,
+            analysis_date,
+            provider_id=profile_lineage.provider_id,
+        )
         if constituent_record is None or not constituents:
             result = _empty("INDUSTRY_CONSTITUENTS_UNAVAILABLE", mapping=mapping)
             return result.model_copy(update={"history_row_count": len(history)})

@@ -10,6 +10,7 @@ from app.data_hub.contracts import (
     FundamentalDataProvider,
     IndustryConstituent,
     IndustryDaily,
+    IndustryMembership,
     IndustryConceptProvider,
     IntradayBar,
     MarketAmountDaily,
@@ -20,6 +21,7 @@ from app.data_hub.contracts import (
     Quote,
     TurnoverDaily,
 )
+from app.data_hub.market_subjects import industry_constituents_subject
 from app.data_hub.trading_calendar import (
     TradingCalendar,
     get_trading_calendar,
@@ -78,7 +80,7 @@ class AKShareProvider(
                 "fundamental.valuation",
                 "announcement.catalog",
                 "announcement.daily",
-                "industry.membership",
+                "industry.membership.native",
                 "company.concepts",
                 "company.industry_chain",
                 "news.company",
@@ -824,6 +826,55 @@ class AKShareProvider(
         if not rows:
             raise ProviderUnavailableError("industry constituents returned no rows")
         return rows
+
+    def get_native_industry_membership(
+        self, symbol: str, analysis_date: date
+    ) -> list[IndustryMembership]:
+        """Resolve Eastmoney native membership by exact constituent inclusion.
+
+        Company-profile industry text is deliberately not used as an identifier.
+        """
+
+        fetched_at = self._aware_now()
+        matches: list[IndustryMembership] = []
+        try:
+            for industry in self.list_industries():
+                members = self.get_industry_constituents(industry)
+                if not any(member.symbol == symbol for member in members):
+                    continue
+                provider_id = industry_constituents_subject(industry).subject_id
+                matches.append(
+                    IndustryMembership(
+                        symbol=symbol,
+                        classification_system="EASTMONEY_INDUSTRY",
+                        provider_industry_id=provider_id,
+                        provider_industry_code=None,
+                        provider_industry_name=industry,
+                        level="PROVIDER_NATIVE",
+                        effective_date=analysis_date,
+                        membership_evidence=(
+                            f"{symbol} present in Eastmoney constituent universe"
+                        ),
+                        observed_at=fetched_at,
+                        source="akshare_eastmoney_industry_members",
+                        fetched_at=fetched_at,
+                    )
+                )
+        except ProviderUnavailableError as exc:
+            code = (
+                "BSE_INDUSTRY_SOURCE_UNAVAILABLE"
+                if symbol.startswith(("4", "8", "92"))
+                else "EXTERNAL_INDUSTRY_DATA_BLOCKED"
+            )
+            raise ProviderUnavailableError(code) from exc
+        if not matches:
+            reason = (
+                "BSE_INDUSTRY_SOURCE_UNAVAILABLE"
+                if symbol.startswith(("4", "8", "92"))
+                else "INDUSTRY_MEMBERSHIP_NOT_FOUND"
+            )
+            raise ProviderUnavailableError(reason)
+        return matches
 
     def list_industries(self) -> list[str]:
         try:

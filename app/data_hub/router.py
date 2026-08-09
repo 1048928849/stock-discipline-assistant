@@ -23,6 +23,7 @@ from app.data_hub.market_subjects import (
     company_industry_chain_subject,
     index_daily_subject,
     industry_constituents_subject,
+    industry_membership_subject,
     industry_universe_subject,
     market_amount_subject,
     market_breadth_subject,
@@ -88,6 +89,7 @@ RESEARCH_SUBJECT_CAPABILITIES = frozenset(
         "announcement.catalog",
         "company.concepts",
         "company.industry_chain",
+        "industry.membership.native",
     }
 )
 CallResultKey = tuple[str, str, str, str, str, str]
@@ -1392,6 +1394,21 @@ class DataHubRouter:
             "get_industry_constituents",
             industry,
             symbol=subject.subject_id,
+            subject=subject,
+            cache_loader=cache_loader,
+            validator=lambda value: isinstance(value, list) and bool(value),
+        )
+
+    def get_native_industry_membership(
+        self, symbol: str, analysis_date: date, cache_loader=None
+    ):
+        subject = industry_membership_subject(symbol)
+        return self.invoke(
+            "industry.membership.native",
+            "get_native_industry_membership",
+            symbol,
+            analysis_date,
+            symbol=symbol,
             subject=subject,
             cache_loader=cache_loader,
             validator=lambda value: isinstance(value, list) and bool(value),

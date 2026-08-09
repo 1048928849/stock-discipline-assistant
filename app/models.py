@@ -311,6 +311,34 @@ class IndustryConstituentSnapshot(Base):
     )
 
 
+class IndustryTaxonomyBinding(Base):
+    __tablename__ = "industry_taxonomy_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "quality_record_id",
+            "provider_industry_id",
+            name="uq_industry_taxonomy_binding_identity",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    classification_system: Mapped[str] = mapped_column(String(40), index=True)
+    provider_id: Mapped[str] = mapped_column(String(80), index=True)
+    provider_industry_id: Mapped[str] = mapped_column(String(40), index=True)
+    provider_industry_code: Mapped[str | None] = mapped_column(String(40))
+    provider_industry_name: Mapped[str] = mapped_column(String(200), index=True)
+    level: Mapped[str] = mapped_column(String(40))
+    effective_date: Mapped[date] = mapped_column(Date, index=True)
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    fetched_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
+    source_reference: Mapped[str] = mapped_column(String(500))
+    response_digest: Mapped[str] = mapped_column(String(64))
+    membership_evidence: Mapped[str] = mapped_column(Text)
+    quality_record_id: Mapped[int] = mapped_column(
+        ForeignKey("data_quality_records.id"), nullable=False, index=True
+    )
+
+
 class IndustryCapitalFlowSnapshot(Base):
     __tablename__ = "industry_capital_flow_snapshots"
     __table_args__ = (
@@ -1290,6 +1318,9 @@ class HistoricalDataBootstrapRun(Base):
     benchmark_ready: Mapped[bool] = mapped_column(Boolean, default=False)
     total_rows_written: Mapped[int] = mapped_column(Integer, default=0)
     coverage_ratio: Mapped[Decimal] = mapped_column(
+        Numeric(12, 6), default=Decimal("0")
+    )
+    amount_coverage_ratio: Mapped[Decimal] = mapped_column(
         Numeric(12, 6), default=Decimal("0")
     )
     started_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)

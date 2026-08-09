@@ -76,6 +76,7 @@ class HistoricalDataBootstrapService:
         calendar: TradingCalendar | None = None,
         plan_factory: Callable[..., HistoryRequirementPlan] | None = None,
         now_fn: Callable[[], datetime] | None = None,
+        purpose: str = _PURPOSE,
     ) -> None:
         self.db = db
         self.settings = settings or get_settings()
@@ -96,6 +97,7 @@ class HistoricalDataBootstrapService:
             )
         self.planning_router = planning_router
         self.plan_factory = plan_factory or self._build_plan
+        self.purpose = purpose
 
     def _now(self) -> datetime:
         value = self.now_fn()
@@ -267,7 +269,7 @@ class HistoricalDataBootstrapService:
     ) -> HistoricalDataBootstrapRun:
         run = self.db.scalar(
             select(HistoricalDataBootstrapRun).where(
-                HistoricalDataBootstrapRun.purpose == _PURPOSE,
+                HistoricalDataBootstrapRun.purpose == self.purpose,
                 HistoricalDataBootstrapRun.market == "CN-A",
                 HistoricalDataBootstrapRun.trade_date == plan.trade_date,
                 HistoricalDataBootstrapRun.plan_hash == plan.plan_hash,
@@ -277,7 +279,7 @@ class HistoricalDataBootstrapService:
             return run
         stored = to_utc_storage_naive(now)
         run = HistoricalDataBootstrapRun(
-            purpose=_PURPOSE,
+            purpose=self.purpose,
             market="CN-A",
             trade_date=plan.trade_date,
             status="PENDING",
@@ -291,6 +293,7 @@ class HistoricalDataBootstrapService:
             benchmark_ready=False,
             total_rows_written=0,
             coverage_ratio=Decimal("0"),
+            amount_coverage_ratio=Decimal("0"),
             started_at=stored,
             completed_at=None,
             blocked_reasons=[],
@@ -303,7 +306,7 @@ class HistoricalDataBootstrapService:
         except IntegrityError:
             run = self.db.scalar(
                 select(HistoricalDataBootstrapRun).where(
-                    HistoricalDataBootstrapRun.purpose == _PURPOSE,
+                    HistoricalDataBootstrapRun.purpose == self.purpose,
                     HistoricalDataBootstrapRun.market == "CN-A",
                     HistoricalDataBootstrapRun.trade_date == plan.trade_date,
                     HistoricalDataBootstrapRun.plan_hash == plan.plan_hash,
@@ -718,8 +721,15 @@ class HistoricalDataBootstrapService:
         run.ready_symbols = ready
         run.failed_symbols = failed
         run.coverage_ratio = coverage
+        run.amount_coverage_ratio = coverage
         run.blocked_reasons = reasons
-        run.status = "SUCCEEDED" if not reasons else "BLOCKED"
+        run.status = (
+            "SUCCEEDED"
+            if not reasons
+            else "PARTIAL"
+            if self.purpose == "INDUSTRY_ROLE_EVIDENCE" and ready > 0
+            else "BLOCKED"
+        )
         run.completed_at = to_utc_storage_naive(current)
         self.db.commit()
         self.db.refresh(run)
