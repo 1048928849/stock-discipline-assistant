@@ -18,4 +18,6 @@ httpx==0.28.1
 pypdf==6.10.2
 pytest==8.4.2
 pytest-cov==6.3.0
+playwright==1.62.0
+pytest-playwright==0.8.0
 ruff==0.15.22

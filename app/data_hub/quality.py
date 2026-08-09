@@ -216,6 +216,22 @@ QUALITY_POLICIES: dict[str, CapabilityQualityPolicy] = {
         ),
         verify_multiple_sources=True,
     ),
+    "industry.membership.native": CapabilityQualityPolicy(
+        "industry.membership.native",
+        required=True,
+        max_age=timedelta(days=7),
+        business_fields=(
+            "symbol",
+            "classification_system",
+            "provider_industry_id",
+            "provider_industry_code",
+            "provider_industry_name",
+            "level",
+            "effective_date",
+            "membership_evidence",
+        ),
+        verify_multiple_sources=True,
+    ),
     "market.industry.capital_flow": CapabilityQualityPolicy(
         "market.industry.capital_flow",
         required=True,

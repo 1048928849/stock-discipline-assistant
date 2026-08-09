@@ -43,6 +43,51 @@ HISTORY_BOOTSTRAP_TABLES = {
     "historical_data_bootstrap_runs",
     "historical_data_bootstrap_items",
 }
+SELECTED_STOCK_TABLES = {"selected_stock_analysis_runs"}
+
+
+def test_0018_selected_stock_strategy_roundtrip(tmp_path):
+    database = tmp_path / "selected-stock-strategy-roundtrip.db"
+    _alembic(database, "upgrade", "20260728_0017")
+    _alembic(database, "upgrade", "head")
+    with sqlite3.connect(database) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        indexes = {
+            row[1]: bool(row[2])
+            for row in connection.execute(
+                "PRAGMA index_list(selected_stock_analysis_runs)"
+            )
+        }
+    assert SELECTED_STOCK_TABLES <= tables
+    assert "ix_selected_stock_symbol_date" in indexes
+    assert any(indexes.values())
+
+    _alembic(database, "downgrade", "20260728_0017")
+    with sqlite3.connect(database) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert not (SELECTED_STOCK_TABLES & tables)
+    _alembic(database, "upgrade", "head")
+
+
+def test_0018_uses_explicit_immutable_table_definitions():
+    source = (
+        ROOT
+        / "alembic"
+        / "versions"
+        / "20260731_0018_selected_stock_strategy.py"
+    ).read_text(encoding="utf-8")
+    assert "Base.metadata" not in source
+    assert source.count("op.create_table") == len(SELECTED_STOCK_TABLES)
 
 
 def test_0016_history_bootstrap_roundtrip(tmp_path):

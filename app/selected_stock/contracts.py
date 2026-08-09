@@ -1,0 +1,623 @@
+from __future__ import annotations
+
+from datetime import date, datetime
+from decimal import Decimal
+from enum import Enum
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+class ContractModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class StrategyMode(str, Enum):
+    PRODUCT_V1 = "PRODUCT_V1"
+    CSV_V2_SHADOW = "CSV_V2_SHADOW"
+    CSV_V2_ADVISORY = "CSV_V2_ADVISORY"
+
+
+class DataStatus(str, Enum):
+    FRESH = "FRESH"
+    STALE_ONE_SESSION = "STALE_ONE_SESSION"
+    STALE = "STALE"
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+    CONFLICTED_DATA = "CONFLICTED_DATA"
+
+
+class ContextStatus(str, Enum):
+    AVAILABLE = "AVAILABLE"
+    BREADTH_UNAVAILABLE = "BREADTH_UNAVAILABLE"
+    INDUSTRY_CONTEXT_UNAVAILABLE = "INDUSTRY_CONTEXT_UNAVAILABLE"
+
+
+class CycleState(str, Enum):
+    PREPARATION = "PREPARATION"
+    PROBE = "PROBE"
+    START_CONFIRMED = "START_CONFIRMED"
+    MARKUP = "MARKUP"
+    DIVERGENCE = "DIVERGENCE"
+    CONCENTRATION = "CONCENTRATION"
+    CLIMAX = "CLIMAX"
+    DECLINE = "DECLINE"
+    TRANSITION = "TRANSITION"
+    UNKNOWN = "UNKNOWN"
+
+
+class StockRole(str, Enum):
+    LEADER = "LEADER"
+    CAPACITY_CORE = "CAPACITY_CORE"
+    BRANCH_CORE = "BRANCH_CORE"
+    TREND_CORE = "TREND_CORE"
+    ROTATION_FRONT = "ROTATION_FRONT"
+    FOLLOWER = "FOLLOWER"
+    EVENT_DRIVEN = "EVENT_DRIVEN"
+    UNKNOWN = "UNKNOWN"
+
+
+class TradeMode(str, Enum):
+    CORE_TREND_PULLBACK = "CORE_TREND_PULLBACK"
+    EARLY_BREAKOUT_CONFIRMATION = "EARLY_BREAKOUT_CONFIRMATION"
+    HIGH_LEVEL_DEFENSE = "HIGH_LEVEL_DEFENSE"
+
+
+class PlanStatus(str, Enum):
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+    NO_TRADE = "NO_TRADE"
+    WAIT_FOR_TRIGGER = "WAIT_FOR_TRIGGER"
+    ENTRY_ALLOWED = "ENTRY_ALLOWED"
+    HOLD = "HOLD"
+    REDUCE = "REDUCE"
+    EXIT = "EXIT"
+
+
+class GateStatus(str, Enum):
+    PASS = "PASS"
+    BLOCKED = "BLOCKED"
+    NOT_EVALUATED = "NOT_EVALUATED"
+
+
+class SurvivalRuleStatus(str, Enum):
+    PASS = "PASS"
+    WARN = "WARN"
+    BLOCK = "BLOCK"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+
+
+class UserPriceStatus(str, Enum):
+    MARKET_QUOTE_TRUSTED = "MARKET_QUOTE_TRUSTED"
+    USER_PRICE_NOT_PROVIDED = "USER_PRICE_NOT_PROVIDED"
+    USER_PRICE_FRESH = "USER_PRICE_FRESH"
+    USER_PRICE_STALE = "USER_PRICE_STALE"
+    USER_PRICE_DATE_MISMATCH = "USER_PRICE_DATE_MISMATCH"
+    USER_PRICE_FUTURE = "USER_PRICE_FUTURE"
+    USER_PRICE_CONFLICTED = "USER_PRICE_CONFLICTED"
+    LATEST_CLOSE_ONLY = "LATEST_CLOSE_ONLY"
+
+
+class CatalystType(str, Enum):
+    INDUSTRY_SUPPLY_DEMAND = "INDUSTRY_SUPPLY_DEMAND"
+    EARNINGS = "EARNINGS"
+    POLICY = "POLICY"
+    COMPANY_ANNOUNCEMENT = "COMPANY_ANNOUNCEMENT"
+    EVENT = "EVENT"
+    RUMOR = "RUMOR"
+    UNKNOWN = "UNKNOWN"
+
+
+class CatalystContext(ContractModel):
+    catalyst_type: CatalystType = CatalystType.UNKNOWN
+    summary: str = Field(min_length=1, max_length=2000)
+    source_reference: str | None = Field(default=None, max_length=1000)
+
+
+class SelectedStockAnalysisRequest(ContractModel):
+    stock_code: str = Field(pattern=r"^\d{6}$")
+    account_id: int | None = Field(default=None, ge=1)
+    analysis_date: date | None = None
+    current_price: Decimal | None = Field(default=None, gt=0)
+    current_price_observed_at: datetime | None = None
+    account_size: Decimal | None = Field(default=None, gt=0)
+    current_position_quantity: int | None = Field(default=None, ge=0)
+    current_position_pct: Decimal | None = Field(default=None, ge=0, le=100)
+    average_cost: Decimal | None = Field(default=None, gt=0)
+    available_cash: Decimal | None = Field(default=None, ge=0)
+    risk_budget: Decimal | None = Field(default=None, gt=0)
+    max_position_pct: Decimal | None = Field(default=None, gt=0, le=100)
+    daily_realized_pnl: Decimal | None = None
+    daily_unrealized_pnl: Decimal | None = None
+    daily_pnl_observed_at: datetime | None = None
+    daily_pnl_source: Literal[
+        "ACCOUNT_SNAPSHOT",
+        "BROKER_STATEMENT",
+        "USER_ACCOUNT_OBSERVATION",
+    ] | None = None
+    strategy_mode: StrategyMode = StrategyMode.CSV_V2_ADVISORY
+    user_focus: str | None = Field(default=None, max_length=2000)
+    catalyst_context: CatalystContext | None = None
+
+    @field_validator("current_price_observed_at", "daily_pnl_observed_at")
+    @classmethod
+    def aware_price_time(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("current_price_observed_at must be timezone-aware")
+        return value
+
+    @model_validator(mode="after")
+    def complete_optional_inputs(self):
+        if (self.current_price is None) != (self.current_price_observed_at is None):
+            raise ValueError(
+                "current_price and current_price_observed_at must be provided together"
+            )
+        if self.available_cash is not None and self.account_size is None:
+            raise ValueError("available_cash requires account_size")
+        if self.current_position_quantity and self.average_cost is None:
+            raise ValueError("current_position_quantity requires average_cost")
+        if self.current_position_pct and self.account_size is None:
+            raise ValueError("current_position_pct requires account_size")
+        if (
+            self.current_position_quantity == 0
+            and not self.current_position_pct
+            and self.average_cost is not None
+        ):
+            raise ValueError("average_cost cannot describe a zero position")
+        daily_pnl = (
+            self.daily_realized_pnl,
+            self.daily_unrealized_pnl,
+            self.daily_pnl_observed_at,
+            self.daily_pnl_source,
+        )
+        if any(value is not None for value in daily_pnl) and not all(
+            value is not None for value in daily_pnl
+        ):
+            raise ValueError(
+                "daily PnL requires realized, unrealized, observed_at, and source"
+            )
+        if self.daily_pnl_source is not None and self.account_size is None:
+            raise ValueError("daily PnL requires account_size")
+        return self
+
+
+class GateResult(ContractModel):
+    code: str
+    status: GateStatus
+    reason_code: str
+    required_inputs: tuple[str, ...] = ()
+    evaluated_inputs: dict[str, Any] = Field(default_factory=dict)
+    threshold: Any | None = None
+    actual_value: Any | None = None
+    evidence: tuple[str, ...] = ()
+    missing_inputs: tuple[str, ...] = ()
+    effect_on_plan: str
+    effect_on_score: str
+    effect_on_position: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_gate(cls, value):
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+        passed = result.pop("passed", None)
+        if "status" not in result and passed is not None:
+            result["status"] = "PASS" if passed else "BLOCKED"
+        status = result.get("status")
+        result.setdefault("effect_on_plan", "ALLOW" if status == "PASS" else "BLOCK_NEW_ACTION")
+        result.setdefault("effect_on_score", "ELIGIBLE" if status == "PASS" else "NO_POSITIVE_SCORE")
+        result.setdefault("effect_on_position", "ELIGIBLE" if status == "PASS" else "ZERO_NEW_POSITION")
+        return result
+
+
+class PriceObservation(ContractModel):
+    price: Decimal = Field(gt=0)
+    observed_at: datetime
+    source: Literal["MARKET_DAILY_CLOSE", "USER_OBSERVATION"]
+    trust_status: UserPriceStatus
+    age_seconds: int | None = Field(default=None, ge=0)
+    matched_analysis_date: bool
+    executable_for_entry: bool
+    executable_for_position: bool
+    reason_code: str
+    market_close: Decimal = Field(gt=0)
+    market_close_observed_at: datetime
+    user_price: Decimal | None = Field(default=None, gt=0)
+    user_price_observed_at: datetime | None = None
+
+    @field_validator(
+        "observed_at",
+        "market_close_observed_at",
+        "user_price_observed_at",
+    )
+    @classmethod
+    def aware_price_times(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("price context times must be timezone-aware")
+        return value
+
+
+class AccountContext(ContractModel):
+    account_id: int | None = None
+    source: Literal[
+        "SERVER_ACCOUNT",
+        "MANUAL_ACCOUNT_CONTEXT",
+        "NO_ACCOUNT_CONTEXT",
+    ]
+    trust_status: Literal[
+        "SERVER_LOADED",
+        "USER_CONFIRMED",
+        "ACCOUNT_INPUT_CONFLICT",
+        "MANUAL_ACCOUNT_CONTEXT",
+        "UNAVAILABLE",
+    ]
+    account_size: Decimal | None = Field(default=None, gt=0)
+    available_cash: Decimal | None = Field(default=None, ge=0)
+    current_position_quantity: int | None = Field(default=None, ge=0)
+    current_position_pct: Decimal | None = Field(default=None, ge=0, le=100)
+    average_cost: Decimal | None = Field(default=None, gt=0)
+    daily_realized_pnl: Decimal | None = None
+    daily_unrealized_pnl: Decimal | None = None
+    daily_loss_amount: Decimal | None = Field(default=None, ge=0)
+    daily_loss_pct: Decimal | None = Field(default=None, ge=0)
+    observed_at: datetime | None = None
+    conflict_fields: tuple[str, ...] = ()
+    confidence: Decimal = Field(ge=0, le=1)
+
+    @field_validator("observed_at")
+    @classmethod
+    def aware_account_time(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("account context observed_at must be timezone-aware")
+        return value
+
+
+class IndustryMapping(ContractModel):
+    symbol: str = Field(pattern=r"^\d{6}$")
+    industry_id: str
+    industry_name: str
+    classification_system: str
+    effective_date: date
+    provider: str
+    source_reference: str
+    fetched_at: datetime
+    response_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class StockRoleEvidence(ContractModel):
+    member_count: int = Field(ge=0)
+    valid_member_count: int = Field(ge=0)
+    coverage_ratio: Decimal = Field(ge=0, le=1)
+    return_rank_20: int | None = Field(default=None, ge=1)
+    return_rank_60: int | None = Field(default=None, ge=1)
+    amount_rank: int | None = Field(default=None, ge=1)
+    amount_percentile: Decimal | None = Field(default=None, ge=0, le=1)
+    industry_weight: Decimal | None = Field(default=None, ge=0)
+    up_day_elasticity: Decimal | None = None
+    down_day_resilience: Decimal | None = None
+    excess_return_20: Decimal | None = None
+    excess_return_60: Decimal | None = None
+    max_drawdown_rank_60: int | None = Field(default=None, ge=1)
+    liquidity: Decimal | None = Field(default=None, ge=0)
+    consecutive_leading_days: int = Field(default=0, ge=0)
+    evidence_complete: bool
+    reason_code: str
+
+
+class IndustryContextEvidence(ContractModel):
+    status: ContextStatus
+    mapping: IndustryMapping | None = None
+    history_row_count: int = Field(ge=0)
+    constituent_count: int = Field(ge=0)
+    valid_member_count: int = Field(ge=0)
+    coverage_ratio: Decimal = Field(ge=0, le=1)
+    quality_status: str
+    role: StockRole
+    role_evidence: StockRoleEvidence
+    reason_codes: tuple[str, ...]
+    quality_record_ids: tuple[int, ...] = ()
+
+
+class SurvivalRuleResult(ContractModel):
+    rule_code: str
+    rule_name: str
+    status: SurvivalRuleStatus
+    severity: Literal["INFO", "WARNING", "CRITICAL"]
+    evidence: dict[str, Any]
+    action: str
+    applicable: bool
+    reason_code: str
+    rule_version: Literal["survival_discipline_v1"] = "survival_discipline_v1"
+
+
+class ScoreComponent(ContractModel):
+    score: Decimal = Field(ge=0)
+    maximum: Decimal = Field(gt=0)
+    reason_codes: tuple[str, ...]
+    evidence: tuple[str, ...]
+    missing_evidence: tuple[str, ...]
+    score_ceiling: Decimal = Field(ge=0)
+    confidence: Decimal = Field(ge=0, le=1)
+
+
+class ScoreCard(ContractModel):
+    market_cycle: ScoreComponent
+    industry_continuity: ScoreComponent
+    stock_role_relative_strength: ScoreComponent
+    trend_volume: ScoreComponent
+    location_trigger: ScoreComponent
+    risk_invalidation: ScoreComponent
+    total: Decimal = Field(ge=0, le=100)
+    grade: Literal["A", "B", "C", "D"]
+
+
+class PricePlan(ContractModel):
+    support_zone_low: Decimal | None = None
+    support_zone_high: Decimal | None = None
+    entry_zone_low: Decimal | None = None
+    entry_zone_high: Decimal | None = None
+    trigger_price: Decimal | None = None
+    stop_loss: Decimal | None = None
+    first_take_profit: Decimal | None = None
+    second_take_profit: Decimal | None = None
+    invalidation_price: Decimal | None = None
+    risk_reward_ratio: Decimal | None = None
+
+
+class PositionPlan(ContractModel):
+    initial_position_pct: Decimal = Field(ge=0, le=100)
+    max_position_pct: Decimal = Field(ge=0, le=100)
+    proposed_trade_pct: Decimal = Field(default=Decimal("0"), ge=0, le=100)
+    post_trade_position_pct: Decimal | None = Field(default=None, ge=0)
+    quantity: int | None = Field(default=None, ge=0)
+    max_quantity: int | None = Field(default=None, ge=0)
+    risk_amount: Decimal | None = Field(default=None, ge=0)
+    maximum_loss_after_trade: Decimal | None = Field(default=None, ge=0)
+    t1_overnight_gap_risk_pct: Decimal | None = Field(default=None, ge=0)
+    t1_risk_amount: Decimal | None = Field(default=None, ge=0)
+    add_conditions: tuple[str, ...]
+    reduce_conditions: tuple[str, ...]
+
+
+class HoldingPlan(ContractModel):
+    unrealized_pnl: Decimal | None
+    risk_amount: Decimal | None
+    risk_pct: Decimal | None
+    allow_hold: bool
+    allow_add: bool
+    stop_distance_pct: Decimal | None
+    maximum_risk_after_add: Decimal | None
+    plan_invalidated: bool
+    next_session_plan: tuple[str, ...]
+
+
+class QualityBinding(ContractModel):
+    capability: str
+    subject_type: str
+    subject_id: str
+    semantic_key: str
+    quality_record_id: int = Field(ge=1)
+    quality_status: str
+    observed_at: datetime
+    normalized_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("observed_at")
+    @classmethod
+    def aware_observed_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("quality binding observed_at must be aware")
+        return value
+
+
+class SourceLineage(ContractModel):
+    capability: str
+    provider_id: str
+    source: str
+    adjustment: str | None = None
+    price_unit: str | None = None
+    volume_unit: str | None = None
+    row_count: int = Field(ge=0)
+    observed_at: datetime | None = None
+    fetched_at: datetime | None = None
+    request_digest: str | None = None
+    response_digest: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class StrategyComparison(ContractModel):
+    conflict_status: Literal[
+        "ALIGNED",
+        "MORE_CONSERVATIVE",
+        "MORE_AGGRESSIVE",
+        "STRUCTURAL_CONFLICT",
+        "DATA_CONFLICT",
+    ]
+    product_v1_status: str
+    csv_v2_status: str
+    differences: tuple[str, ...]
+    formal_execution_owner: Literal["PRODUCT_V1"] = "PRODUCT_V1"
+
+
+class SelectedStockAnalysisResult(ContractModel):
+    analysis_run_id: int | None = None
+    strategy_id: Literal["cycle_structure_validation_v2"]
+    strategy_version: Literal["2.0.0"]
+    strategy_mode: StrategyMode
+    stock_code: str
+    analysis_date: date
+    generated_at: datetime
+    data_status: DataStatus
+    market_context_status: ContextStatus
+    industry_context_status: ContextStatus
+    industry_name: str | None
+    industry_context: IndustryContextEvidence
+    benchmark_symbol: Literal["CSI000300"] = "CSI000300"
+    cycle_state: CycleState
+    stock_role: StockRole
+    trade_mode: TradeMode
+    plan_status: PlanStatus
+    executable: bool
+    confidence: Decimal = Field(ge=0, le=1)
+    hard_gates: tuple[GateResult, ...]
+    scores: ScoreCard
+    technical_evidence: dict[str, Any]
+    passed_conditions: tuple[str, ...]
+    failed_conditions: tuple[str, ...]
+    pending_conditions: tuple[str, ...]
+    price_plan: PricePlan
+    position_plan: PositionPlan
+    holding_plan: HoldingPlan | None
+    invalidation_conditions: tuple[str, ...]
+    next_check_condition: tuple[str, ...]
+    execution_blockers: tuple[str, ...]
+    price_observation: PriceObservation
+    account_context: AccountContext
+    survival_discipline: tuple[SurvivalRuleResult, ...]
+    quality_bindings: tuple[QualityBinding, ...]
+    source_lineage: tuple[SourceLineage, ...]
+    product_v1_comparison: StrategyComparison
+    explanation: dict[str, Any]
+    snapshot_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    result_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_snapshot(cls, value):
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+        generated_at = result.get("generated_at")
+        technical = result.get("technical_evidence") or {}
+        latest = technical.get("latest_close") or "0.01"
+        result.setdefault(
+            "price_observation",
+            {
+                "price": latest,
+                "observed_at": generated_at,
+                "source": "MARKET_DAILY_CLOSE",
+                "trust_status": "LATEST_CLOSE_ONLY",
+                "matched_analysis_date": False,
+                "executable_for_entry": False,
+                "executable_for_position": False,
+                "reason_code": "LEGACY_PRICE_CONTEXT_NOT_EVALUATED",
+                "market_close": latest,
+                "market_close_observed_at": generated_at,
+            },
+        )
+        result.setdefault(
+            "account_context",
+            {
+                "source": "NO_ACCOUNT_CONTEXT",
+                "trust_status": "UNAVAILABLE",
+                "confidence": 0,
+            },
+        )
+        legacy_role = result.get("stock_role", "UNKNOWN")
+        result.setdefault(
+            "industry_context",
+            {
+                "status": "INDUSTRY_CONTEXT_UNAVAILABLE",
+                "history_row_count": 0,
+                "constituent_count": 0,
+                "valid_member_count": 0,
+                "coverage_ratio": 0,
+                "quality_status": "MISSING",
+                "role": "UNKNOWN",
+                "role_evidence": {
+                    "member_count": 0,
+                    "valid_member_count": 0,
+                    "coverage_ratio": 0,
+                    "evidence_complete": False,
+                    "reason_code": "LEGACY_ROLE_EVIDENCE_NOT_EVALUATED",
+                },
+                "reason_codes": [
+                    "LEGACY_INDUSTRY_CONTEXT_NOT_EVALUATED",
+                    f"legacy_role={legacy_role}",
+                ],
+            },
+        )
+        if "survival_discipline" not in result:
+            result["survival_discipline"] = [
+                {
+                    "rule_code": code,
+                    "rule_name": name,
+                    "status": "INSUFFICIENT_DATA",
+                    "severity": "WARNING",
+                    "evidence": {},
+                    "action": "Re-run analysis with the current contract.",
+                    "applicable": True,
+                    "reason_code": "LEGACY_RULE_NOT_EVALUATED",
+                }
+                for code, name in (
+                    ("TREND_POSITION_COORDINATION", "Trend and position coordination"),
+                    ("CHASE_RISK", "Chasing risk"),
+                    ("HIGH_VOLUME_STALL", "High-level volume stall"),
+                    ("VOLUME_DECLINE_BREAKDOWN", "Volume decline and structure breakdown"),
+                    ("INDUSTRY_ROLE_RISK", "Mainline and stock role risk"),
+                    ("HARD_STOP_PRIORITY", "Hard stop priority"),
+                )
+            ]
+        return result
+
+    @field_validator("generated_at")
+    @classmethod
+    def aware_generated_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("generated_at must be timezone-aware")
+        return value
+
+    @model_validator(mode="after")
+    def execution_is_advisory_only(self):
+        if self.strategy_mode != StrategyMode.PRODUCT_V1 and self.executable:
+            raise ValueError("CSV_V2 cannot receive formal execution permission")
+        return self
+
+
+PROGRESS_STATES = (
+    "VALIDATING_INPUT",
+    "FETCHING_STOCK_HISTORY",
+    "FETCHING_INDUSTRY_MAPPING",
+    "FETCHING_INDUSTRY_HISTORY",
+    "FETCHING_BENCHMARK",
+    "CALCULATING_INDICATORS",
+    "EVALUATING_HARD_GATES",
+    "EVALUATING_CONTEXT",
+    "EVALUATING_TRIGGERS",
+    "BUILDING_RISK_PLAN",
+    "COMPARING_STRATEGIES",
+    "COMPLETED",
+    "FAILED",
+)
+
+
+__all__ = [
+    "AccountContext",
+    "CatalystContext",
+    "ContextStatus",
+    "CycleState",
+    "DataStatus",
+    "GateStatus",
+    "GateResult",
+    "HoldingPlan",
+    "IndustryContextEvidence",
+    "IndustryMapping",
+    "PlanStatus",
+    "PriceObservation",
+    "PositionPlan",
+    "PricePlan",
+    "PROGRESS_STATES",
+    "QualityBinding",
+    "ScoreCard",
+    "ScoreComponent",
+    "SelectedStockAnalysisRequest",
+    "SelectedStockAnalysisResult",
+    "SourceLineage",
+    "StockRoleEvidence",
+    "StockRole",
+    "StrategyComparison",
+    "StrategyMode",
+    "SurvivalRuleResult",
+    "SurvivalRuleStatus",
+    "TradeMode",
+    "UserPriceStatus",
+]

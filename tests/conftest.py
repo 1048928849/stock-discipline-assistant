@@ -21,6 +21,13 @@ from app.main import app
 def pytest_collection_modifyitems(config, items):
     for item in items:
         if (
+            "browser_smoke" in item.keywords
+            and os.environ.get("RUN_BROWSER_SMOKE") != "1"
+        ):
+            item.add_marker(
+                pytest.mark.skip(reason="repository browser smoke is a dedicated CI job")
+            )
+        if (
             "freestockdb_integration" in item.keywords
             and os.environ.get("RUN_FREESTOCKDB_INTEGRATION") != "1"
         ):
@@ -40,6 +47,13 @@ def pytest_collection_modifyitems(config, items):
         ):
             item.add_marker(
                 pytest.mark.skip(reason="real market breadth sources are opt-in")
+            )
+        if (
+            "selected_stock_integration" in item.keywords
+            and os.environ.get("RUN_SELECTED_STOCK_INTEGRATION") != "1"
+        ):
+            item.add_marker(
+                pytest.mark.skip(reason="real selected-stock sources are opt-in")
             )
 
 

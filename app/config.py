@@ -8,6 +8,9 @@ from app.providers.baostock_worker import MAX_OUTPUT_BYTES as BAOSTOCK_MAX_OUTPU
 from app.providers.market_breadth_worker import (
     MAX_OUTPUT_BYTES as MARKET_BREADTH_MAX_OUTPUT_BYTES,
 )
+from app.providers.selected_stock_history_worker import (
+    MAX_OUTPUT_BYTES as SELECTED_STOCK_HISTORY_MAX_OUTPUT_BYTES,
+)
 
 
 class Settings(BaseSettings):
@@ -97,6 +100,14 @@ class Settings(BaseSettings):
     )
     baostock_max_rows: int = Field(default=500, ge=80, le=1000)
     baostock_adapter_version: str = "1.0.0"
+    selected_stock_history_worker_timeout_seconds: int = Field(default=15, ge=1, le=60)
+    selected_stock_history_max_response_bytes: int = Field(
+        default=SELECTED_STOCK_HISTORY_MAX_OUTPUT_BYTES,
+        ge=1024,
+        le=SELECTED_STOCK_HISTORY_MAX_OUTPUT_BYTES,
+    )
+    selected_stock_history_max_rows: int = Field(default=800, ge=120, le=1000)
+    selected_stock_history_adapter_version: str = "1.0.0"
     market_breadth_enabled: bool = False
     market_breadth_worker_timeout_seconds: int = Field(default=30, ge=1, le=60)
     market_breadth_total_budget_seconds: int = Field(default=60, ge=1, le=120)
