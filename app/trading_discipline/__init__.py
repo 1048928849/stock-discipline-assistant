@@ -1,0 +1,1 @@
+"""Trading discipline coaching domain."""

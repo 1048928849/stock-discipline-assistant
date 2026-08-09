@@ -130,9 +130,7 @@ class MarketQuote(TimestampMixin, Base):
     name: Mapped[str | None] = mapped_column(String(100))
     price: Mapped[Decimal] = mapped_column(PRICE)
     quote_type: Mapped[str] = mapped_column(String(20), default="realtime")
-    observed_at: Mapped[datetime] = mapped_column(
-        PRECISE_DATETIME, default=datetime.now
-    )
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME, default=datetime.now)
     price_unit: Mapped[str] = mapped_column(String(20), default="CNY")
     quality_status: Mapped[str] = mapped_column(String(20), default="SINGLE_SOURCE")
     quality_record_id: Mapped[int | None] = mapped_column(
@@ -159,9 +157,7 @@ class MarketDailyBar(Base):
     adjustment: Mapped[str] = mapped_column(String(20), default="qfq")
     price_unit: Mapped[str] = mapped_column(String(20), default="CNY")
     volume_unit: Mapped[str] = mapped_column(String(20), default="share")
-    observed_at: Mapped[datetime] = mapped_column(
-        PRECISE_DATETIME, default=datetime.now
-    )
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME, default=datetime.now)
     quality_status: Mapped[str] = mapped_column(String(20), default="SINGLE_SOURCE")
     quality_record_id: Mapped[int | None] = mapped_column(
         ForeignKey("data_quality_records.id"), index=True
@@ -202,9 +198,7 @@ class MarketIntradayBar(Base):
 
 class MarketTurnoverSnapshot(Base):
     __tablename__ = "market_turnover_snapshots"
-    __table_args__ = (
-        UniqueConstraint("symbol", "trade_date", name="uq_turnover_symbol_date"),
-    )
+    __table_args__ = (UniqueConstraint("symbol", "trade_date", name="uq_turnover_symbol_date"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     symbol: Mapped[str] = mapped_column(String(12), index=True)
     trade_date: Mapped[date] = mapped_column(Date, index=True)
@@ -220,9 +214,7 @@ class MarketTurnoverSnapshot(Base):
 
 class MarketBreadthSnapshot(Base):
     __tablename__ = "market_breadth_snapshots"
-    __table_args__ = (
-        UniqueConstraint("market_id", "trade_date", name="uq_breadth_market_date"),
-    )
+    __table_args__ = (UniqueConstraint("market_id", "trade_date", name="uq_breadth_market_date"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     market_id: Mapped[str] = mapped_column(String(20), default="CN-A")
     trade_date: Mapped[date] = mapped_column(Date, index=True)
@@ -246,9 +238,7 @@ class MarketBreadthSnapshot(Base):
 
 class MarketAmountSnapshot(Base):
     __tablename__ = "market_amount_snapshots"
-    __table_args__ = (
-        UniqueConstraint("market_id", "trade_date", name="uq_amount_market_date"),
-    )
+    __table_args__ = (UniqueConstraint("market_id", "trade_date", name="uq_amount_market_date"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     market_id: Mapped[str] = mapped_column(String(20), default="CN-A")
     trade_date: Mapped[date] = mapped_column(Date, index=True)
@@ -288,9 +278,7 @@ class IndustryMarketSnapshot(Base):
 class IndustryConstituentSnapshot(Base):
     __tablename__ = "industry_constituent_snapshots"
     __table_args__ = (
-        UniqueConstraint(
-            "industry_key", "symbol", "snapshot_date", name="uq_industry_member_date"
-        ),
+        UniqueConstraint("industry_key", "symbol", "snapshot_date", name="uq_industry_member_date"),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     industry_key: Mapped[str] = mapped_column(String(20), index=True)
@@ -342,9 +330,7 @@ class IndustryTaxonomyBinding(Base):
 class IndustryCapitalFlowSnapshot(Base):
     __tablename__ = "industry_capital_flow_snapshots"
     __table_args__ = (
-        UniqueConstraint(
-            "industry_key", "trade_date", name="uq_industry_capital_flow_date"
-        ),
+        UniqueConstraint("industry_key", "trade_date", name="uq_industry_capital_flow_date"),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     industry_key: Mapped[str] = mapped_column(String(40), index=True)
@@ -366,9 +352,7 @@ class IndustryCapitalFlowSnapshot(Base):
 class MarketEventPoolSnapshot(Base):
     __tablename__ = "market_event_pool_snapshots"
     __table_args__ = (
-        UniqueConstraint(
-            "trade_date", "event_type", "symbol", name="uq_market_event_pool_symbol"
-        ),
+        UniqueConstraint("trade_date", "event_type", "symbol", name="uq_market_event_pool_symbol"),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     symbol: Mapped[str] = mapped_column(String(12), index=True)
@@ -394,9 +378,7 @@ class MarketEventPoolSnapshot(Base):
 
 class MarketRegimeSnapshot(Base):
     __tablename__ = "market_regime_snapshots"
-    __table_args__ = (
-        UniqueConstraint("market_id", "trade_date", name="uq_market_regime_date"),
-    )
+    __table_args__ = (UniqueConstraint("market_id", "trade_date", name="uq_market_regime_date"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     market_id: Mapped[str] = mapped_column(String(20), default="CN-A")
     trade_date: Mapped[date] = mapped_column(Date, index=True)
@@ -412,9 +394,7 @@ class MarketRegimeSnapshot(Base):
 class IndustryAnalysisSnapshot(Base):
     __tablename__ = "industry_analysis_snapshots"
     __table_args__ = (
-        UniqueConstraint(
-            "industry_name", "trade_date", name="uq_industry_analysis_name_date"
-        ),
+        UniqueConstraint("industry_name", "trade_date", name="uq_industry_analysis_name_date"),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     industry_name: Mapped[str] = mapped_column(String(200), index=True)
@@ -438,9 +418,7 @@ class Concept(Base):
 
 class CompanyConcept(Base):
     __tablename__ = "company_concepts"
-    __table_args__ = (
-        UniqueConstraint("symbol", "concept_id", name="uq_company_concept"),
-    )
+    __table_args__ = (UniqueConstraint("symbol", "concept_id", name="uq_company_concept"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     symbol: Mapped[str] = mapped_column(String(12), index=True)
     concept_id: Mapped[int] = mapped_column(ForeignKey("concepts.id"), index=True)
@@ -464,9 +442,7 @@ class IndustryChain(Base):
 
 class IndustryChainNode(Base):
     __tablename__ = "industry_chain_nodes"
-    __table_args__ = (
-        UniqueConstraint("chain_id", "name", name="uq_industry_chain_node"),
-    )
+    __table_args__ = (UniqueConstraint("chain_id", "name", name="uq_industry_chain_node"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     chain_id: Mapped[int] = mapped_column(ForeignKey("industry_chains.id"), index=True)
     name: Mapped[str] = mapped_column(String(200))
@@ -479,9 +455,7 @@ class IndustryChainNode(Base):
 
 class CompanyChainPosition(Base):
     __tablename__ = "company_chain_positions"
-    __table_args__ = (
-        UniqueConstraint("symbol", "node_id", name="uq_company_chain_position"),
-    )
+    __table_args__ = (UniqueConstraint("symbol", "node_id", name="uq_company_chain_position"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     symbol: Mapped[str] = mapped_column(String(12), index=True)
     node_id: Mapped[int] = mapped_column(ForeignKey("industry_chain_nodes.id"), index=True)
@@ -575,9 +549,7 @@ class DataQualityRecord(Base):
     scan_end: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
     checked_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
     latest_content_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
-    created_at: Mapped[datetime] = mapped_column(
-        PRECISE_DATETIME, server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME, server_default=func.now())
 
     @validates("semantic_key")
     def normalize_semantic_key(self, _key: str, value: str | None) -> str:
@@ -709,6 +681,148 @@ class SystemJob(TimestampMixin, Base):
     next_run_at: Mapped[datetime | None] = mapped_column(DateTime)
     result_count: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class TradingPlaybook(TimestampMixin, Base):
+    __tablename__ = "trading_playbooks"
+    __table_args__ = (UniqueConstraint("code", "version", name="uq_trading_playbook_version"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(80), index=True)
+    version: Mapped[str] = mapped_column(String(30))
+    name: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str] = mapped_column(Text)
+    active: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    rules: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class MarketStageSnapshot(Base):
+    __tablename__ = "market_stage_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol", "as_of", "rule_version", name="uq_market_stage_symbol_asof_rule"
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    stage: Mapped[str] = mapped_column(String(30), index=True)
+    as_of: Mapped[date] = mapped_column(Date, index=True)
+    evidence: Mapped[dict] = mapped_column(JSON)
+    source_analysis_run_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    evidence_status: Mapped[str] = mapped_column(String(30))
+    rule_version: Mapped[str] = mapped_column(String(30))
+    reason_codes: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME, server_default=func.now())
+
+
+class SourceEvidenceRecord(TimestampMixin, Base):
+    __tablename__ = "source_evidence_records"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str | None] = mapped_column(String(12), index=True)
+    scope: Mapped[str | None] = mapped_column(String(100), index=True)
+    title: Mapped[str] = mapped_column(String(300))
+    content_summary: Mapped[str] = mapped_column(Text)
+    tier: Mapped[str] = mapped_column(String(20), index=True)
+    source_type: Mapped[str] = mapped_column(String(50))
+    source_reference: Mapped[str | None] = mapped_column(String(1000))
+    published_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME, index=True)
+    observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME, index=True)
+    added_by: Mapped[str] = mapped_column(String(100))
+    before_or_after_entry: Mapped[str] = mapped_column(String(20), index=True)
+    verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    quality: Mapped[str] = mapped_column(String(30))
+    lineage: Mapped[dict] = mapped_column(JSON, default=dict)
+    related_thesis_id: Mapped[str | None] = mapped_column(String(64), index=True)
+
+
+class TradeThesisSnapshot(Base):
+    __tablename__ = "trade_thesis_snapshots"
+    __table_args__ = (UniqueConstraint("snapshot_hash", name="uq_trade_thesis_snapshot_hash"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    thesis_id: Mapped[str] = mapped_column(String(64), index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    parent_snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey("trade_thesis_snapshots.id"), index=True
+    )
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    playbook_id: Mapped[int] = mapped_column(ForeignKey("trading_playbooks.id"), index=True)
+    entry_reasons: Mapped[list] = mapped_column(JSON)
+    invalidation_conditions: Mapped[list] = mapped_column(JSON)
+    expected_behavior: Mapped[list] = mapped_column(JSON)
+    hard_stop: Mapped[Decimal] = mapped_column(PRICE)
+    initial_position: Mapped[int] = mapped_column(Integer)
+    max_position: Mapped[int] = mapped_column(Integer)
+    fact_evidence_ids: Mapped[list] = mapped_column(JSON, default=list)
+    analysis_hypotheses: Mapped[list] = mapped_column(JSON, default=list)
+    strategy_run_refs: Mapped[list] = mapped_column(JSON, default=list)
+    snapshot_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME, server_default=func.now())
+
+
+class PretradeDisciplineCheck(Base):
+    __tablename__ = "pretrade_discipline_checks"
+    __table_args__ = (UniqueConstraint("snapshot_hash", name="uq_pretrade_check_hash"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    symbol: Mapped[str] = mapped_column(String(12), index=True)
+    action: Mapped[str] = mapped_column(String(10))
+    decision_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME, index=True)
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    score: Mapped[int] = mapped_column(Integer)
+    category_scores: Mapped[dict] = mapped_column(JSON)
+    rules: Mapped[list] = mapped_column(JSON)
+    reason_codes: Mapped[list] = mapped_column(JSON)
+    source_refs: Mapped[list] = mapped_column(JSON, default=list)
+    snapshot_hash: Mapped[str] = mapped_column(String(64))
+    rule_version: Mapped[str] = mapped_column(String(30))
+    created_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME, server_default=func.now())
+
+
+class TradingTrainingProgram(TimestampMixin, Base):
+    __tablename__ = "trading_training_programs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    playbook_id: Mapped[int] = mapped_column(ForeignKey("trading_playbooks.id"), index=True)
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    target_samples: Mapped[int] = mapped_column(Integer, default=20)
+    valid_samples: Mapped[int] = mapped_column(Integer, default=0)
+    excluded_samples: Mapped[int] = mapped_column(Integer, default=0)
+    started_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+    completed_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
+
+
+class TradeDisciplineReview(Base):
+    __tablename__ = "trade_discipline_reviews"
+    __table_args__ = (
+        UniqueConstraint("trade_id", "rule_version", name="uq_trade_discipline_review_rule"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trade_id: Mapped[int] = mapped_column(ForeignKey("trades.id"), index=True)
+    training_program_id: Mapped[int | None] = mapped_column(
+        ForeignKey("trading_training_programs.id"), index=True
+    )
+    pretrade_check_id: Mapped[int | None] = mapped_column(
+        ForeignKey("pretrade_discipline_checks.id"), index=True
+    )
+    thesis_snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey("trade_thesis_snapshots.id"), index=True
+    )
+    stage_at_decision: Mapped[str] = mapped_column(String(30))
+    planned_position: Mapped[int | None] = mapped_column(Integer)
+    actual_position: Mapped[int | None] = mapped_column(Integer)
+    planned_entry: Mapped[dict | None] = mapped_column(JSON)
+    actual_entry: Mapped[Decimal | None] = mapped_column(PRICE)
+    planned_stop: Mapped[Decimal | None] = mapped_column(PRICE)
+    deviations: Mapped[list] = mapped_column(JSON, default=list)
+    post_entry_evidence_ids: Mapped[list] = mapped_column(JSON, default=list)
+    pnl_pct: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    mfe_pct: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    mae_pct: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    exit_reason: Mapped[str | None] = mapped_column(String(100))
+    compliance_result: Mapped[str] = mapped_column(String(50), index=True)
+    error_codes: Mapped[list] = mapped_column(JSON, default=list)
+    rule_version: Mapped[str] = mapped_column(String(30))
+    reviewed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME, server_default=func.now())
 
 
 class TechnicalSnapshot(Base):
@@ -1078,9 +1192,7 @@ class SelectedStockAnalysisRun(Base):
 class WatchlistItem(TimestampMixin, Base):
     __tablename__ = "watchlist_items"
     __table_args__ = (
-        UniqueConstraint(
-            "source_type", "source_reference", name="uq_watchlist_source_reference"
-        ),
+        UniqueConstraint("source_type", "source_reference", name="uq_watchlist_source_reference"),
         Index("ix_watchlist_account_symbol", "account_id", "symbol"),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -1162,9 +1274,7 @@ class WatchlistTransition(Base):
 
 class ReanalysisRequest(Base):
     __tablename__ = "reanalysis_requests"
-    __table_args__ = (
-        UniqueConstraint("dedupe_key", name="uq_reanalysis_request_dedupe"),
-    )
+    __table_args__ = (UniqueConstraint("dedupe_key", name="uq_reanalysis_request_dedupe"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     watchlist_item_id: Mapped[int] = mapped_column(
         ForeignKey("watchlist_items.id", ondelete="CASCADE"), index=True
@@ -1179,9 +1289,7 @@ class ReanalysisRequest(Base):
 
 class ReanalysisRun(Base):
     __tablename__ = "reanalysis_runs"
-    __table_args__ = (
-        UniqueConstraint("request_id", name="uq_reanalysis_run_request"),
-    )
+    __table_args__ = (UniqueConstraint("request_id", name="uq_reanalysis_run_request"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     request_id: Mapped[int] = mapped_column(
         ForeignKey("reanalysis_requests.id", ondelete="CASCADE"), index=True
@@ -1228,9 +1336,7 @@ class CandidateDiscoveryRun(Base):
     total_constituents: Mapped[int] = mapped_column(Integer, default=0)
     historical_data_ready: Mapped[int] = mapped_column(Integer, default=0)
     historical_data_missing: Mapped[int] = mapped_column(Integer, default=0)
-    coverage_ratio: Mapped[Decimal] = mapped_column(
-        Numeric(12, 6), default=Decimal("0")
-    )
+    coverage_ratio: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
     started_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
     completed_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
     created_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
@@ -1239,9 +1345,7 @@ class CandidateDiscoveryRun(Base):
 class CandidateIndustryAssessment(Base):
     __tablename__ = "candidate_industry_assessments"
     __table_args__ = (
-        UniqueConstraint(
-            "discovery_run_id", "industry_key", name="uq_candidate_industry_run"
-        ),
+        UniqueConstraint("discovery_run_id", "industry_key", name="uq_candidate_industry_run"),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     discovery_run_id: Mapped[int] = mapped_column(
@@ -1261,9 +1365,7 @@ class CandidateIndustryAssessment(Base):
 class DiscoveryCandidate(Base):
     __tablename__ = "discovery_candidates"
     __table_args__ = (
-        UniqueConstraint(
-            "discovery_run_id", "symbol", name="uq_discovery_candidate_run_symbol"
-        ),
+        UniqueConstraint("discovery_run_id", "symbol", name="uq_discovery_candidate_run_symbol"),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     discovery_run_id: Mapped[int] = mapped_column(
@@ -1317,12 +1419,8 @@ class HistoricalDataBootstrapRun(Base):
     failed_symbols: Mapped[int] = mapped_column(Integer, default=0)
     benchmark_ready: Mapped[bool] = mapped_column(Boolean, default=False)
     total_rows_written: Mapped[int] = mapped_column(Integer, default=0)
-    coverage_ratio: Mapped[Decimal] = mapped_column(
-        Numeric(12, 6), default=Decimal("0")
-    )
-    amount_coverage_ratio: Mapped[Decimal] = mapped_column(
-        Numeric(12, 6), default=Decimal("0")
-    )
+    coverage_ratio: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
+    amount_coverage_ratio: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal("0"))
     started_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
     completed_at: Mapped[datetime | None] = mapped_column(PRECISE_DATETIME)
     blocked_reasons: Mapped[list] = mapped_column(JSON, default=list)
@@ -1366,9 +1464,7 @@ class HistoricalDataBootstrapItem(Base):
 
 class MonitoringEvent(Base):
     __tablename__ = "monitoring_events"
-    __table_args__ = (
-        UniqueConstraint("dedupe_key", name="uq_monitoring_event_dedupe"),
-    )
+    __table_args__ = (UniqueConstraint("dedupe_key", name="uq_monitoring_event_dedupe"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     watchlist_item_id: Mapped[int] = mapped_column(
         ForeignKey("watchlist_items.id", ondelete="CASCADE"), index=True
