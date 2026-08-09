@@ -23,6 +23,7 @@ jobs:
       - run: python -m ruff check .
       - run: node --check app/static/product-v1.js
       - run: node --check app/static/selected-stock.js
+      - run: node --check app/static/trading-discipline.js
       - run: git diff --check
       - name: Require exactly one Alembic head
         run: |
@@ -128,7 +129,7 @@ jobs:
           else:
               raise SystemExit("local app did not become ready")
           PY
-          python -m pytest tests/browser/test_selected_stock_smoke.py --browser chromium
+          python -m pytest tests/browser --browser chromium
       - name: Upload browser smoke artifacts
         if: failure()
         uses: actions/upload-artifact@v4

@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="/static/product-v1.css?v=20260726">
   <link rel="stylesheet" href="/static/discovery.css?v=20260727b">
   <link rel="stylesheet" href="/static/selected-stock.css?v=20260731">
+  <link rel="stylesheet" href="/static/trading-discipline.css?v=20260809">
 </head>
 <body data-page="{{ page|default('dashboard') }}">
   <aside class="sidebar">
@@ -16,7 +17,7 @@
       <span class="nav-group">今日</span><a href="/dashboard">今日工作台</a>
       <span class="nav-group">研究中心</span><a href="/selected-stock-analysis">指定股票策略</a><a href="/market">市场与主线</a><a href="/company-research">公司与财报</a><a href="/technical">技术研究</a><a href="/x-monitor">产业线索 / X</a>
       <span class="nav-group">计划与执行</span><a href="/trade-plans">交易计划</a><a href="/watchlist">观察名单</a><a href="/holdings">持仓管理</a><a href="/trades">交易记录</a>
-      <span class="nav-group">复盘与验证</span><a href="/reviews">每日 / 每周复盘</a><a href="/backtests">策略回测</a>
+      <span class="nav-group">复盘与验证</span><a href="/trading-discipline">交易训练 / 纪律</a><a href="/reviews">每日 / 每周复盘</a><a href="/backtests">策略回测</a>
       <span class="nav-group">系统</span><a href="/settings">数据源与设置</a>
     </nav>
     <a class="docs" href="/docs">API 文档 ↗</a>
@@ -208,6 +209,24 @@
       <details id="backtest-developer" class="developer-details"><summary>开发者详情（原始 JSON）</summary><pre id="backtest-json"></pre></details>
       <h3>历史验证记录</h3><div id="backtests-table" class="table-wrap"></div>
     </section>
+    <section class="panel discipline-panel" data-view="trading-discipline">
+      <div class="discipline-heading"><div><p class="eyebrow">PROCESS QUALITY · NOT A SIGNAL</p><h2>交易训练 / 纪律</h2></div><span class="discipline-badge">只约束风险，不创造买点</span></div>
+      <div class="warning">盈利不等于执行正确，亏损不等于执行错误。纪律评分不会因后续盈亏被改写。</div>
+      <div class="action-row"><label>账户 ID <input id="discipline-account-id" type="number" min="1" value="1"></label><button id="discipline-refresh" type="button">刷新训练面板</button></div>
+      <div id="discipline-overview" class="discipline-overview"><div class="missing-data">请输入账户 ID 查看训练进度。</div></div>
+      <h3>交易前决策单</h3>
+      <form id="discipline-pretrade-form" class="discipline-form">
+        <input name="account_id" type="number" min="1" value="1" required><input name="symbol" pattern="\d{6}" placeholder="股票代码" required>
+        <select name="action"><option value="BUY">BUY 新开仓</option><option value="ADD">ADD 加仓</option><option value="REDUCE">REDUCE 减仓</option><option value="EXIT">EXIT 退出</option></select>
+        <select name="market_stage"><option>SECOND_CONFIRMATION</option><option>STATE_CHANGE</option><option>ACCELERATION</option><option>CLIMAX</option><option>UNKNOWN</option></select>
+        <input name="current_price" type="number" min="0.01" step="0.0001" placeholder="当前价格" required><input name="entry_low" type="number" min="0.01" step="0.0001" placeholder="计划区下沿" required><input name="entry_high" type="number" min="0.01" step="0.0001" placeholder="计划区上沿" required>
+        <input name="hard_stop" type="number" min="0.01" step="0.0001" placeholder="硬止损" required><input name="proposed_quantity" type="number" min="0" step="100" placeholder="拟交易数量" required><input name="max_quantity" type="number" min="0" step="100" placeholder="计划最大数量" required>
+        <label class="checkbox-label"><input name="chase_risk" type="checkbox">CHASE_RISK</label><label class="checkbox-label"><input name="losing_add" type="checkbox">当前价格低于成本</label>
+        <button class="primary-action">执行纪律检查</button>
+      </form>
+      <div id="discipline-decision-sheet" class="discipline-decision"><div class="missing-data">纪律检查只表示该层是否阻断，不代表 Product V1 发出买入信号。</div></div>
+      <h3>最近训练样本：盈亏与纪律分开显示</h3><div id="discipline-recent" class="discipline-trades"></div>
+    </section>
     <section class="panel" data-view="settings"><h2>数据源与系统设置</h2><div id="settings-result" class="cards"><div class="missing-data">加载中…</div></div><div class="action-row"><button type="button" id="llm-test-button">测试大模型连接</button></div><div id="llm-test-result" class="hint">测试会发送一条极短的结构化请求，不会上传股票或账户数据。</div><details class="developer-details"><summary>技术详情 / 调试信息</summary><pre id="settings-json"></pre></details><p>密钥只通过 <code>.env</code> 配置，页面仅显示是否配置，不回显完整值。</p></section>
   </main>
   <div id="toast" role="status"></div>
@@ -215,5 +234,6 @@
   <script src="/static/product-v1.js?v=20260726"></script>
   <script src="/static/discovery.js?v=20260727b"></script>
   <script src="/static/selected-stock.js?v=20260731"></script>
+  <script src="/static/trading-discipline.js?v=20260809"></script>
 </body>
 </html>
