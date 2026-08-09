@@ -15,6 +15,7 @@ from app.api.watchlist import router as watchlist_router
 from app.api.discovery import router as discovery_router
 from app.api.history import router as history_router
 from app.api.selected_stock import router as selected_stock_router
+from app.api.trading_discipline import router as trading_discipline_router
 from app.config import get_settings
 from app.errors import install_error_handlers
 from app.logging_config import configure_logging
@@ -59,6 +60,7 @@ def create_app() -> FastAPI:
             "watchlist",
             "opportunities",
             "selected-stock-analysis",
+            "trading-discipline",
         }
         if page_name not in allowed:
             from app.errors import AppError
@@ -77,6 +79,7 @@ def create_app() -> FastAPI:
     app.include_router(discovery_router)
     app.include_router(history_router)
     app.include_router(selected_stock_router)
+    app.include_router(trading_discipline_router)
     install_error_handlers(app)
     return app
 
