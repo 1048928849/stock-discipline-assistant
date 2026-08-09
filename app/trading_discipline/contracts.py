@@ -227,3 +227,33 @@ class ThesisSnapshotInput(Contract):
         if self.initial_position > self.max_position:
             raise ValueError("initial_position cannot exceed max_position")
         return self
+
+
+class ConfirmationBiasInput(Contract):
+    holding_exists: bool
+    current_price: Decimal
+    cost_price: Decimal | None = None
+    proposed_action: ProposedAction
+    evidence_tier: EvidenceTier | None = None
+    evidence_added_after_entry: bool = False
+    original_invalidation_triggered: bool = False
+    proposed_hard_stop: Decimal | None = None
+    frozen_hard_stop: Decimal | None = None
+    thesis_changed_after_price_move: bool = False
+
+
+class ProcessConflictResult(Contract):
+    status: GateStatus
+    reason_codes: list[str]
+    reanalysis_required: bool
+    expansion_blocked: bool
+    risk_reduction_allowed: bool = True
+
+
+class EvidenceAuthorityResult(Contract):
+    tier: EvidenceTier
+    may_update_fact_set: bool
+    may_update_hypothesis: bool
+    may_modify_formal_plan: bool = False
+    formal_execution_authority: bool = False
+    requires_validation: bool

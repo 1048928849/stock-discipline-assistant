@@ -5,7 +5,9 @@ from decimal import Decimal
 from app.domain.hashing import canonical_hash
 from app.trading_discipline.contracts import (
     DetectionStatus,
+    DivergenceAssessment,
     EvidenceTier,
+    EvidenceAuthorityResult,
     GateStatus,
     MarketStage,
     PositionStressInput,
@@ -13,6 +15,8 @@ from app.trading_discipline.contracts import (
     PreTradeContext,
     PreTradeResult,
     ProposedAction,
+    ConfirmationBiasInput,
+    ProcessConflictResult,
     RuleEvaluation,
     StageAssessment,
     StageEvidence,
@@ -447,6 +451,66 @@ class TradingDisciplineService:
             add_blocked=critical,
             reanalysis_required=critical,
         )
+
+    def evidence_authority(self, tier: EvidenceTier, *, verified: bool) -> EvidenceAuthorityResult:
+        return EvidenceAuthorityResult(
+            tier=tier,
+            may_update_fact_set=tier is EvidenceTier.FACT and verified,
+            may_update_hypothesis=tier in {EvidenceTier.FACT, EvidenceTier.ANALYSIS},
+            requires_validation=tier is not EvidenceTier.FACT or not verified,
+        )
+
+    def confirmation_bias_guard(self, item: ConfirmationBiasInput) -> ProcessConflictResult:
+        reasons: list[str] = []
+        losing = item.cost_price is not None and item.current_price < item.cost_price
+        expansion = item.proposed_action in {ProposedAction.BUY, ProposedAction.ADD}
+        if item.holding_exists and item.evidence_added_after_entry:
+            reasons.append("POST_POSITION_NEW_REASON")
+        if (
+            losing
+            and item.evidence_added_after_entry
+            and item.evidence_tier in {EvidenceTier.ANALYSIS, EvidenceTier.SENTIMENT}
+        ):
+            reasons.append("LOSS_POSITION_NEW_BULLISH_REASON")
+        if expansion and item.evidence_added_after_entry:
+            reasons.append("POSITION_INCREASE_FROM_NEW_REASON")
+        if item.original_invalidation_triggered:
+            reasons.append("ORIGINAL_INVALIDATION_IGNORED")
+        if (
+            item.frozen_hard_stop is not None
+            and item.proposed_hard_stop is not None
+            and item.proposed_hard_stop < item.frozen_hard_stop
+        ):
+            reasons.append("STOP_OVERRIDE_ATTEMPT")
+        if item.thesis_changed_after_price_move:
+            reasons.append("THESIS_CHANGED_AFTER_PRICE_MOVE")
+        block_codes = {
+            "LOSS_POSITION_NEW_BULLISH_REASON",
+            "POSITION_INCREASE_FROM_NEW_REASON",
+            "ORIGINAL_INVALIDATION_IGNORED",
+            "STOP_OVERRIDE_ATTEMPT",
+        }
+        blocked = expansion and bool(block_codes.intersection(reasons))
+        return ProcessConflictResult(
+            status=GateStatus.BLOCK
+            if blocked
+            else (GateStatus.WARN if reasons else GateStatus.PASS),
+            reason_codes=reasons,
+            reanalysis_required=bool(reasons),
+            expansion_blocked=blocked,
+        )
+
+    def classify_execution(self, *, discipline_score: int, pnl_pct: Decimal | None) -> str:
+        compliant = discipline_score == 100
+        profitable = pnl_pct is not None and pnl_pct > 0
+        return ("PROFITABLE" if profitable else "LOSING") + (
+            "_COMPLIANT" if compliant else "_UNDISCIPLINED"
+        )
+
+    def assess_divergence(self, *, data_quality: str) -> DivergenceAssessment:
+        if data_quality not in {"VERIFIED_TICK", "VERIFIED_L2", "VERIFIED_MINUTE"}:
+            return DivergenceAssessment.INSUFFICIENT_DATA
+        return DivergenceAssessment.UNKNOWN
 
 
 __all__ = ["PLAYBOOK_CODE", "RULE_VERSION", "SCORE_CATEGORIES", "TradingDisciplineService"]

@@ -5,6 +5,7 @@ import pytest
 
 from app.trading_discipline.contracts import (
     BuyImpactObservation,
+    ConfirmationBiasInput,
     DetectionStatus,
     EvidenceTier,
     GateStatus,
@@ -213,3 +214,60 @@ def test_large_print_without_intraday_quality_has_no_intent_inference():
         data_quality="DAILY_ONLY",
     )
     assert observation.efficiency().value == "INSUFFICIENT_DATA"
+
+
+@pytest.mark.parametrize("tier", list(EvidenceTier))
+def test_evidence_never_has_formal_execution_authority(tier):
+    authority = service.evidence_authority(tier, verified=tier is EvidenceTier.FACT)
+    assert authority.formal_execution_authority is False
+    assert authority.may_modify_formal_plan is False
+    assert authority.may_update_fact_set is (tier is EvidenceTier.FACT)
+
+
+def test_post_position_low_authority_reason_cannot_authorize_loss_add():
+    result = service.confirmation_bias_guard(
+        ConfirmationBiasInput(
+            holding_exists=True,
+            current_price=Decimal("9"),
+            cost_price=Decimal("10"),
+            proposed_action=ProposedAction.ADD,
+            evidence_tier=EvidenceTier.ANALYSIS,
+            evidence_added_after_entry=True,
+        )
+    )
+    assert result.status is GateStatus.BLOCK
+    assert "LOSS_POSITION_NEW_BULLISH_REASON" in result.reason_codes
+    assert result.risk_reduction_allowed is True
+
+
+def test_new_fact_requires_review_and_cannot_loosen_stop():
+    result = service.confirmation_bias_guard(
+        ConfirmationBiasInput(
+            holding_exists=True,
+            current_price=Decimal("11"),
+            cost_price=Decimal("10"),
+            proposed_action=ProposedAction.ADD,
+            evidence_tier=EvidenceTier.FACT,
+            evidence_added_after_entry=True,
+            frozen_hard_stop=Decimal("9.7"),
+            proposed_hard_stop=Decimal("9.0"),
+        )
+    )
+    assert result.status is GateStatus.BLOCK
+    assert "STOP_OVERRIDE_ATTEMPT" in result.reason_codes
+    assert result.reanalysis_required is True
+
+
+def test_profit_and_loss_never_rewrite_discipline_classification():
+    assert (
+        service.classify_execution(discipline_score=40, pnl_pct=Decimal("20"))
+        == "PROFITABLE_UNDISCIPLINED"
+    )
+    assert (
+        service.classify_execution(discipline_score=100, pnl_pct=Decimal("-5"))
+        == "LOSING_COMPLIANT"
+    )
+
+
+def test_daily_data_cannot_activate_divergence_contract():
+    assert service.assess_divergence(data_quality="DAILY_ONLY").value == "INSUFFICIENT_DATA"
