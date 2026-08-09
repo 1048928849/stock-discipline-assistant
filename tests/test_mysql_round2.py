@@ -96,8 +96,7 @@ def _recreate_database(url: URL) -> None:
         with engine.connect() as connection:
             connection.exec_driver_sql(f"DROP DATABASE IF EXISTS `{database}`")
             connection.exec_driver_sql(
-                f"CREATE DATABASE `{database}` CHARACTER SET utf8mb4 "
-                "COLLATE utf8mb4_unicode_ci"
+                f"CREATE DATABASE `{database}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
             )
     finally:
         engine.dispose()
@@ -162,9 +161,7 @@ def mysql_test_url() -> URL:
                 ),
                 {"name": url.database},
             ).one()
-            if not version.startswith("8.") or "mariadb" in (
-                version + version_comment
-            ).lower():
+            if not version.startswith("8.") or "mariadb" in (version + version_comment).lower():
                 pytest.fail(f"MySQL 8 is required; server reported {version}")
             if database_charset[0] != "utf8mb4":
                 pytest.fail("isolated MySQL database must use utf8mb4")
@@ -258,9 +255,7 @@ def _persist_catalog(
     )
     router = _router(session, provider)
     result = router.company_announcements("300502", start, end)
-    refresh = persist_announcement_catalog(
-        session, router, result, start=start, end=end
-    )
+    refresh = persist_announcement_catalog(session, router, result, start=start, end=end)
     return router, result, refresh
 
 
@@ -322,9 +317,9 @@ def _seed_mysql_analysis_runs(
                     enable_ai=False,
                 ),
             )
-            assert result["decision_package"]["freeze_allowed"] is True, result[
-                "decision_package"
-            ]["blocked_reasons"]
+            assert result["decision_package"]["freeze_allowed"] is True, result["decision_package"][
+                "blocked_reasons"
+            ]
             run_ids.append(result["run_id"])
         return account.id, run_ids
 
@@ -368,9 +363,9 @@ def test_mysql8_version_empty_upgrade_and_idempotency(mysql_database: URL):
     assert session_tz
     _alembic(mysql_database, "upgrade", "head")
     current = _alembic(mysql_database, "current")
-    assert "20260809_0019" in current.stdout
+    assert "20260809_0020" in current.stdout
     heads = _alembic(mysql_database, "heads")
-    assert "20260809_0019" in heads.stdout
+    assert "20260809_0020" in heads.stdout
     _alembic(mysql_database, "upgrade", "head")
 
 
@@ -446,15 +441,11 @@ def test_mysql_0015_candidate_discovery_round_trip(mysql_database: URL):
     _alembic(mysql_database, "upgrade", "head")
     _alembic(mysql_database, "downgrade", "20260727_0014")
     engine = create_engine(mysql_database, pool_pre_ping=True)
-    assert not set(_CANDIDATE_DISCOVERY_TABLES) & set(
-        inspect(engine).get_table_names()
-    )
+    assert not set(_CANDIDATE_DISCOVERY_TABLES) & set(inspect(engine).get_table_names())
     _alembic(mysql_database, "upgrade", "head")
     inspector = inspect(engine)
     assert set(_CANDIDATE_DISCOVERY_TABLES) <= set(inspector.get_table_names())
-    run_columns = {
-        item["name"] for item in inspector.get_columns("candidate_discovery_runs")
-    }
+    run_columns = {item["name"] for item in inspector.get_columns("candidate_discovery_runs")}
     assert {
         "total_constituents",
         "historical_data_ready",
@@ -462,12 +453,10 @@ def test_mysql_0015_candidate_discovery_round_trip(mysql_database: URL):
         "coverage_ratio",
     } <= run_columns
     run_constraints = {
-        item["name"]
-        for item in inspector.get_unique_constraints("candidate_discovery_runs")
+        item["name"] for item in inspector.get_unique_constraints("candidate_discovery_runs")
     }
     candidate_constraints = {
-        item["name"]
-        for item in inspector.get_unique_constraints("discovery_candidates")
+        item["name"] for item in inspector.get_unique_constraints("discovery_candidates")
     }
     assert "uq_candidate_discovery_run_identity" in run_constraints
     assert "uq_discovery_candidate_run_symbol" in candidate_constraints
@@ -478,23 +467,15 @@ def test_mysql_0016_history_bootstrap_round_trip(mysql_database: URL):
     _alembic(mysql_database, "upgrade", "head")
     _alembic(mysql_database, "downgrade", "20260727_0015")
     engine = create_engine(mysql_database, pool_pre_ping=True)
-    assert not set(_HISTORY_BOOTSTRAP_TABLES) & set(
-        inspect(engine).get_table_names()
-    )
+    assert not set(_HISTORY_BOOTSTRAP_TABLES) & set(inspect(engine).get_table_names())
     _alembic(mysql_database, "upgrade", "head")
     inspector = inspect(engine)
     assert set(_HISTORY_BOOTSTRAP_TABLES) <= set(inspector.get_table_names())
     run_constraints = {
-        item["name"]
-        for item in inspector.get_unique_constraints(
-            "historical_data_bootstrap_runs"
-        )
+        item["name"] for item in inspector.get_unique_constraints("historical_data_bootstrap_runs")
     }
     item_constraints = {
-        item["name"]
-        for item in inspector.get_unique_constraints(
-            "historical_data_bootstrap_items"
-        )
+        item["name"] for item in inspector.get_unique_constraints("historical_data_bootstrap_items")
     }
     assert "uq_history_bootstrap_run_identity" in run_constraints
     assert "uq_history_bootstrap_item_scope" in item_constraints
@@ -505,9 +486,7 @@ def test_mysql_0017_bootstrap_adapter_identity_round_trip(mysql_database: URL):
     _alembic(mysql_database, "upgrade", "head")
     engine = create_engine(mysql_database, pool_pre_ping=True)
     columns = {
-        item["name"]: item for item in inspect(engine).get_columns(
-            "historical_data_bootstrap_runs"
-        )
+        item["name"]: item for item in inspect(engine).get_columns("historical_data_bootstrap_runs")
     }
     assert columns["adapter_version"]["type"].length == 64
     _alembic(mysql_database, "downgrade", "20260728_0016")
@@ -528,15 +507,12 @@ def test_mysql_watchlist_monitor_lease_is_atomic(mysql_head_url: URL):
     def worker(token: str) -> None:
         with factory() as db:
             barrier.wait()
-            acquired = acquire_monitor_lease(
-                db, owner_token=token, lease_seconds=60, now=now
-            )
+            acquired = acquire_monitor_lease(db, owner_token=token, lease_seconds=60, now=now)
             with result_lock:
                 outcomes.append((token, acquired))
 
     threads = [
-        Thread(target=worker, args=(token,))
-        for token in ("mysql-worker-a", "mysql-worker-b")
+        Thread(target=worker, args=(token,)) for token in ("mysql-worker-a", "mysql-worker-b")
     ]
     for thread in threads:
         thread.start()
@@ -699,12 +675,8 @@ def test_mysql_schema_constraints_json_and_full_url_index(mysql_head_url: URL):
         "company_research_refreshes": ("quality_record_id",),
     }
     for table_name, columns in expected_fks.items():
-        assert (columns, "data_quality_records") in _foreign_key_pairs(
-            inspector, table_name
-        )
-    plan_uniques = {
-        item["name"] for item in inspector.get_unique_constraints("trade_plans")
-    }
+        assert (columns, "data_quality_records") in _foreign_key_pairs(inspector, table_name)
+    plan_uniques = {item["name"] for item in inspector.get_unique_constraints("trade_plans")}
     assert {
         "uq_trade_plan_analysis_run",
         "uq_trade_plan_account_symbol_version",
@@ -880,9 +852,7 @@ def test_mysql_profile_flush_failure_rolls_back_business_savepoint(mysql_head_ur
                 "FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='profile failure'"
             )
         )
-        replacement_router = _router(
-            session, MySQLResearchProvider(profile_name="replacement")
-        )
+        replacement_router = _router(session, MySQLResearchProvider(profile_name="replacement"))
         replacement = replacement_router.company_profile("300502")
         with pytest.raises(DBAPIError):
             persist_company_profile(session, replacement_router, replacement)
@@ -930,9 +900,7 @@ def test_mysql_announcement_insert_failure_restores_old_catalog(mysql_head_url: 
         session.commit()
         router = _router(
             session,
-            MySQLResearchProvider(
-                announcements=[_announcement_row(2, end, url=collision)]
-            ),
+            MySQLResearchProvider(announcements=[_announcement_row(2, end, url=collision)]),
         )
         result = router.company_announcements("300502", start, end)
         with pytest.raises(IntegrityError):
@@ -986,9 +954,7 @@ def test_mysql_concurrent_confirm_same_run_is_idempotent_and_uses_for_update(
     mysql_session_factory,
     monkeypatch,
 ):
-    _, run_ids = _seed_mysql_analysis_runs(
-        mysql_session_factory, monkeypatch, run_count=1
-    )
+    _, run_ids = _seed_mysql_analysis_runs(mysql_session_factory, monkeypatch, run_count=1)
     statements = []
     statement_lock = Lock()
 
@@ -1008,9 +974,7 @@ def test_mysql_concurrent_confirm_same_run_is_idempotent_and_uses_for_update(
     engine = mysql_session_factory.kw["bind"]
     event.listen(engine, "before_cursor_execute", capture_for_update)
     try:
-        outcomes = _confirm_threads(
-            mysql_session_factory, [run_ids[0], run_ids[0]]
-        )
+        outcomes = _confirm_threads(mysql_session_factory, [run_ids[0], run_ids[0]])
     finally:
         event.remove(engine, "before_cursor_execute", capture_for_update)
     assert [item[0] for item in outcomes].count("ok") == 1, outcomes
@@ -1028,9 +992,7 @@ def test_mysql_concurrent_same_plan_version_maps_to_business_conflict(
     mysql_session_factory,
     monkeypatch,
 ):
-    _, run_ids = _seed_mysql_analysis_runs(
-        mysql_session_factory, monkeypatch, run_count=2
-    )
+    _, run_ids = _seed_mysql_analysis_runs(mysql_session_factory, monkeypatch, run_count=2)
     insert_barrier = Barrier(2)
 
     def synchronize_trade_plan_insert(
@@ -1095,9 +1057,10 @@ def test_mysql_datetime_round_trip_is_not_shifted(mysql_head_url: URL, session_t
     assert market_value == stored
     assert research_value == stored
     assert market_storage_naive_to_aware(market_value).replace(tzinfo=None) == stored
-    assert utc_storage_naive_to_aware(research_value).astimezone(timezone.utc).replace(
-        tzinfo=None
-    ) == stored
+    assert (
+        utc_storage_naive_to_aware(research_value).astimezone(timezone.utc).replace(tzinfo=None)
+        == stored
+    )
     engine.dispose()
 
 
@@ -1155,9 +1118,7 @@ def test_mysql_0009_duplicate_plan_upgrade_fails_actionably(
     _alembic(mysql_database, "upgrade", "20260723_0008")
     engine = create_engine(mysql_database, pool_pre_ping=True)
     with engine.begin() as connection:
-        connection.exec_driver_sql(
-            f"ALTER TABLE trade_plans DROP INDEX `{constraint_name}`"
-        )
+        connection.exec_driver_sql(f"ALTER TABLE trade_plans DROP INDEX `{constraint_name}`")
     SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
     with SessionLocal() as session:
         account = Account(
