@@ -64,6 +64,12 @@ class Provider(DataProvider):
             observed_at=observed,
             source="freestockdb+akshare-limit-pools",
             fetched_at=NOW,
+            membership_digest="b" * 64,
+            reconciliation_digest="c" * 64,
+            reconciliation_status="COMPLETE",
+            primary_count=5486,
+            supplementary_count=0,
+            source_lineage={"membership_provider": "fixture-security-master"},
         )
         return ObservedRows(
             [row],
@@ -90,6 +96,14 @@ def test_same_day_capture_is_idempotent(session):
     assert provider.calls == 1
     assert session.scalar(select(func.count(MarketBreadthSnapshot.id))) == 1
     assert session.scalar(select(func.count(DataQualityRecord.id))) == 1
+    snapshot = session.scalar(select(MarketBreadthSnapshot))
+    assert snapshot.universe_id == "A_SHARE_SH_SZ"
+    assert snapshot.universe_version == "1.0.0"
+    assert snapshot.membership_digest == "b" * 64
+    assert snapshot.reconciliation_digest == "c" * 64
+    assert snapshot.reconciliation_status == "COMPLETE"
+    assert snapshot.primary_count == 5486
+    assert snapshot.source_lineage["membership_provider"] == "fixture-security-master"
 
 
 def test_force_refresh_changed_success_creates_new_lineage(session):

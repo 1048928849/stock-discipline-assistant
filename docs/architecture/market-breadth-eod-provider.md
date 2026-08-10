@@ -1,53 +1,54 @@
-# Recent-window market breadth provider
+# Canonical market breadth provider
 
-`market-breadth-eod/1.0.0` owns only `market.breadth.daily`. It combines fields
-from two sources without treating them as independent verification of the same
-business value:
+`market-breadth-eod/1.0.0` owns `market.breadth.daily`. Its universe is the
+versioned `A_SHARE_SH_SZ/1.0.0` contract: Shanghai main board and STAR Market,
+Shenzhen main board and ChiNext, common stocks only. BSE, B shares, ETFs, funds,
+bonds and indices are outside this scope. The product must call this universe
+“沪深普通A股”, never “全A市场”.
 
-- FreeStockDB supplies one bounded `日k` cross-section request with fixed native
-  parameters: `cmd=vals`, `k1=all:`, and `k2=key:YYYYMMDD`.
-- AKShare supplies the official recent-window limit-up and limit-down pools through
-  the process-isolated `limit_pools` worker.
+BaoStock security master evidence derives the date-specific membership snapshot.
+Listing and delisting dates decide historical membership; exchange and board are
+classified from normalized codes, never display names. The membership digest is
+independent of fetch time.
 
-The successful daily path uses three source requests. The AKShare worker accepts one
-fixed JSON request, emits one bounded JSON response, runs with `shell=False`, and is
-killed and reaped after its hard timeout. Arbitrary modules, functions, URLs, and
-commands are not accepted.
+## Reconciliation
 
-## Universe and failure policy
+FreeStockDB is the primary exact-date price cross-section. Every listed member must
+have a valid close and previous close. A bounded public-history adapter may fill a
+small primary-provider gap only when symbol, date, units and adjustment semantics
+are validated. It records `BREADTH_PRIMARY_PROVIDER_GAP_SUPPLEMENTED`; it is not an
+independent vote and cannot conceal an unresolved member.
 
-The normalized universe includes recognized Shanghai, Shenzhen, and Beijing A-share
-code ranges. B shares, funds, ETFs, bonds, indices, invalid prices, and rows without
-positive volume are excluded. ST securities remain included. Prices and percentage
-changes use `Decimal`, and normalized rows are sorted by symbol before hashing.
+AKShare provides raw limit-up/down pools through a bounded, process-isolated worker.
+Raw pools are projected onto the same membership snapshot. Outside-scope symbols,
+including BSE securities, remain visible in reconciliation lineage but are not
+counted as missing SH/SZ members. An in-scope pool member without price evidence
+blocks persistence.
 
-Official pool symbols are intersected with the valid universe. Known non-target
-instruments are recorded and excluded. A target A-share missing a valid daily row
-fails with `BREADTH_UNIVERSE_INCOMPLETE`; unknown or unnormalizable symbols fail with
-`BREADTH_POOL_UNIVERSE_MISMATCH`. The provider never substitutes a 9.8 percent rule,
-zero, a broken-limit pool, or a spot snapshot.
+Only `COMPLETE` and `COMPLETE_WITH_SUPPLEMENTARY_DATA` are persistable. `INCOMPLETE`
+and `UNIVERSE_UNAVAILABLE` cannot create neutral market state, increase risk, or
+produce a persisted market regime. Suspensions are excluded only with explicit
+suspension evidence; no zero return is invented.
 
-AKShare's down-limit pool is limited to the recent window. Requests older than 30
-calendar days fail with `BREADTH_LIMIT_EVIDENCE_UNAVAILABLE`. Therefore this provider
-supports latest-session EOD capture and bounded recent backfill, not arbitrary
-historical reconstruction.
+## Persistence and identity
 
-## Persistence and scheduling
+Every breadth snapshot binds universe ID/version, membership and reconciliation
+digests, primary/supplementary counts, completeness and source lineage. Its unique
+identity includes the universe version and trade date. Fetch timestamps do not
+change business identity, while changed membership or universe policy does.
 
-The capture service uses the normal Router audit and product persistence path. A
-successful result is persisted atomically and then marked persisted; failed refreshes
-leave the previous cache untouched. Same-date captures reuse an existing trusted row
-unless an explicit internal force refresh is requested.
+The capability subject is `market/CN-A/daily/a-share-sh-sz`. Product V1 exposes the
+universe name, covered exchanges/boards, as-of date, completeness, source counts and
+degradation state beside breadth. Technical symbol-level reconciliation stays in
+collapsed evidence/lineage.
 
-The existing scheduler can run one post-close capture when
-`MARKET_BREADTH_ENABLED=true`. A database lease prevents overlapping executions.
-The setting defaults to disabled, and no online request automatically backfills
-multiple dates.
+## Bounded execution
 
-## Current external limitation
+The security-master and limit-pool adapters use fixed subprocess protocols,
+`shell=False`, output limits, hard timeouts and kill/reap cleanup. FreeStockDB is
+restricted to loopback. Supplementation is capped by
+`MARKET_BREADTH_MAX_SUPPLEMENT_SYMBOLS` and never expands into an unbounded crawl.
 
-The July 29, 2026 acceptance probe found official pool symbols `301583` on July 24
-and `920176` on July 28 absent from the corresponding FreeStockDB cross-sections.
-The strict provider correctly blocks both captures. Until upstream universe coverage
-is complete, a real executable `MarketRegimeSnapshot` cannot be claimed from this
-source combination, and P1D remains blocked.
+The provider supports recent-session EOD capture. Missing local FreeStockDB service
+is an external-data limitation and is reported as unavailable, not replaced with a
+spot snapshot or fabricated breadth.
