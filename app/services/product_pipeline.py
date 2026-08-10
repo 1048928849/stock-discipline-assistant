@@ -138,9 +138,7 @@ class RequiredDataPlan(ProductPipelineModel):
         ]
         if len(scopes) != len(set(scopes)):
             raise ValueError("duplicate required data scope")
-        expected = canonical_hash(
-            self.model_dump(mode="python", exclude={"plan_hash"})
-        )
+        expected = canonical_hash(self.model_dump(mode="python", exclude={"plan_hash"}))
         if self.plan_hash is not None and self.plan_hash != expected:
             raise ValueError("plan_hash does not match required data plan")
         object.__setattr__(self, "plan_hash", expected)
@@ -159,6 +157,7 @@ class ProductPipelineResult(ProductPipelineModel):
     strategy_bindings: tuple[StrategyBinding, ...]
     strategy_signals: tuple[StrategySignal, ...]
     data_completeness: Decimal = Field(ge=0, le=1)
+    breadth_universe: dict[str, Any] | None = None
 
 
 def build_required_data_plan(
@@ -279,23 +278,26 @@ def select_product_data(
 
 
 def has_product_cache(db: Session, symbol: str) -> bool:
-    return db.scalar(
-        select(DataQualityRecord.id)
-        .where(
-            DataQualityRecord.persisted.is_(True),
-            DataQualityRecord.subject_type == "stock",
-            DataQualityRecord.subject_id == symbol,
-            DataQualityRecord.capability.in_(
-                (
-                    "market.intraday.60m",
-                    "market.turnover.daily",
-                    "company.concepts",
-                    "company.industry_chain",
-                )
-            ),
+    return (
+        db.scalar(
+            select(DataQualityRecord.id)
+            .where(
+                DataQualityRecord.persisted.is_(True),
+                DataQualityRecord.subject_type == "stock",
+                DataQualityRecord.subject_id == symbol,
+                DataQualityRecord.capability.in_(
+                    (
+                        "market.intraday.60m",
+                        "market.turnover.daily",
+                        "company.concepts",
+                        "company.industry_chain",
+                    )
+                ),
+            )
+            .limit(1)
         )
-        .limit(1)
-    ) is not None
+        is not None
+    )
 
 
 def router_supports_product_data(router: DataHubRouter) -> bool:
@@ -308,9 +310,7 @@ def router_supports_product_data(router: DataHubRouter) -> bool:
     )
 
 
-def should_run_product_pipeline(
-    db: Session, router: DataHubRouter, symbol: str
-) -> bool:
+def should_run_product_pipeline(db: Session, router: DataHubRouter, symbol: str) -> bool:
     return has_product_cache(db, symbol) or router_supports_product_data(router)
 
 
@@ -383,10 +383,14 @@ def refresh_product_data(
                 industry=industry,
                 analysis_started_at=analysis_started_at,
             )
-            if result.quality_status in {
-                DataQualityStatus.VERIFIED,
-                DataQualityStatus.SINGLE_SOURCE,
-            } and result.value:
+            if (
+                result.quality_status
+                in {
+                    DataQualityStatus.VERIFIED,
+                    DataQualityStatus.SINGLE_SOURCE,
+                }
+                and result.value
+            ):
                 persist_product_result(db, router, result)
         except Exception:
             # The Router has already audited provider failures. Selection below decides
@@ -444,9 +448,7 @@ def _json_value(value: Any) -> Any:
 def _orm_payload(row: Any) -> dict[str, Any]:
     if isinstance(row, tuple) or hasattr(row, "_mapping"):
         items = tuple(row)
-        position = next(
-            (item for item in items if isinstance(item, CompanyChainPosition)), None
-        )
+        position = next((item for item in items if isinstance(item, CompanyChainPosition)), None)
         node = next((item for item in items if isinstance(item, IndustryChainNode)), None)
         chain = next((item for item in items if isinstance(item, IndustryChain)), None)
         if position is not None and node is not None and chain is not None:
@@ -500,12 +502,8 @@ def snapshot_from_product_data(
                 quality_status=selection.effective_quality.effective_quality,
                 executable=selection.executable,
                 quality_record_id=selection.quality_record_id,
-                observed_at=_aware_record_time(record, record.observed_at)
-                if record
-                else None,
-                fetched_at=_aware_record_time(record, record.fetched_at)
-                if record
-                else None,
+                observed_at=_aware_record_time(record, record.observed_at) if record else None,
+                fetched_at=_aware_record_time(record, record.fetched_at) if record else None,
                 normalized_digest=record.normalized_digest if record else None,
                 rows=tuple(_orm_payload(row) for row in selection.rows),
                 evidence_refs=(f"product:{capability}",),
@@ -520,11 +518,7 @@ def snapshot_from_product_data(
         record = db.get(DataQualityRecord, binding.quality_record_id)
         rows: tuple[dict[str, Any], ...] = (dict(evidence.payload),)
         if data_capability in {"market.daily.qfq", "market.index_daily"}:
-            cache_symbol = (
-                symbol
-                if data_capability == "market.daily.qfq"
-                else binding.subject_id
-            )
+            cache_symbol = symbol if data_capability == "market.daily.qfq" else binding.subject_id
             stored = db.scalars(
                 select(MarketDailyBar)
                 .where(
@@ -549,9 +543,7 @@ def snapshot_from_product_data(
                 observed_at=_aware_record_time(record, record.observed_at)
                 if record
                 else to_shanghai_aware(binding.observed_at),
-                fetched_at=_aware_record_time(record, record.fetched_at)
-                if record
-                else None,
+                fetched_at=_aware_record_time(record, record.fetched_at) if record else None,
                 normalized_digest=record.normalized_digest if record else None,
                 rows=rows,
                 evidence_refs=(evidence.evidence_id,),
@@ -640,23 +632,23 @@ def analyze_snapshot(
     breadth_row = breadth.rows[-1] if breadth and breadth.rows else None
     if breadth_row:
         market_input = dict(
-                current=BreadthMetrics(
-                    trade_date=date.fromisoformat(str(breadth_row["trade_date"])),
-                    advancing=breadth_row["advancing"],
-                    declining=breadth_row["declining"],
-                    unchanged=breadth_row["unchanged"],
-                    limit_up=breadth_row["limit_up"],
-                    limit_down=breadth_row["limit_down"],
-                    new_highs=breadth_row.get("new_highs"),
-                    new_lows=breadth_row.get("new_lows"),
-                    median_change_pct=breadth_row.get("median_change_pct"),
-                    above_ma20_ratio=breadth_row.get("above_ma20_ratio"),
-                    above_ma50_ratio=breadth_row.get("above_ma50_ratio"),
-                ),
-                amount_history=tuple(
-                    Decimal(str(row["total_amount"])) for row in (amount.rows if amount else ())
-                ),
-                index_changes=index_changes,
+            current=BreadthMetrics(
+                trade_date=date.fromisoformat(str(breadth_row["trade_date"])),
+                advancing=breadth_row["advancing"],
+                declining=breadth_row["declining"],
+                unchanged=breadth_row["unchanged"],
+                limit_up=breadth_row["limit_up"],
+                limit_down=breadth_row["limit_down"],
+                new_highs=breadth_row.get("new_highs"),
+                new_lows=breadth_row.get("new_lows"),
+                median_change_pct=breadth_row.get("median_change_pct"),
+                above_ma20_ratio=breadth_row.get("above_ma20_ratio"),
+                above_ma50_ratio=breadth_row.get("above_ma50_ratio"),
+            ),
+            amount_history=tuple(
+                Decimal(str(row["total_amount"])) for row in (amount.rows if amount else ())
+            ),
+            index_changes=index_changes,
         )
         if previous_market_state is None:
             previous_market_state = infer_market_state_without_history(
@@ -841,12 +833,8 @@ def _persist_market_regime(
     stored.transition = regime.transition
     stored.product_snapshot_hash = snapshot.snapshot_hash
     stored.observed_at = _market_time_for_storage(observed_at)
-    stored.quality_status = _analysis_quality(
-        snapshot, _MARKET_STATE_CAPABILITIES
-    ).value
-    stored.quality_bindings = _analysis_quality_bindings(
-        snapshot, _MARKET_STATE_CAPABILITIES
-    )
+    stored.quality_status = _analysis_quality(snapshot, _MARKET_STATE_CAPABILITIES).value
+    stored.quality_bindings = _analysis_quality_bindings(snapshot, _MARKET_STATE_CAPABILITIES)
 
 
 def _persist_industry_context(
@@ -918,7 +906,9 @@ def _product_evidence(
     for item in snapshot.capabilities:
         if not item.capability.startswith(("market.", "company.")):
             continue
-        record = db.get(DataQualityRecord, item.quality_record_id) if item.quality_record_id else None
+        record = (
+            db.get(DataQualityRecord, item.quality_record_id) if item.quality_record_id else None
+        )
         binding = None
         if item.quality_record_id and item.observed_at:
             binding = MarketQualityBinding(
@@ -993,19 +983,13 @@ def run_product_pipeline(
     )
     _persist_market_regime(db, snapshot, market)
     _persist_industry_context(db, snapshot, industry_context)
-    required_statuses = [
-        item.quality_status for item in snapshot.capabilities if item.required
-    ]
+    required_statuses = [item.quality_status for item in snapshot.capabilities if item.required]
     data_quality = worst_quality(required_statuses)
-    constituent_capability = _capability(
-        snapshot, "market.industry.constituents"
-    )
+    constituent_capability = _capability(snapshot, "market.industry.constituents")
     universe_industry = next(
         (
             str(row.get("industry_name") or row.get("industry"))
-            for row in (
-                constituent_capability.rows if constituent_capability else ()
-            )
+            for row in (constituent_capability.rows if constituent_capability else ())
             if str(row.get("symbol") or "").zfill(6) == symbol
         ),
         None,
@@ -1068,7 +1052,31 @@ def run_product_pipeline(
     evidence = _product_evidence(db, snapshot)
     executable_count = sum(item.executable for item in snapshot.capabilities if item.required)
     required_count = sum(item.required for item in snapshot.capabilities)
-    completeness = Decimal(executable_count) / Decimal(required_count) if required_count else Decimal(0)
+    completeness = (
+        Decimal(executable_count) / Decimal(required_count) if required_count else Decimal(0)
+    )
+    breadth_capability = _capability(snapshot, "market.breadth.daily")
+    breadth_row = (
+        breadth_capability.rows[-1] if breadth_capability and breadth_capability.rows else None
+    )
+    breadth_universe = None
+    if breadth_row:
+        breadth_universe = {
+            "universe_id": breadth_row.get("universe_id"),
+            "universe_version": breadth_row.get("universe_version"),
+            "universe_name": "沪深普通A股",
+            "exchanges": ["上海证券交易所", "深圳证券交易所"],
+            "boards": ["沪市主板", "科创板", "深市主板", "创业板"],
+            "as_of_date": breadth_row.get("trade_date"),
+            "completeness": breadth_row.get("reconciliation_status"),
+            "primary_count": breadth_row.get("primary_count"),
+            "supplementary_count": breadth_row.get("supplementary_count"),
+            "degradation_status": (
+                "SUPPLEMENTARY_DATA_USED"
+                if breadth_row.get("supplementary_count", 0) > 0
+                else "NONE"
+            ),
+        }
     return ProductPipelineResult(
         required_data=required_data,
         snapshot=snapshot,
@@ -1081,6 +1089,7 @@ def run_product_pipeline(
         strategy_bindings=tuple(bindings),
         strategy_signals=strategy_signals,
         data_completeness=completeness,
+        breadth_universe=breadth_universe,
     )
 
 
