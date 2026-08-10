@@ -118,6 +118,7 @@ class Settings(BaseSettings):
     )
     market_breadth_max_cross_section_rows: int = Field(default=10_000, ge=1, le=20_000)
     market_breadth_max_pool_rows: int = Field(default=2_000, ge=1, le=2_000)
+    market_breadth_max_supplement_symbols: int = Field(default=25, ge=0, le=100)
     market_breadth_history_window_days: int = Field(default=30, ge=1, le=30)
     market_breadth_adapter_version: str = "1.0.0"
     market_breadth_capture_hour: int = Field(default=16, ge=15, le=23)
