@@ -62,6 +62,7 @@
     const exit = trade.exit_plan || {};
     const technical = data.technical_context || {};
     const market = data.market_regime || {};
+    const breadthUniverse = data.breadth_universe || {};
     const industry = data.industry_context || {};
     const concept = data.concept_chain_context || {};
     concept.chain = concept.chain_name;
@@ -83,6 +84,9 @@
         <div class="product-field-grid">
           ${field("市场周期", market.state, true)}${field("市场仓位上限", market.market_position_cap)}
           ${field("上涨占比", market.advance_ratio)}${field("主动进攻", market.offensive_allowed === true ? "允许" : "不允许")}
+          ${field("宽度范围", breadthUniverse.universe_name || "数据不足")}${field("宽度日期", breadthUniverse.as_of_date)}
+          ${field("成员完整性", breadthUniverse.completeness)}${field("主源 / 补充", `${text(breadthUniverse.primary_count)} / ${text(breadthUniverse.supplementary_count)}`)}
+          ${field("覆盖交易所", (breadthUniverse.exchanges || []).join("、"))}${field("降级状态", breadthUniverse.degradation_status)}
           ${field("当前主线", (industry.mainlines || []).join("、"))}${field("次主线", (industry.secondary || []).join("、"))}
           ${field("退潮行业", (industry.fading_industries || []).join("、"))}${field("数据完整度", market.data_completeness)}
         </div>

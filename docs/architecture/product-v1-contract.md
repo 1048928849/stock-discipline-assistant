@@ -13,7 +13,7 @@ lineage, Evidence, package hashing, and freeze semantics remain authoritative.
 | `market.intraday.60m` | `stock/{symbol}` | `60m/qfq/CNY/share` | `MarketIntradayBar` |
 | `market.turnover.daily` | `stock/{symbol}` | `daily/ratio` | `MarketTurnoverSnapshot` |
 | `market.index_daily` | `index/{index}` | `daily/unadjusted/CNY/point` | `MarketIndexBar` |
-| `market.breadth.daily` | `market/CN-A` | `daily/all-a` | `MarketBreadthSnapshot` |
+| `market.breadth.daily` | `market/CN-A` | `daily/a-share-sh-sz` | `MarketBreadthSnapshot` |
 | `market.amount.daily` | `market/CN-A` | `daily/CNY` | `MarketAmountSnapshot` |
 | `market.industry.daily` | `industry/{industry}` | `daily/unadjusted/CNY/point` | `IndustryMarketSnapshot` |
 | `market.industry.constituents` | `industry/{industry}` | `constituents/current` | `IndustryConstituentSnapshot` |

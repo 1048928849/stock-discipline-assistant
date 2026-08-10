@@ -241,13 +241,15 @@ def _router(session, *providers) -> DataHubRouter:
 def test_product_subjects_have_stable_semantic_scopes():
     assert stock_intraday_subject("300502").semantic_key == "60m/qfq/CNY/share"
     assert stock_turnover_subject("300502").semantic_key == "daily/ratio"
-    assert market_breadth_subject().stable_key == ("market", "CN-A", "daily/all-a")
+    assert market_breadth_subject().stable_key == (
+        "market",
+        "CN-A",
+        "daily/a-share-sh-sz",
+    )
     assert market_amount_subject().stable_key == ("market", "CN-A", "daily/CNY")
     assert industry_constituents_subject(" 电子 ").semantic_key == "constituents/current"
     assert company_concepts_subject("300502").semantic_key == "concepts/current"
-    assert company_industry_chain_subject("300502").semantic_key == (
-        "industry-chain/current"
-    )
+    assert company_industry_chain_subject("300502").semantic_key == ("industry-chain/current")
 
 
 def test_incomplete_intraday_bar_is_missing_and_not_persistable(session):
@@ -375,16 +377,12 @@ def test_company_mapping_refresh_is_idempotent(session):
     persist_product_result(session, router, second)
     session.commit()
     assert session.query(CompanyConcept).count() == 1
-    assert session.query(CompanyConcept).one().quality_record_id == (
-        second.quality_record_id
-    )
+    assert session.query(CompanyConcept).one().quality_record_id == (second.quality_record_id)
 
 
 def test_product_cache_selector_recomputes_freshness(session):
     router = _router(session, FullProductProvider())
-    result = router.get_turnover_daily(
-        "300502", date(2026, 7, 1), date(2026, 7, 24)
-    )
+    result = router.get_turnover_daily("300502", date(2026, 7, 1), date(2026, 7, 24))
     persist_product_result(session, router, result)
     session.commit()
     fresh = resolve_product_cache(
@@ -519,10 +517,7 @@ def test_akshare_three_industry_universe_produces_mainline_secondary_and_fading(
     provider = AKShareProvider(now_fn=lambda: NOW)
     provider._ak = lambda: FakeAkshare()
     rows = provider.get_industry_universe(date(2026, 6, 1), date(2026, 7, 24))
-    grouped = {
-        name: tuple(row for row in rows if row.industry == name)
-        for name in industries
-    }
+    grouped = {name: tuple(row for row in rows if row.industry == name) for name in industries}
     context = analyze_industry_mainlines(
         IndustryAnalysisInput(
             industries=tuple(

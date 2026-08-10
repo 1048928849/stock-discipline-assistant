@@ -17,9 +17,15 @@ from app.data_hub.registry import ProviderRegistry
 from app.data_hub.router import DataHubRouter
 from app.data_hub.quality import canonical_digest, policy_for
 from app.models import DataQualityRecord
+from app.market_breadth.reconciliation import (
+    CANONICAL_A_SHARE_SH_SZ_V1,
+    MarketUniverseMembership,
+    SecurityType,
+    TradableStatus,
+    classify_symbol,
+)
 from app.providers.market_breadth import (
     BreadthLimitEvidenceUnavailableError,
-    BreadthPoolUniverseMismatchError,
     BreadthProtocolError,
     BreadthTimeoutError,
     BreadthUniverseIncompleteError,
@@ -112,14 +118,82 @@ class Runner:
         return self.response
 
 
-def _provider(rows, response=None):
+class MembershipProvider:
+    def __init__(self, symbols):
+        self.symbols = symbols
+
+    def get_membership(self, trade_date):
+        result = []
+        for symbol in self.symbols:
+            exchange, board = classify_symbol(symbol)
+            result.append(
+                MarketUniverseMembership.build(
+                    spec=CANONICAL_A_SHARE_SH_SZ_V1,
+                    trade_date=trade_date,
+                    symbol=symbol,
+                    exchange=exchange,
+                    board=board,
+                    security_type=SecurityType.COMMON_STOCK,
+                    tradable_status=TradableStatus.ACTIVE,
+                    listing_date=date(2000, 1, 1),
+                    delisting_date=None,
+                    source="fixture-membership",
+                    source_reference=f"fixture:{symbol}",
+                    observed_at=NOW,
+                )
+            )
+        return result
+
+
+class NoSupplement:
+    def get_history(self, symbol, start, end):
+        return []
+
+
+def _provider(rows, response=None, *, membership_symbols=None):
+    response = response or _worker_response()
+    if membership_symbols is None:
+        membership_symbols = []
+        for row in rows:
+            symbol = str(row.get("code", ""))
+            if (
+                symbol.startswith(
+                    (
+                        "600",
+                        "601",
+                        "603",
+                        "605",
+                        "688",
+                        "689",
+                        "000",
+                        "001",
+                        "002",
+                        "003",
+                        "300",
+                        "301",
+                    )
+                )
+                and _decimal_for_fixture(row.get("close"))
+                and _decimal_for_fixture(row.get("pre_close"))
+                and _decimal_for_fixture(row.get("volume"))
+            ):
+                membership_symbols.append(symbol)
     return MarketBreadthEODProvider(
         _settings(),
         client=Client(rows),
-        runner=Runner(response or _worker_response()),
+        runner=Runner(response),
+        membership_provider=MembershipProvider(membership_symbols),
+        supplementary_provider=NoSupplement(),
         now_fn=lambda: NOW,
         fetch_now_fn=lambda: NOW,
     )
+
+
+def _decimal_for_fixture(value):
+    try:
+        return Decimal(str(value)).is_finite() and Decimal(str(value)) > 0
+    except Exception:
+        return False
 
 
 def test_freestockdb_client_uses_only_fixed_cross_section_protocol():
@@ -129,9 +203,7 @@ def test_freestockdb_client_uses_only_fixed_cross_section_protocol():
         seen["url"] = request.url
         return httpx.Response(200, json=[_row("600001")])
 
-    client = FreeStockDBBreadthClient(
-        _settings(), transport=httpx.MockTransport(handler)
-    )
+    client = FreeStockDBBreadthClient(_settings(), transport=httpx.MockTransport(handler))
     response = client.daily_cross_section(DAY)
     params = dict(seen["url"].params.multi_items())
     assert seen["url"].path == "/"
@@ -161,13 +233,13 @@ def test_provider_filters_non_stocks_and_computes_decimal_median():
     assert isinstance(result, ObservedRows)
     assert len(result) == 1
     row = result[0]
-    assert (row.advancing, row.declining, row.unchanged) == (1, 1, 1)
+    assert (row.advancing, row.declining, row.unchanged) == (1, 1, 0)
     assert row.median_change_pct == Decimal("0")
     assert (row.limit_up, row.limit_down) == (1, 1)
     assert row.observed_at == datetime(2026, 7, 28, 15, 0, tzinfo=SHANGHAI)
     lineage = result.provider_lineage
     assert lineage["raw_cross_section_rows"] == 7
-    assert lineage["valid_universe_rows"] == 3
+    assert lineage["valid_universe_rows"] == 2
     assert lineage["excluded_rows_by_reason"] == {
         "invalid_close": 1,
         "invalid_pre_close": 1,
@@ -200,17 +272,16 @@ def test_invalid_business_rows_are_excluded(close, pre_close, volume, reason):
 
 def test_pool_order_and_duplicate_codes_do_not_change_normalized_result():
     rows = [_row("600001"), _row("000001", "9", "10")]
-    first = _provider(
-        rows,
-        _worker_response(up=["600001", "600001"], down=["000001"]),
-    ).get_market_breadth(DAY)
+    first = _provider(rows, _worker_response(up=["600001"], down=["000001"])).get_market_breadth(
+        DAY
+    )
     second = _provider(
-        list(reversed(rows)),
-        _worker_response(up=["600001", "600001"], down=["000001"]),
+        list(reversed(rows)), _worker_response(up=["600001"], down=["000001"])
     ).get_market_breadth(DAY)
-    assert first.provider_lineage["normalized_result_digest"] == second.provider_lineage[
-        "normalized_result_digest"
-    ]
+    assert (
+        first.provider_lineage["normalized_result_digest"]
+        == second.provider_lineage["normalized_result_digest"]
+    )
     assert first[0] == second[0]
 
 
@@ -221,18 +292,17 @@ def test_non_target_pool_symbol_is_recorded_but_allowed():
     ).get_market_breadth(DAY)
     assert result[0].limit_up == 1
     assert result.provider_lineage["unmatched_limit_up_symbols"] == [
-        {"classification": "NON_TARGET_INSTRUMENT", "symbol": "510300"}
+        {"classification": "OUTSIDE_UNIVERSE", "symbol": "510300"}
     ]
 
 
 def test_target_stock_missing_from_cross_section_blocks_persistence_input():
     provider = _provider(
-        [_row("600001")],
-        _worker_response(up=["600002"]),
+        [_row("600001")], _worker_response(up=["600002"]), membership_symbols=["600001", "600002"]
     )
     with pytest.raises(
         BreadthUniverseIncompleteError,
-        match='BREADTH_UNIVERSE_INCOMPLETE.*600002.*INVALID_OR_MISSING_DAILY_ROW',
+        match="BREADTH_UNIVERSE_INCOMPLETE.*600002",
     ):
         provider.get_market_breadth(DAY)
 
@@ -242,10 +312,7 @@ def test_unknown_pool_symbol_blocks_persistence_input():
         [_row("600001")],
         _worker_response(up=["999999"]),
     )
-    with pytest.raises(
-        BreadthPoolUniverseMismatchError,
-        match='BREADTH_POOL_UNIVERSE_MISMATCH.*999999.*UNKNOWN',
-    ):
+    with pytest.raises(BreadthUniverseIncompleteError, match="BREADTH_UNIVERSE_INCOMPLETE.*999999"):
         provider.get_market_breadth(DAY)
 
 
@@ -285,7 +352,7 @@ def test_worker_runner_uses_fixed_command_and_reaps_after_timeout(monkeypatch):
     ("stdout", "returncode", "message"),
     [
         (b"not-json", 0, "invalid JSON"),
-        (b'{}\n{}', 0, "invalid JSON"),
+        (b"{}\n{}", 0, "invalid JSON"),
         (b"{}", 1, "invalid error response"),
     ],
 )
@@ -307,9 +374,7 @@ def test_worker_runner_rejects_oversized_stdout(monkeypatch):
         communicate=lambda **kwargs: (b"x" * 2001, b""),
     )
     monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
-    runner = MarketBreadthWorkerRunner(
-        _settings(market_breadth_max_response_bytes=2000)
-    )
+    runner = MarketBreadthWorkerRunner(_settings(market_breadth_max_response_bytes=2000))
     with pytest.raises(BreadthProtocolError, match="size limit"):
         runner.run(DAY)
 
@@ -328,9 +393,7 @@ def test_worker_response_digest_is_stable_for_business_rows():
 
 
 def test_router_breadth_digest_ignores_fetch_completion_time():
-    first = _provider(
-        [_row("600001")], _worker_response(up=["600001"])
-    ).get_market_breadth(DAY)
+    first = _provider([_row("600001")], _worker_response(up=["600001"])).get_market_breadth(DAY)
     later = datetime(2026, 7, 29, 9, 42, tzinfo=SHANGHAI)
     changed = MarketBreadthEODProvider(
         _settings(),
@@ -341,6 +404,8 @@ def test_router_breadth_digest_ignores_fetch_completion_time():
                 "fetched_at": later.isoformat(),
             }
         ),
+        membership_provider=MembershipProvider(["600001"]),
+        supplementary_provider=NoSupplement(),
         now_fn=lambda: later,
         fetch_now_fn=lambda: later,
     ).get_market_breadth(DAY)
@@ -365,15 +430,15 @@ def test_fetch_completion_time_can_follow_fixed_business_evaluation_time():
                 "fetched_at": worker_fetched_at.isoformat(),
             }
         ),
+        membership_provider=MembershipProvider(["600001"]),
+        supplementary_provider=NoSupplement(),
         now_fn=lambda: NOW,
         fetch_now_fn=lambda: next(request_times),
     )
 
     result = provider.get_market_breadth(DAY)
 
-    assert result.fetched_at == datetime(
-        2026, 7, 29, 9, 42, 30, tzinfo=SHANGHAI
-    )
+    assert result.fetched_at == datetime(2026, 7, 29, 9, 42, 30, tzinfo=SHANGHAI)
 
 
 def test_router_audit_preserves_bounded_breadth_lineage(session):

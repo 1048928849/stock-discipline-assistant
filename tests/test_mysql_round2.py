@@ -363,9 +363,9 @@ def test_mysql8_version_empty_upgrade_and_idempotency(mysql_database: URL):
     assert session_tz
     _alembic(mysql_database, "upgrade", "head")
     current = _alembic(mysql_database, "current")
-    assert "20260809_0020" in current.stdout
+    assert "20260810_0021" in current.stdout
     heads = _alembic(mysql_database, "heads")
-    assert "20260809_0020" in heads.stdout
+    assert "20260810_0021" in heads.stdout
     _alembic(mysql_database, "upgrade", "head")
 
 

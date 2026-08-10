@@ -92,6 +92,14 @@ class MarketBreadthDaily:
     observed_at: datetime
     source: str
     fetched_at: datetime
+    universe_id: str = "A_SHARE_SH_SZ"
+    universe_version: str = "1.0.0"
+    membership_digest: str = ""
+    reconciliation_digest: str = ""
+    reconciliation_status: str = "INCOMPLETE"
+    primary_count: int = 0
+    supplementary_count: int = 0
+    source_lineage: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -309,9 +317,7 @@ _FUTURE_TIME_TOLERANCE = timedelta(seconds=1)
 
 def _aware_shanghai_datetime(value: datetime, field: str) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None:
-        raise ProviderUnavailableError(
-            f"market contract requires timezone-aware {field}"
-        )
+        raise ProviderUnavailableError(f"market contract requires timezone-aware {field}")
     return value.astimezone(SHANGHAI_TZ)
 
 
@@ -378,9 +384,7 @@ def validate_quote_contract(
                 "latest-close quote contract requires official session close time"
             )
         if observed.date() > calendar.latest_completed_session(current):
-            raise ProviderUnavailableError(
-                "latest-close quote contract session is not completed"
-            )
+            raise ProviderUnavailableError("latest-close quote contract session is not completed")
         return
 
     raise ProviderUnavailableError(f"unsupported quote capability contract: {capability}")
@@ -399,9 +403,7 @@ def validate_daily_bar_contract(
         "market.daily.unadjusted": "unadjusted",
     }.get(capability)
     if expected_adjustment is None:
-        raise ProviderUnavailableError(
-            f"unsupported daily capability contract: {capability}"
-        )
+        raise ProviderUnavailableError(f"unsupported daily capability contract: {capability}")
     if not isinstance(bars, list) or not bars:
         raise ProviderUnavailableError("daily contract requires a non-empty list")
     current = _aware_shanghai_datetime(evaluated_at, "evaluated_at")
@@ -436,9 +438,7 @@ def validate_daily_bar_contract(
                 "daily contract trade_date is not an exchange session"
             ) from exc
         if bar.trade_date > latest_completed:
-            raise ProviderUnavailableError(
-                "daily contract contains an incomplete exchange session"
-            )
+            raise ProviderUnavailableError("daily contract contains an incomplete exchange session")
         if observed != expected_close:
             raise ProviderUnavailableError(
                 "daily contract observed_at must equal official session close"
@@ -470,6 +470,4 @@ def validate_daily_bar_contract(
     if max(fetched_times) - min(fetched_times) > _FUTURE_TIME_TOLERANCE:
         raise ProviderUnavailableError("daily contract fetched_at mismatch")
     if dates != sorted(set(dates)):
-        raise ProviderUnavailableError(
-            "daily contract trade_date must be unique and increasing"
-        )
+        raise ProviderUnavailableError("daily contract trade_date must be unique and increasing")

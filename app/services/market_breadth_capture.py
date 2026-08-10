@@ -48,7 +48,7 @@ def _existing_capture(
         or quality.capability != "market.breadth.daily"
         or quality.subject_type != "market"
         or quality.subject_id != "CN-A"
-        or canonical_semantic_key(quality.semantic_key) != "daily/all-a"
+        or canonical_semantic_key(quality.semantic_key) != "daily/a-share-sh-sz"
         or not quality.persisted
         or not quality.trusted
         or not quality.normalized_digest

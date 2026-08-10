@@ -30,15 +30,23 @@ from app.data_hub.trading_calendar import (
     shanghai_now,
     to_shanghai_aware,
 )
+from app.market_breadth.reconciliation import (
+    CANONICAL_A_SHARE_SH_SZ_V1,
+    BreadthPriceEvidence,
+    ReconciliationStatus,
+    reconcile_market_breadth_universe,
+)
 from app.providers.market_breadth_worker import (
     OPERATION,
     WORKER_PROTOCOL_VERSION,
 )
+from app.providers.market_universe import BaoStockSecurityMasterProvider
+from app.providers.selected_stock_history import SelectedStockPublicHistoryProvider
 
 
 PROVIDER_ID = "market-breadth-eod"
-ADAPTER_SOURCE = "freestockdb+akshare-limit-pools"
-UNIVERSE_DEFINITION_VERSION = "cn-a-code-rules-v1"
+ADAPTER_SOURCE = "canonical-sh-sz:baostock+freestockdb+akshare+public-history"
+UNIVERSE_DEFINITION_VERSION = CANONICAL_A_SHARE_SH_SZ_V1.version
 AKSHARE_PACKAGE_VERSION = "1.18.72"
 _ROOT_PATH = "/"
 _DAILY_TABLE = "\u65e5k"
@@ -212,8 +220,7 @@ class MarketBreadthWorkerRunner:
             )
         if (
             not isinstance(response, dict)
-            or set(response)
-            != {"worker_protocol_version", "ok", "error_type", "message"}
+            or set(response) != {"worker_protocol_version", "ok", "error_type", "message"}
             or response.get("worker_protocol_version") != WORKER_PROTOCOL_VERSION
             or response.get("ok") is not False
         ):
@@ -231,9 +238,7 @@ class MarketBreadthWorkerRunner:
         *,
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
-        payload = _canonical_json(
-            {"operation": OPERATION, "trade_date": trade_date.isoformat()}
-        )
+        payload = _canonical_json({"operation": OPERATION, "trade_date": trade_date.isoformat()})
         timeout = min(
             float(timeout_seconds or self.settings.market_breadth_worker_timeout_seconds),
             float(self.settings.market_breadth_worker_timeout_seconds),
@@ -326,18 +331,24 @@ class MarketBreadthEODProvider(DataProvider):
         *,
         client: FreeStockDBBreadthClient | None = None,
         runner: MarketBreadthWorkerRunner | None = None,
+        membership_provider=None,
+        supplementary_provider=None,
         calendar: TradingCalendar | None = None,
         now_fn=None,
         fetch_now_fn=None,
     ) -> None:
         self.settings = settings
         self.client = client or (
-            FreeStockDBBreadthClient(settings)
-            if settings.market_breadth_enabled
-            else None
+            FreeStockDBBreadthClient(settings) if settings.market_breadth_enabled else None
         )
         self.runner = runner or MarketBreadthWorkerRunner(settings)
         self.calendar = calendar or get_trading_calendar()
+        self.membership_provider = membership_provider or BaoStockSecurityMasterProvider(
+            settings, calendar=self.calendar
+        )
+        self.supplementary_provider = supplementary_provider or SelectedStockPublicHistoryProvider(
+            settings, calendar=self.calendar, now_fn=now_fn
+        )
         self.now_fn = now_fn or shanghai_now
         self.fetch_now_fn = fetch_now_fn or shanghai_now
         self._last_success_at: datetime | None = None
@@ -347,12 +358,10 @@ class MarketBreadthEODProvider(DataProvider):
             supported_capabilities=("market.breadth.daily",),
             enabled=settings.market_breadth_enabled,
             priority=25,
-            health_status=(
-                "DISABLED" if not settings.market_breadth_enabled else "DEGRADED"
-            ),
+            health_status=("DISABLED" if not settings.market_breadth_enabled else "DEGRADED"),
             timeout=settings.market_breadth_total_budget_seconds,
             retry=0,
-            rate_limit="one local cross-section plus two fixed AKShare pool calls",
+            rate_limit="one membership snapshot, one local cross-section, two fixed pools, bounded supplements",
         )
 
     def _now(self) -> datetime:
@@ -378,9 +387,7 @@ class MarketBreadthEODProvider(DataProvider):
         latest = self.calendar.latest_completed_session(now)
         is_session = getattr(self.calendar, "is_session", lambda day: day == latest)
         if not is_session(trade_date) or trade_date > latest:
-            raise BreadthProtocolError(
-                "market breadth requires a completed trading session"
-            )
+            raise BreadthProtocolError("market breadth requires a completed trading session")
         if (now.date() - trade_date).days > self.settings.market_breadth_history_window_days:
             raise BreadthLimitEvidenceUnavailableError(
                 "BREADTH_LIMIT_EVIDENCE_UNAVAILABLE: trade date exceeds pool history window"
@@ -410,9 +417,7 @@ class MarketBreadthEODProvider(DataProvider):
             instrument = _instrument(symbol)
             if instrument != "TARGET":
                 excluded[
-                    "non_target_instrument"
-                    if instrument == "NON_TARGET"
-                    else "unknown_instrument"
+                    "non_target_instrument" if instrument == "NON_TARGET" else "unknown_instrument"
                 ] += 1
                 continue
             close = _decimal(raw.get("close"))
@@ -471,7 +476,9 @@ class MarketBreadthEODProvider(DataProvider):
             if response[key] > self.settings.market_breadth_max_pool_rows:
                 raise BreadthProtocolError("market breadth pool exceeds configured row limit")
         for key in ("limit_up_response_digest", "limit_down_response_digest"):
-            if not isinstance(response[key], str) or not re.fullmatch(r"[0-9a-f]{64}", response[key]):
+            if not isinstance(response[key], str) or not re.fullmatch(
+                r"[0-9a-f]{64}", response[key]
+            ):
                 raise BreadthProtocolError("market breadth pool digest is invalid")
         try:
             fetched_at = datetime.fromisoformat(response["fetched_at"])
@@ -515,14 +522,52 @@ class MarketBreadthEODProvider(DataProvider):
         unmatched.sort(key=lambda item: (item["classification"], item["symbol"]))
         detail = json.dumps(unmatched, ensure_ascii=True, separators=(",", ":"))[:350]
         if "incomplete" in failures:
-            raise BreadthUniverseIncompleteError(
-                "BREADTH_UNIVERSE_INCOMPLETE: " + detail
-            )
+            raise BreadthUniverseIncompleteError("BREADTH_UNIVERSE_INCOMPLETE: " + detail)
         if "mismatch" in failures:
-            raise BreadthPoolUniverseMismatchError(
-                "BREADTH_POOL_UNIVERSE_MISMATCH: " + detail
-            )
+            raise BreadthPoolUniverseMismatchError("BREADTH_POOL_UNIVERSE_MISMATCH: " + detail)
         return normalized & set(valid), unmatched
+
+    def _supplement(
+        self,
+        trade_date: date,
+        missing_symbols: list[str],
+    ) -> list[BreadthPriceEvidence]:
+        if not missing_symbols:
+            return []
+        max_supplements = self.settings.market_breadth_max_supplement_symbols
+        if len(missing_symbols) > max_supplements:
+            return []
+        start = trade_date.fromordinal(trade_date.toordinal() - 10)
+        evidence: list[BreadthPriceEvidence] = []
+        for symbol in missing_symbols:
+            try:
+                rows = list(self.supplementary_provider.get_history(symbol, start, trade_date))
+            except ProviderUnavailableError:
+                continue
+            rows = sorted(rows, key=lambda item: item.trade_date)
+            current_index = next(
+                (index for index, item in enumerate(rows) if item.trade_date == trade_date),
+                None,
+            )
+            if current_index is None or current_index == 0:
+                continue
+            current = rows[current_index]
+            previous = rows[current_index - 1]
+            evidence.append(
+                BreadthPriceEvidence(
+                    symbol=symbol,
+                    trade_date=trade_date,
+                    close=current.close,
+                    previous_close=previous.close,
+                    source=current.source,
+                    source_reference=(
+                        f"{current.source}:{symbol}:{previous.trade_date.isoformat()}:{trade_date.isoformat()}"
+                    ),
+                    price_unit=current.price_unit,
+                    adjustment=current.adjustment,
+                )
+            )
+        return evidence
 
     def get_market_breadth(self, trade_date: date) -> ObservedRows:
         started = time.perf_counter()
@@ -540,20 +585,64 @@ class MarketBreadthEODProvider(DataProvider):
             worker = self.runner.run(trade_date, timeout_seconds=remaining)
             request_completed_at = self._fetch_now()
             self._validate_worker_response(worker, trade_date)
-            worker_fetched_at = to_shanghai_aware(
-                datetime.fromisoformat(worker["fetched_at"])
-            )
+            worker_fetched_at = to_shanghai_aware(datetime.fromisoformat(worker["fetched_at"]))
             if not request_started_at <= worker_fetched_at <= request_completed_at:
                 raise BreadthProtocolError(
                     "market breadth worker fetched_at is outside request bounds"
                 )
-            valid, target_presence, excluded = self._cross_section(cross, trade_date)
-            matched_up, unmatched_up = self._pool(
-                worker["limit_up_symbols"], valid, target_presence
+            valid, _, excluded = self._cross_section(cross, trade_date)
+            membership = self.membership_provider.get_membership(trade_date)
+            primary = [
+                BreadthPriceEvidence(
+                    symbol=symbol,
+                    trade_date=trade_date,
+                    close=close,
+                    previous_close=previous,
+                    source="freestockdb",
+                    source_reference=f"{cross.response_digest}:{symbol}",
+                )
+                for symbol, (close, previous) in sorted(valid.items())
+            ]
+            preliminary = reconcile_market_breadth_universe(
+                spec=CANONICAL_A_SHARE_SH_SZ_V1,
+                trade_date=trade_date,
+                membership=membership,
+                primary=primary,
+                raw_limit_up=worker["limit_up_symbols"],
+                raw_limit_down=worker["limit_down_symbols"],
             )
-            matched_down, unmatched_down = self._pool(
-                worker["limit_down_symbols"], valid, target_presence
+            supplementary = self._supplement(
+                trade_date, list(preliminary.unresolved_missing_members)
             )
+            report = reconcile_market_breadth_universe(
+                spec=CANONICAL_A_SHARE_SH_SZ_V1,
+                trade_date=trade_date,
+                membership=membership,
+                primary=primary,
+                supplementary=supplementary,
+                raw_limit_up=worker["limit_up_symbols"],
+                raw_limit_down=worker["limit_down_symbols"],
+            )
+            if not report.persistable:
+                detail = {
+                    "status": report.completeness_status.value,
+                    "unresolved": list(report.unresolved_missing_members[:20]),
+                    "conflicts": list(report.membership_conflicts[:20]),
+                    "reasons": list(report.degradation_reason_codes),
+                }
+                prefix = (
+                    "UNIVERSE_MEMBERSHIP_UNAVAILABLE"
+                    if report.completeness_status == ReconciliationStatus.UNIVERSE_UNAVAILABLE
+                    else "BREADTH_UNIVERSE_INCOMPLETE"
+                )
+                raise BreadthUniverseIncompleteError(
+                    prefix + ": " + json.dumps(detail, separators=(",", ":"))
+                )
+            valid = {
+                item.symbol: (item.close, item.previous_close) for item in report.price_evidence
+            }
+            matched_up = set(report.limit_up_members)
+            matched_down = set(report.limit_down_members)
             changes = [
                 (close / previous - Decimal("1")) * Decimal("100")
                 for close, previous in valid.values()
@@ -576,6 +665,14 @@ class MarketBreadthEODProvider(DataProvider):
                 median_change_pct=_median(changes).quantize(Decimal("0.000001")),
                 above_ma20_ratio=None,
                 above_ma50_ratio=None,
+                universe_id=CANONICAL_A_SHARE_SH_SZ_V1.universe_id,
+                universe_version=CANONICAL_A_SHARE_SH_SZ_V1.version,
+                membership_digest=report.membership_digest,
+                reconciliation_digest=report.reconciliation_digest,
+                reconciliation_status=report.completeness_status.value,
+                primary_count=report.primary_rows,
+                supplementary_count=report.supplementary_rows,
+                source_lineage=report.as_persisted_metadata(),
                 observed_at=self.calendar.session_close_at(trade_date),
                 source=ADAPTER_SOURCE,
                 fetched_at=fetched_at,
@@ -599,7 +696,25 @@ class MarketBreadthEODProvider(DataProvider):
                 "trade_date": trade_date.isoformat(),
                 "observed_at": row.observed_at.isoformat(),
                 "fetched_at": fetched_at.isoformat(),
+                "universe_id": CANONICAL_A_SHARE_SH_SZ_V1.universe_id,
+                "universe_version": CANONICAL_A_SHARE_SH_SZ_V1.version,
+                "universe_name": "Shanghai and Shenzhen common A-shares",
+                "included_exchanges": ["SH", "SZ"],
+                "included_boards": ["SH_MAIN", "SH_STAR", "SZ_MAIN", "SZ_CHINEXT"],
+                "security_types": ["COMMON_STOCK"],
                 "universe_definition_version": UNIVERSE_DEFINITION_VERSION,
+                "membership_provider": CANONICAL_A_SHARE_SH_SZ_V1.membership_provider,
+                "membership_digest": report.membership_digest,
+                "reconciliation_digest": report.reconciliation_digest,
+                "business_identity": report.business_identity,
+                "reconciliation_status": report.completeness_status.value,
+                "expected_member_count": report.expected_member_count,
+                "active_trading_member_count": report.active_trading_member_count,
+                "primary_count": report.primary_rows,
+                "supplementary_count": report.supplementary_rows,
+                "excluded_legitimate_members": report.excluded_legitimate_members,
+                "unresolved_missing_members": list(report.unresolved_missing_members),
+                "degradation_reason_codes": list(report.degradation_reason_codes),
                 "raw_cross_section_rows": len(cross.payload),
                 "valid_universe_rows": len(valid),
                 "excluded_rows_by_reason": dict(sorted(excluded.items())),
@@ -609,10 +724,19 @@ class MarketBreadthEODProvider(DataProvider):
                 "median_change_pct": format(row.median_change_pct, "f"),
                 "raw_limit_up_count": worker["raw_limit_up_count"],
                 "matched_limit_up_count": len(matched_up),
-                "unmatched_limit_up_symbols": unmatched_up,
+                "unmatched_limit_up_symbols": [
+                    {"symbol": item.symbol, "classification": item.classification.value}
+                    for item in report.limit_up_reconciliation
+                    if item.classification.value != "IN_CANONICAL_UNIVERSE"
+                ],
                 "raw_limit_down_count": worker["raw_limit_down_count"],
                 "matched_limit_down_count": len(matched_down),
-                "unmatched_limit_down_symbols": unmatched_down,
+                "unmatched_limit_down_symbols": [
+                    {"symbol": item.symbol, "classification": item.classification.value}
+                    for item in report.limit_down_reconciliation
+                    if item.classification.value != "IN_CANONICAL_UNIVERSE"
+                ],
+                "pool_symbols_outside_scope": list(report.pool_symbols_outside_scope),
                 "freestockdb_request_digest": cross.request_digest,
                 "freestockdb_response_digest": cross.response_digest,
                 "limit_up_response_digest": worker["limit_up_response_digest"],
