@@ -39,7 +39,6 @@ def upgrade():
         ("reconciliation_status", sa.String(48), "INCOMPLETE"),
         ("primary_count", sa.Integer(), "0"),
         ("supplementary_count", sa.Integer(), "0"),
-        ("source_lineage", sa.JSON(), "{}"),
     )
     for name, type_, default in additions:
         if name not in columns:
@@ -48,8 +47,23 @@ def upgrade():
                 sa.Column(name, type_, nullable=False, server_default=default),
             )
 
+    if "source_lineage" not in columns:
+        # MySQL 8 rejects literal defaults on JSON columns. Add nullable, backfill
+        # with a native JSON value, then enforce the model's NOT NULL contract.
+        op.add_column(TABLE, sa.Column("source_lineage", sa.JSON(), nullable=True))
+        if op.get_bind().dialect.name == "mysql":
+            op.execute(sa.text(f"UPDATE {TABLE} SET source_lineage = JSON_OBJECT()"))
+        else:
+            op.execute(sa.text(f"UPDATE {TABLE} SET source_lineage = '{{}}'"))
+
     unique_names = _unique_names()
     with op.batch_alter_table(TABLE) as batch:
+        if "source_lineage" not in columns:
+            batch.alter_column(
+                "source_lineage",
+                existing_type=sa.JSON(),
+                nullable=False,
+            )
         if "uq_breadth_market_date" in unique_names:
             batch.drop_constraint("uq_breadth_market_date", type_="unique")
         if "uq_breadth_market_universe_date" not in unique_names:
