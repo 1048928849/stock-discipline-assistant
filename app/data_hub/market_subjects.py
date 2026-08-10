@@ -79,7 +79,7 @@ def market_breadth_subject() -> SubjectRef:
     return SubjectRef(
         subject_type="market",
         subject_id="CN-A",
-        semantic_key="daily/all-a",
+        semantic_key="daily/a-share-sh-sz",
     )
 
 

@@ -214,7 +214,15 @@ class MarketTurnoverSnapshot(Base):
 
 class MarketBreadthSnapshot(Base):
     __tablename__ = "market_breadth_snapshots"
-    __table_args__ = (UniqueConstraint("market_id", "trade_date", name="uq_breadth_market_date"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "market_id",
+            "universe_id",
+            "universe_version",
+            "trade_date",
+            name="uq_breadth_market_universe_date",
+        ),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     market_id: Mapped[str] = mapped_column(String(20), default="CN-A")
     trade_date: Mapped[date] = mapped_column(Date, index=True)
@@ -228,6 +236,14 @@ class MarketBreadthSnapshot(Base):
     median_change_pct: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
     above_ma20_ratio: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
     above_ma50_ratio: Mapped[Decimal | None] = mapped_column(Numeric(12, 6))
+    universe_id: Mapped[str] = mapped_column(String(40), default="A_SHARE_SH_SZ")
+    universe_version: Mapped[str] = mapped_column(String(20), default="1.0.0")
+    membership_digest: Mapped[str] = mapped_column(String(64), default="")
+    reconciliation_digest: Mapped[str] = mapped_column(String(64), default="")
+    reconciliation_status: Mapped[str] = mapped_column(String(48), default="INCOMPLETE")
+    primary_count: Mapped[int] = mapped_column(Integer, default=0)
+    supplementary_count: Mapped[int] = mapped_column(Integer, default=0)
+    source_lineage: Mapped[dict] = mapped_column(JSON, default=dict)
     observed_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)
     source: Mapped[str] = mapped_column(String(80))
     fetched_at: Mapped[datetime] = mapped_column(PRECISE_DATETIME)

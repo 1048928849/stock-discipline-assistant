@@ -100,7 +100,9 @@ def _trade_date(row: dict[str, Any]) -> date:
 
 def _evidence_key(symbol: str, mapping_type: str, row: dict[str, Any]) -> str:
     payload = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(symbol.encode("ascii") + mapping_type.encode("ascii") + payload).hexdigest()
+    return hashlib.sha256(
+        symbol.encode("ascii") + mapping_type.encode("ascii") + payload
+    ).hexdigest()
 
 
 def _json_value(value: Any) -> Any:
@@ -174,6 +176,7 @@ def _persist_breadth(db: Session, result: ProviderResult, rows: list[dict]) -> i
     db.execute(
         delete(MarketBreadthSnapshot).where(
             MarketBreadthSnapshot.market_id == "CN-A",
+            MarketBreadthSnapshot.universe_id.in_({row["universe_id"] for row in rows}),
             MarketBreadthSnapshot.trade_date.in_(dates),
         )
     )
@@ -192,6 +195,14 @@ def _persist_breadth(db: Session, result: ProviderResult, rows: list[dict]) -> i
                 median_change_pct=row.get("median_change_pct"),
                 above_ma20_ratio=row.get("above_ma20_ratio"),
                 above_ma50_ratio=row.get("above_ma50_ratio"),
+                universe_id=row["universe_id"],
+                universe_version=row["universe_version"],
+                membership_digest=row["membership_digest"],
+                reconciliation_digest=row["reconciliation_digest"],
+                reconciliation_status=row["reconciliation_status"],
+                primary_count=row["primary_count"],
+                supplementary_count=row["supplementary_count"],
+                source_lineage=row["source_lineage"],
                 observed_at=_observed_at(row, result),
                 source=row["source"],
                 fetched_at=_fetched_at(row, result),
@@ -232,14 +243,10 @@ def _persist_industry(db: Session, result: ProviderResult, rows: list[dict]) -> 
     }
     if not universe:
         keys = {result.subject.subject_id}
-    db.execute(
-        delete(IndustryMarketSnapshot).where(IndustryMarketSnapshot.industry_key.in_(keys))
-    )
+    db.execute(delete(IndustryMarketSnapshot).where(IndustryMarketSnapshot.industry_key.in_(keys)))
     for row in rows:
         key = (
-            sector_daily_subject(
-                str(row["industry"]), "unadjusted", "CNY", "share"
-            ).subject_id
+            sector_daily_subject(str(row["industry"]), "unadjusted", "CNY", "share").subject_id
             if universe
             else result.subject.subject_id
         )
@@ -279,9 +286,7 @@ def _persist_constituents(db: Session, result: ProviderResult, rows: list[dict])
     )
     for row in rows:
         key = (
-            sector_daily_subject(
-                str(row["industry"]), "unadjusted", "CNY", "share"
-            ).subject_id
+            sector_daily_subject(str(row["industry"]), "unadjusted", "CNY", "share").subject_id
             if universe
             else result.subject.subject_id
         )
@@ -311,9 +316,7 @@ def _persist_constituents(db: Session, result: ProviderResult, rows: list[dict])
     return len(rows)
 
 
-def _persist_industry_membership(
-    db: Session, result: ProviderResult, rows: list[dict]
-) -> int:
+def _persist_industry_membership(db: Session, result: ProviderResult, rows: list[dict]) -> int:
     symbol = result.subject.subject_id
     for row in rows:
         if str(row["symbol"]) != symbol:
@@ -582,10 +585,7 @@ def _stored_rows(
             return list(
                 db.scalars(
                     select(IndustryConstituentSnapshot)
-                    .where(
-                        IndustryConstituentSnapshot.quality_record_id
-                        == quality_record_id
-                    )
+                    .where(IndustryConstituentSnapshot.quality_record_id == quality_record_id)
                     .order_by(
                         IndustryConstituentSnapshot.industry_name,
                         IndustryConstituentSnapshot.symbol,
@@ -670,15 +670,9 @@ def resolve_product_cache(
         None,
     )
     selected_quality_id = latest_record.id if latest_record else None
-    rows = (
-        _stored_rows(db, capability, subject, selected_quality_id)
-        if selected_quality_id
-        else []
-    )
+    rows = _stored_rows(db, capability, subject, selected_quality_id) if selected_quality_id else []
     quality_ids = {
-        item.quality_record_id
-        if hasattr(item, "quality_record_id")
-        else item[0].quality_record_id
+        item.quality_record_id if hasattr(item, "quality_record_id") else item[0].quality_record_id
         for item in rows
     }
     quality_id = next(iter(quality_ids)) if len(quality_ids) == 1 else None
@@ -689,9 +683,7 @@ def resolve_product_cache(
     observed_at = record.observed_at if record else None
     cached_at = record.cached_at if record else None
     if record and capability.startswith("market."):
-        observed_at = (
-            market_storage_naive_to_aware(observed_at) if observed_at else None
-        )
+        observed_at = market_storage_naive_to_aware(observed_at) if observed_at else None
         cached_at = market_storage_naive_to_aware(cached_at) if cached_at else None
     elif record:
         observed_at = utc_storage_naive_to_aware(observed_at) if observed_at else None
